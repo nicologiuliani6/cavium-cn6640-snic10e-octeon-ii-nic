@@ -87,6 +87,8 @@ else
   # port i <-> its NC523 peer in a private netns + subnet (static ARP both sides)
   setup_port() { # oct ns dev peermac cip nip
     local OCT=$1 NS=$2 DEV=$3 PMAC=$4 CIP=$5 NIP=$6
+    # octnic registers oct1 a hair after oct0 -> wait for the netdev so its IP actually lands
+    local n=0; while ! ip link show $OCT >/dev/null 2>&1 && [ $n -lt 40 ]; do sleep 0.25; n=$((n+1)); done
     ip netns add $NS 2>/dev/null || true
     ip link set $DEV netns $NS 2>/dev/null || true
     ip netns exec $NS ip link set lo up
