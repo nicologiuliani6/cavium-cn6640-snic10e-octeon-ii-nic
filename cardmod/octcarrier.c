@@ -16,27 +16,35 @@
 #include <asm/octeon/cvmx.h>
 #include <asm/octeon/cvmx-helper.h>
 
+/* Up to MAXP ports forced up. dev/ipd_port are comma-lists, e.g. dev=xaui0,xaui1
+ * ipd_port=0,16 -- one entry per port. Single values keep the old 1-port behaviour. */
+#define MAXP 4
 static char *dev = "xaui0";
 module_param(dev, charp, 0444);
-static int ipd_port;			/* xaui0 = interface 0 port 0 = ipd_port 0 */
-module_param(ipd_port, int, 0444);
+static char *ipd_port = "0";		/* xaui0 = ipd_port 0; xaui1 = 16 on CN66xx XAUI */
+module_param(ipd_port, charp, 0444);
 static unsigned int period_ms = 200;
 module_param(period_ms, uint, 0444);
 
-static struct net_device *nd;
+static struct net_device *nd[MAXP];
+static int ipd[MAXP];
+static int nports;
 static struct timer_list t;
 
 static void force_up(void)
 {
 	union cvmx_helper_link_info li;
+	int i;
 
 	li.u64 = 0;
 	li.s.link_up = 1;
 	li.s.full_duplex = 1;
 	li.s.speed = 10000;
-	cvmx_helper_link_set(ipd_port, li);
-	if (nd && !netif_carrier_ok(nd))
-		netif_carrier_on(nd);
+	for (i = 0; i < nports; i++) {
+		cvmx_helper_link_set(ipd[i], li);
+		if (nd[i] && !netif_carrier_ok(nd[i]))
+			netif_carrier_on(nd[i]);
+	}
 }
 
 static void tick(struct timer_list *unused)
@@ -47,25 +55,39 @@ static void tick(struct timer_list *unused)
 
 static int __init m_init(void)
 {
-	nd = dev_get_by_name(&init_net, dev);
-	if (!nd) {
-		pr_err("octcarrier: %s not found\n", dev);
-		return -ENODEV;
+	char *dp = dev, *ip = ipd_port, *tok;
+
+	while ((tok = strsep(&dp, ",")) && nports < MAXP) {
+		char *itok = strsep(&ip, ",");
+		struct net_device *n = dev_get_by_name(&init_net, tok);
+
+		if (!n) {
+			pr_err("octcarrier: %s not found\n", tok);
+			continue;
+		}
+		nd[nports] = n;
+		ipd[nports] = itok ? (int)simple_strtol(itok, NULL, 0) : 0;
+		pr_info("octcarrier: forcing link up for %s (ipd_port %d)\n",
+			tok, ipd[nports]);
+		nports++;
 	}
+	if (!nports)
+		return -ENODEV;
 	force_up();
 	timer_setup(&t, tick, 0);
 	mod_timer(&t, jiffies + msecs_to_jiffies(period_ms));
-	pr_info("octcarrier: forcing link_set(up)+carrier for %s (ipd_port %d)\n",
-		dev, ipd_port);
 	return 0;
 }
 
 static void __exit m_exit(void)
 {
+	int i;
+
 	del_timer_sync(&t);
-	if (nd)
-		dev_put(nd);
-	pr_info("octcarrier: released %s\n", dev);
+	for (i = 0; i < nports; i++)
+		if (nd[i])
+			dev_put(nd[i]);
+	pr_info("octcarrier: released %d port(s)\n", nports);
 }
 module_init(m_init);
 module_exit(m_exit);
