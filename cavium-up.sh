@@ -9,7 +9,7 @@
 # If boot-nsr fails and an FT232 console is present, it falls back to the serial boot-clean.
 #
 # Logs to /var/log/cavium-up.log. Safe to re-run by hand: `sudo bash cavium-up.sh`.
-DIR=/home/nico/Desktop/cavium
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 LOG=/var/log/cavium-up.log
 exec > >(tee -a "$LOG") 2>&1
 echo "==================== cavium-up $(date) ===================="

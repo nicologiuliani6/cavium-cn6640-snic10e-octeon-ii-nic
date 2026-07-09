@@ -13,9 +13,20 @@
 # (window live), pushes the OpenWrt image into card DRAM via BAR2 + wordfix, then u-boot
 # finishes the sleep, flushes and boots the freshly-pushed image.
 set -u
-IMG=${IMG:-/home/nico/openwrt/bin/targets/octeon/generic/openwrt-octeon-generic-snic10e-initramfs-kernel.bin}
+SELF="$(dirname "$(readlink -f "$0")")"
+# Card image: honour $IMG, else find the built OpenWrt initramfs in a few known spots.
+if [ -z "${IMG:-}" ]; then
+  for c in \
+    "$SELF"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
+    /home/*/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
+    "$SELF"/*snic10e-initramfs-kernel.bin ; do
+    [ -f "$c" ] && IMG="$c" && break
+  done
+fi
+IMG=${IMG:-}
+[ -n "$IMG" ] && [ -f "$IMG" ] || { echo "[FAIL] card image not found (set IMG=... or build: ./openwrt/build-openwrt.sh)"; exit 1; }
 OFF=${OFF:-0x10000}
-[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+[ "$(id -u)" = 0 ] || exec sudo IMG="$IMG" "$0" "$@"
 
 ok(){ printf '[ \033[32mOK\033[0m ] %s\n' "$1"; }
 

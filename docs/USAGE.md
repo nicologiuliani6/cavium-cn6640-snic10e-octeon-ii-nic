@@ -5,12 +5,22 @@
 `system/cavium-nic.service` runs `cavium-up.sh` at boot: it boots the card with `octboot`,
 loads `octnic ports=2`, and wires up both ports (`twocard-up.sh`).
 
+The one-shot installer does all of the below (module build+install, the two host configs,
+and the service) in one go:
+
+```bash
+sudo ./install.sh            # add --start to also boot the card + bring NICs up now
+sudo systemctl start cavium-nic
+```
+
+Or by hand — install the service:
+
 ```bash
 sudo cp system/cavium-nic.service /etc/systemd/system/
 sudo systemctl enable --now cavium-nic
 ```
 
-Two host requirements (shipped as files in `system/`, install them once):
+Two host requirements (shipped as files in `system/`, installed by `install.sh`, or by hand once):
 
 ```bash
 # 1) keep the stock liquidio driver off the card (it hangs the host probing this OEM board)

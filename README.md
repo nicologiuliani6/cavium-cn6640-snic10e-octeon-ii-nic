@@ -52,11 +52,16 @@ Run entirely hands-off by the `cavium-nic.service` systemd unit (see `system/`).
 
 ## Quick start
 
-Assuming the card is already provisioned (one-time u-boot env, see [FLASHING](docs/FLASHING.md))
-and the modules are built + installed:
+One-shot install (builds + installs the host module, drops the configs, enables autostart):
 
 ```bash
-sudo systemctl start cavium-nic      # boots the card + brings up oct0 and oct1
+sudo ./install.sh                     # host side; add --start to also boot the card now
+```
+
+Then (card already provisioned — one-time u-boot env, see [FLASHING](docs/FLASHING.md)):
+
+```bash
+sudo systemctl start cavium-nic      # boots the card + brings up oct0 and oct1 (no serial)
 ip -br addr show oct0                 # 10 GbE host interface, port 0
 ip -br addr show oct1                 # 10 GbE host interface, port 1
 ```
@@ -80,6 +85,7 @@ Full details: [FLASHING](docs/FLASHING.md) · [USAGE](docs/USAGE.md) ·
 ```
 cardmod/     octshm_card.c, octcarrier.c   — card-side kernel modules (cross-built)
 hostmod/     octnic.c                        — host-side kernel module (native build)
+install.sh                                   — one-shot host installer (module + configs + service)
 octboot                                      — host bootloader (no serial)
 cavium-up.sh, twocard-up.sh, cexec.sh        — bring-up orchestration (+ serial fallback)
 card-temp.sh                                 — card temperature feed
