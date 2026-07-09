@@ -1,0 +1,21 @@
+# Cavium SNIC10E auto-bring-up (no serial). Loads xaui0 TX-unlock + octshm NIC +
+# temp feed. Host side (octshm_host/oct0/NC523) is configured by cavium-up.sh.
+echo 0 > /proc/sys/kernel/printk
+/etc/init.d/firewall stop 2>/dev/null
+iptables -F 2>/dev/null; iptables -P INPUT ACCEPT 2>/dev/null
+ip link set xaui0 up mtu 9000 promisc on 2>/dev/null
+ip link set xaui1 up mtu 9000 promisc on 2>/dev/null
+insmod /root/octcarrier.ko dev=xaui0,xaui1 ipd_port=0,16 2>/dev/null
+insmod /root/octshm_card.ko uplink=xaui0,xaui1 ports=2 dma=2 dpiwait=0 lockfree=1 hrx=1 nworkers=8 2>/dev/null
+# spread the 8 POW-group "Ethernet" RX IRQs across cpu0-7 so RX NAPI (and thus the
+# octshm tap + DPI) runs multi-core instead of piling on cpu0. IRQ nums vary -> match by name.
+( n=0; for irq in $(awk -F: '/Ethernet/{gsub(/ /,"",$1);print $1}' /proc/interrupts); do
+    printf '%x\n' $((1 << (n % 8))) > /proc/irq/$irq/smp_affinity 2>/dev/null; n=$((n+1));
+  done ) 2>/dev/null
+( while :; do
+    t1=$(cat /sys/class/hwmon/hwmon0/temp1_input 2>/dev/null)
+    t2=$(cat /sys/class/hwmon/hwmon0/temp2_input 2>/dev/null)
+    [ -n "$t1" ] && echo "$t1 $t2" > /proc/octshm/temp 2>/dev/null
+    sleep 5
+  done ) &
+exit 0

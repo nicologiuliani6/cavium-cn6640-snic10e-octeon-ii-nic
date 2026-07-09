@@ -1,0 +1,13 @@
+[Unit]
+Description=Cavium SNIC10E — reload card OS over PCIe + bring up octshm NIC
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=360
+ExecStart=/home/nico/Desktop/cavium/cavium-up.sh
+
+[Install]
+WantedBy=multi-user.target
