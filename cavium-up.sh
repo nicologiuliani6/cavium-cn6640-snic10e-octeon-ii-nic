@@ -3,7 +3,7 @@
 # The card runs its OS from RAM, so a host power-cycle wipes it. This re-pushes the image
 # over PCIe and brings up the 10G NIC. Auto-detects the card's PCI location.
 #
-# NO SERIAL by default: boot-nsr.sh boots the card via a persisted self-programming
+# NO SERIAL by default: octboot boots the card via a persisted self-programming
 # u-boot bootcmd + a host BAR2 image push (no console). The image's baked /etc/rc.local
 # self-loads octcarrier + octshm_card + the temp daemon, so the card side needs no serial.
 # If boot-nsr fails and an FT232 console is present, it falls back to the serial boot-clean.
@@ -22,7 +22,7 @@ fi
 booted=0
 for t in 1 2 3; do
   echo "--- no-serial boot attempt $t ---"
-  if bash "$DIR/boot-nsr.sh"; then booted=1; NOSER=1; echo "card booted no-serial (try $t)"; break; fi
+  if bash "$DIR/octboot"; then booted=1; NOSER=1; echo "card booted no-serial (try $t)"; break; fi
   echo "no-serial boot $t failed"; sleep 3
 done
 if [ "$booted" != 1 ]; then

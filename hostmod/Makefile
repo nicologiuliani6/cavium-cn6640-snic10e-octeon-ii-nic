@@ -1,4 +1,4 @@
-obj-m += octshm_host.o
+obj-m += octnic.o
 obj-m += octdma_test.o
 KDIR ?= /lib/modules/$(shell uname -r)/build
 all:

@@ -79,8 +79,10 @@ else
     done
   fi
   setpci -s $BDF COMMAND=0x06
-  rmmod octshm_host 2>/dev/null || true
-  insmod "$DIR/hostmod/octshm_host.ko" base=$BAR2 ports=$PORTS dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1} ${NTXQ:+ntxq=$NTXQ}
+  rmmod octnic 2>/dev/null || true
+  # octnic auto-discovers BAR2 (base=0) -> `modprobe octnic` if installed, else insmod by path.
+  OPTS="ports=$PORTS dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1} ${NTXQ:+ntxq=$NTXQ}"
+  modprobe octnic $OPTS 2>/dev/null || insmod "$DIR/hostmod/octnic.ko" $OPTS
 
   # port i <-> its NC523 peer in a private netns + subnet (static ARP both sides)
   setup_port() { # oct ns dev peermac cip nip

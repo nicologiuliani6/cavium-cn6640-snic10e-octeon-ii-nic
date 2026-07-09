@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
-/* octshm_host: host side of the Cavium shared-memory NIC. Registers one netdev
+/* octnic: host side of the Cavium shared-memory NIC. Registers one netdev
  * per card port ("oct0", "oct1") over the card's DRAM window exposed at PCIe
- * BAR2 (host phys base, default 0xf4000000, set via setpci before load). Each
+ * BAR2. base=0 (default) auto-discovers the card's BAR2 via PCI 177d:0092, so
+ * `modprobe octnic` needs no args; pass base= to force a specific address. Each
  * port owns a private 4MB region at PORT_STRIDE*i. TX writes the host->card
  * ring; per-port poll kthreads drain the card->host RX ring into the stack.
  * ports=1 is byte-identical to the original single-port build.
@@ -47,7 +48,7 @@
 #define C_RESV0      0x38	/* card board temp, millidegC (fed by card /proc/octshm/temp) */
 #define C_RESV1      0x3c	/* card Octeon die temp, millidegC */
 
-static unsigned long base = 0xf4000000;
+static unsigned long base;		/* 0 = auto-discover card BAR2 (177d:0092). override to force */
 module_param(base, ulong, 0444);
 static int ports = 1;		/* one netdev per card uplink (oct0<->xaui0, oct1<->xaui1) */
 module_param(ports, int, 0444);
@@ -117,7 +118,7 @@ static int octdma_alloc(struct host_port *p)
 {
 	if (!pdev) {
 		pdev = pci_get_device(0x177d, 0x0092, NULL);
-		if (!pdev) { pr_err("octshm_host: EP 177d:0092 not found\n"); return -ENODEV; }
+		if (!pdev) { pr_err("octnic: EP 177d:0092 not found\n"); return -ENODEV; }
 		if (dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64)))
 			return -EIO;
 	}
@@ -138,7 +139,7 @@ static int octdma_alloc(struct host_port *p)
 	wmb();
 	pwr(p, C_DMA_ENABLE, 1);		/* tell card to switch to DMA */
 	wmb();
-	pr_info("octshm_host: port%d DMA on, tx_bus=0x%llx rx_bus=0x%llx\n",
+	pr_info("octnic: port%d DMA on, tx_bus=0x%llx rx_bus=0x%llx\n",
 		p->idx, (u64)p->tx_dma_bus, (u64)p->rx_dma_bus);
 	return 0;
 }
@@ -425,6 +426,25 @@ static int __init octshm_host_init(void)
 	if (ports < 1) ports = 1;
 	if (ports > MAXPORT) ports = MAXPORT;
 
+	if (!base) {		/* auto-discover card BAR2 so `modprobe octnic` needs no args */
+		struct pci_dev *pd = pci_get_device(0x177d, 0x0092, NULL);
+		u16 cmd;
+
+		if (!pd) {
+			pr_err("octnic: CN6640 (177d:0092) not found\n");
+			return -ENODEV;
+		}
+		base = pci_resource_start(pd, 2);	/* BAR2 = card DRAM window */
+		pci_read_config_word(pd, PCI_COMMAND, &cmd);	/* ensure MEM+bus-master on */
+		pci_write_config_word(pd, PCI_COMMAND,
+				      cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+		pci_dev_put(pd);
+		if (!base) {
+			pr_err("octnic: BAR2 unassigned (enable Above-4G / re-scan)\n");
+			return -ENODEV;
+		}
+	}
+
 	win = ioremap_wc(base, (u32)ports * PORT_STRIDE);	/* WC: batch TX writes into big TLPs */
 	if (!win)
 		return -ENOMEM;
@@ -435,12 +455,12 @@ static int __init octshm_host_init(void)
 	magic = readl(hp[0].w + C_MAGIC);
 	cr = readl(hp[0].w + C_CARD_READY);
 	if (magic != OCTSHM_MAGIC) {
-		pr_err("octshm_host: bad magic 0x%08x at base 0x%lx (card module loaded? BAR2 set?)\n",
+		pr_err("octnic: bad magic 0x%08x at base 0x%lx (card module loaded? BAR2 set?)\n",
 		       magic, base);
 		iounmap(win);
 		return -ENODEV;
 	}
-	pr_info("octshm_host: magic OK ver=%u card_ready=%u ports=%d\n",
+	pr_info("octnic: magic OK ver=%u card_ready=%u ports=%d\n",
 		readl(hp[0].w + C_VERSION), cr, ports);
 
 	if (ntxq < 1) ntxq = 1;
@@ -450,7 +470,7 @@ static int __init octshm_host_init(void)
 		struct host_port *p = &hp[i];
 
 		if (i > 0 && readl(p->w + C_MAGIC) != OCTSHM_MAGIC) {
-			pr_err("octshm_host: port%d magic bad -- card built with ports=%d?\n",
+			pr_err("octnic: port%d magic bad -- card built with ports=%d?\n",
 			       i, ports);
 			ret = -ENODEV;
 			goto err;
@@ -477,7 +497,7 @@ static int __init octshm_host_init(void)
 			goto err;
 		}
 		nregistered++;
-		pr_info("octshm_host: registered %s\n", p->ndev->name);
+		pr_info("octnic: registered %s\n", p->ndev->name);
 	}
 
 	if (!pdev)					/* hwmon needs a parent dev */
@@ -486,7 +506,7 @@ static int __init octshm_host_init(void)
 		hwmon_dev = hwmon_device_register_with_info(&pdev->dev,
 				"cavium_card", NULL, &oct_hwmon_chip, NULL);
 		if (!IS_ERR(hwmon_dev))
-			pr_info("octshm_host: hwmon cavium_card registered\n");
+			pr_info("octnic: hwmon cavium_card registered\n");
 		else
 			hwmon_dev = NULL;
 	}
@@ -525,9 +545,9 @@ static void __exit octshm_host_exit(void)
 	}
 	if (pdev) { pci_clear_master(pdev); pci_dev_put(pdev); }
 	iounmap(win);
-	pr_info("octshm_host: unloaded\n");
+	pr_info("octnic: unloaded\n");
 }
 module_init(octshm_host_init);
 module_exit(octshm_host_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Cavium shared-memory NIC (host side)");
+MODULE_DESCRIPTION("octnic: Cavium CN6640 shared-memory NIC (host side, oct0/oct1)");
