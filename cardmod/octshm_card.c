@@ -717,15 +717,16 @@ static int worker_fn(void *arg)
 		 * workers -> off the single cpu0 NAPI). oct_rx_deliver resolves the port. */
 		if (rxwork && any2) {
 			struct sk_buff *rs;
-			int b = 64;
+			int b = 16;		/* bounded RX batch, then fall through to TX
+					 * drain so heavy RX can't fully starve TX
+					 * (was: drain 64 then `continue`, skipping TX
+					 * -> TX collapsed to ~0.45G under contention). */
 
 			while (b-- && (rs = skb_dequeue(&rxq[id]))) {
 				oct_rx_deliver(rs);
 				kfree_skb(rs);
 				did = 1;
 			}
-			if (did)
-				continue;
 		}
 
 		if (!any_ready) {		/* wait for arm: txd phases seeded there */
