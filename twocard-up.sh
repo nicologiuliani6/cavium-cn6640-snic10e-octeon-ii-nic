@@ -15,6 +15,7 @@ DIR=/home/nico/Desktop/cavium
 MODE=${MODE:-host}
 HRX=${HRX:-1}		# host-RAM RX descriptors (matches card image rc.local hrx=1)
 RXTH=${RXTH:-8}		# parallel host RX drain threads (REV ~2.75G->7G). Needs HRX.
+NTXQ=${NTXQ:-8}		# multi-queue TX (FWD): N host txqs -> N cores PIO in parallel
 ZTX=${ZTX:-}		# zero-copy TX (empty=off). BROKEN: inbound DPI corrupts host->card DMA.
 			# NB keep EMPTY not 0 -- ${ZTX:+..} triggers on any non-empty incl "0".
 NCNS=nc
@@ -75,7 +76,7 @@ else
   fi
   setpci -s $BDF COMMAND=0x06
   rmmod octshm_host 2>/dev/null || true
-  insmod "$DIR/hostmod/octshm_host.ko" base=$BAR2 dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1}
+  insmod "$DIR/hostmod/octshm_host.ko" base=$BAR2 dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1} ${NTXQ:+ntxq=$NTXQ}
   ip addr flush dev oct0; ip addr add $C/24 dev oct0; ip link set oct0 mtu 9000 up
   OCT0MAC=$(cat /sys/class/net/oct0/address)
   ip neigh replace $N lladdr $NCMAC dev oct0 nud permanent

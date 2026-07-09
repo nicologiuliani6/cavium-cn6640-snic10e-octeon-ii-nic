@@ -49,6 +49,12 @@ static unsigned long base = 0xf4000000;
 module_param(base, ulong, 0444);
 static int poll_us = 200;
 module_param(poll_us, int, 0644);
+static int ntxq = 1;		/* multi-queue TX: N netdev txqs -> N cores xmit in parallel.
+				 * Single ring, CAS slot-claim + per-slot TX phase (host stamps after
+				 * PIO, card drains by phase). Mirrors the rxthreads RX win for FWD. */
+module_param(ntxq, int, 0444);
+static atomic_t tx_claim = ATOMIC_INIT(0);	/* parallel TX producer (CAS-claimed) */
+#define TX_PHASE(tp)  (((tp) >> 7) & 1u)	/* log2(RING_SZ)=7 */
 static int rxthreads = 1;	/* hrx only: N parallel drain threads, each owning slots
 				 * s where s%N==tid. Card fills the single ring in claim order;
 				 * a per-slot phase in RAM lets threads drain disjoint slots in
@@ -135,16 +141,24 @@ static void octdma_free(void)
 
 static netdev_tx_t oct_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	u32 tp = tp_shadow;
-	u32 slot, len = skb->len;
+	u32 tp, slot, len = skb->len;
 
-	if ((tp - tc_cache) >= RING_SZ) {	/* maybe full: refresh once */
-		tc_cache = rd(C_TX_CONS);
-		if ((tp - tc_cache) >= RING_SZ) {
-			dev->stats.tx_dropped++;
-			dev_kfree_skb_any(skb);
-			return NETDEV_TX_OK;
+	/* CAS-claim a slot: parallel across txqs, and on full DROP without claiming
+	 * (no hole -- the card drains by phase and would stall on an unfilled slot). */
+	for (;;) {
+		tp = (u32)atomic_read(&tx_claim);
+		if ((tp - READ_ONCE(tc_cache)) >= RING_SZ) {
+			u32 tc = rd(C_TX_CONS);
+
+			WRITE_ONCE(tc_cache, tc);
+			if ((tp - tc) >= RING_SZ) {
+				dev->stats.tx_dropped++;
+				dev_kfree_skb_any(skb);
+				return NETDEV_TX_OK;
+			}
 		}
+		if ((u32)atomic_cmpxchg(&tx_claim, (int)tp, (int)(tp + 1)) == tp)
+			break;
 	}
 	if (len > BUF_SZ)
 		len = BUF_SZ;
@@ -155,10 +169,10 @@ static netdev_tx_t oct_xmit(struct sk_buff *skb, struct net_device *dev)
 	else				/* PIO: host posted-write into card BAR window */
 		memcpy_toio(win + TXBUF_OFF + slot * BUF_SZ, skb->data, len);
 	wmb();
-	wr(TXDESC_OFF + slot * 8, len);
-	wmb();					/* flush WC + desc before producer bump */
-	tp_shadow = tp + 1;
-	wr(C_TX_PROD, tp_shadow);
+	wr(TXDESC_OFF + slot * 8, len);			/* desc len */
+	wmb();						/* len+data before phase */
+	wr(TXDESC_OFF + slot * 8 + 4, TX_PHASE(tp));	/* phase LAST = slot ready to xmit */
+	wmb();
 	dev->stats.tx_packets++;
 	dev->stats.tx_bytes += len;
 	dev_kfree_skb_any(skb);
@@ -278,6 +292,8 @@ static int oct_open(struct net_device *dev)
 {
 	tp_shadow = rd(C_TX_PROD);		/* sync shadows to current ring */
 	tc_cache  = rd(C_TX_CONS);
+	atomic_set(&tx_claim, 0);		/* fresh TX ring (card resets tx_cons + seeds phase at arm) */
+	tc_cache = 0;
 	/* snap RX consumer to the card's current producer (drop any stale/desynced
 	 * count). Avoids an infinite poll spin if C_RX_CONS holds garbage. */
 	rc_shadow = rd(C_RX_PROD);
@@ -409,8 +425,13 @@ static int __init octshm_host_init(void)
 		if (ret) { octdma_free(); iounmap(win); return ret; }
 	}
 
-	ndev = alloc_etherdev(0);
+	if (ntxq < 1)
+		ntxq = 1;
+	if (ntxq > 8)
+		ntxq = 8;
+	ndev = alloc_etherdev_mq(0, ntxq);	/* N txqs -> N cores xmit in parallel */
 	if (!ndev) { iounmap(win); return -ENOMEM; }
+	netif_set_real_num_tx_queues(ndev, ntxq);
 	strscpy(ndev->name, "oct0", IFNAMSIZ);
 	ndev->netdev_ops = &oct_ops;
 	eth_hw_addr_random(ndev);

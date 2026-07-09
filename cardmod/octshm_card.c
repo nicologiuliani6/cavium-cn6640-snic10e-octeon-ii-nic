@@ -462,6 +462,8 @@ static int lockfree;
 module_param(lockfree, int, 0444);
 static atomic_t rx_claim_a = ATOMIC_INIT(0);
 #define RX_PHASE(claimnum)  (((claimnum) >> 7) & 1u)	/* log2(RING_SZ)=7; flips each wrap */
+#define TX_PHASE(tc)        (((tc) >> 7) & 1u)		/* host stamps this per TX slot */
+static u32 tx_cons_w[MAX_WORKERS];			/* per-worker TX consumer (stride nworkers) */
 #define RXF_PHASE  0x1u
 static u32 beat;
 static struct task_struct *bench_thread;
@@ -728,6 +730,8 @@ static int worker_fn(void *arg)
 			u64 tb = le64_to_cpu(ctrl->tx_dma_base);
 			u64 rb = le64_to_cpu(ctrl->rx_dma_base);
 			if (rb && tb && rb < (1ull << 40) && tb < (1ull << 40)) {
+				u32 s;
+
 				tx_dma_base = tb;
 				rx_dma_base = rb;
 				/* fresh ring: any pre-DMA frame bumped the claim; realign to 0
@@ -735,6 +739,14 @@ static int worker_fn(void *arg)
 				atomic_set(&rx_claim_a, 0);
 				rx_claim = 0;
 				if (ctrl) { ctrl->rx_cons = 0; ctrl->rx_prod = 0; }
+				/* TX: fresh ring at 0. Seed each slot's TX phase to "not ready"
+				 * (opposite of first expected) so workers wait for the host to
+				 * stamp it; per-worker consumer starts at its worker id. */
+				for (s = 0; s < RING_SZ; s++)
+					txd[s].flags = cpu_to_le32(TX_PHASE(s) ^ 1u);
+				for (s = 0; s < (u32)nworkers && s < MAX_WORKERS; s++)
+					tx_cons_w[s] = s;
+				wmb();
 				octdma_setup();		/* arms SLI outbound (needed by DPI too) */
 				dma_ready = 1;
 				if (dma == 2 && dpi_nic_init() == 0)
@@ -767,44 +779,45 @@ static int worker_fn(void *arg)
 				continue;
 		}
 
-		/* cheap racy hint: skip alloc when the ring looks empty */
-		if (le32_to_cpu(ctrl->tx_prod) == le32_to_cpu(ctrl->tx_cons) ||
-		    !up_dev) {
-			usleep_range(20, 40);
+		(void)idle; (void)flags;
+		if (!dma_ready) {		/* wait for arm: txd phases seeded there */
+			usleep_range(50, 100);
 			continue;
 		}
-		(void)idle;
-		/* pre-alloc skb OUTSIDE the lock (parallel across workers) */
+		/* phase-based TX drain: this worker owns slots where slot%nworkers==id.
+		 * Host stamps txd[slot].flags (TX phase) LAST, after the PIO+len, so a
+		 * matching phase means the slot is fully written -> no tx_lock, workers
+		 * drain disjoint slots + PKO-xmit in parallel (mirrors the RX rxthreads win). */
+		{
+			u32 tc = tx_cons_w[id];
+			u32 i, m;
+
+			ts = tc & RING_MASK;
+			if (!up_dev ||
+			    le32_to_cpu(txd[ts].flags) != TX_PHASE(tc)) {
+				usleep_range(20, 40);
+				continue;			/* slot not filled yet */
+			}
+			rmb();					/* phase seen => len+data landed */
+			len = le32_to_cpu(txd[ts].len);
+			tx_cons_w[id] = tc + nworkers;
+			m = tx_cons_w[0];			/* publish tx_cons = min (bp floor) */
+			for (i = 1; i < (u32)nworkers; i++)
+				if ((s32)(tx_cons_w[i] - m) < 0)
+					m = tx_cons_w[i];
+			ctrl->tx_cons = cpu_to_le32(m);
+		}
+		if (!(len >= ETH_HLEN && len <= BUF_SZ))
+			continue;			/* bad len: slot consumed, skip */
 		skb = netdev_alloc_skb(up_dev, BUF_SZ + NET_IP_ALIGN);
 		if (!skb) { usleep_range(20, 40); continue; }
-
-		/* critical section: claim one slot, copy it, advance tx_cons in
-		 * strict order. Keeps the ring race-free (tx_cons only passes a
-		 * slot after its data is fully copied out). Copy is cheap. */
-		spin_lock_irqsave(&tx_lock, flags);
-		{
-			u32 tp = le32_to_cpu(ctrl->tx_prod);
-			u32 tc = le32_to_cpu(ctrl->tx_cons);
-			if (tc != tp) {
-				ts  = tc & RING_MASK;
-				len = le32_to_cpu(txd[ts].len);
-				if (len >= ETH_HLEN && len <= BUF_SZ) {
-					if (ztx && dma_ready == 2) {
-						have = 2;	/* DPI-fetch outside lock */
-					} else {
-						skb_reserve(skb, NET_IP_ALIGN);
-						memcpy(skb_put(skb, len),
-						       txbuf + ts * BUF_SZ, len);
-						have = 1;
-					}
-				}
-				tc++;			/* 128-slot ring: host can't reuse
-							 * this slot before the DPI below finishes */
-				ctrl->tx_cons = cpu_to_le32(tc);
-				wmb();
-			}
+		if (ztx && dma_ready == 2) {
+			have = 2;			/* DPI-fetch below */
+		} else {
+			skb_reserve(skb, NET_IP_ALIGN);
+			memcpy(skb_put(skb, len), txbuf + ts * BUF_SZ, len);
+			have = 1;
 		}
-		spin_unlock_irqrestore(&tx_lock, flags);
 
 		if (have == 2) {		/* ztx: DMA host RAM -> skb, no host PIO */
 			skb_reserve(skb, NET_IP_ALIGN);
