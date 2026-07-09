@@ -5,9 +5,10 @@ Out-of-tree Linux driver stack and boot tooling for the **Cavium CN6640-SNIC10E*
 host interfaces** (`oct0`, `oct1`) over a reverse-engineered PCIe BAR2 shared-memory
 datapath. No vendor NDA firmware. Host OS untouched, fully reversible.
 
-> Status: **working.** Both ports link at 10 G on a DAC and pass traffic bidirectionally
-> at **~7.7 Gb/s per port** (see [PERFORMANCE](docs/PERFORMANCE.md)). Card boots with no
-> serial cable; the host brings both NICs up automatically at boot.
+> Status: **working.** Both ports link at 10 G on a DAC and pass traffic bidirectionally —
+> TX at **line-rate 10 GbE** (`oct0` FWD 9.71 Gb/s, zero-copy datapath), RX ~7.5 Gb/s (see
+> [PERFORMANCE](docs/PERFORMANCE.md)). Card boots with no serial cable; the host brings both
+> NICs up automatically at boot.
 
 ---
 

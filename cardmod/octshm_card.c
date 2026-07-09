@@ -40,6 +40,9 @@ module_param(host_bar1, ulong, 0444);
 #define RING_SZ        128			/* power of two */
 #define RING_MASK      (RING_SZ - 1)
 #define BUF_SZ         9216
+#define ZC_HDR         64			/* zc: bytes copied linear (eth+ip+tcp) so the
+						 * octeon-ethernet ip_hdr()/csum block parses OK;
+						 * payload beyond this is zero-copy frag */
 
 #define CTRL_OFF       0x000000
 #define TXDESC_OFF     0x001000
@@ -564,9 +567,6 @@ struct oct_port {
 	u32 rx_claim;				/* locked-path claim index */
 	u8 rx_done[RING_SZ];			/* ordered-publish flags (non-lockfree) */
 	u32 tx_cons_w[MAX_WORKERS];		/* per-worker TX consumer (stride nworkers) */
-	u32 zc_rd[MAX_WORKERS];			/* zc: per-worker read/post cursor (runs ahead of
-						 * tx_cons_w, which becomes the completion floor) */
-	atomic_t zc_done[MAX_WORKERS];		/* zc: frames PKO-completed (bumped in destructor) */
 	int dma_ready;				/* 0 none, 1 SLI copy, 2 DPI */
 	int idx;
 };
@@ -762,17 +762,6 @@ out:
 }
 
 /* TX: drain each port's host->card TX ring, transmit out that port's uplink. */
-/* zc TX completion: PKO frees the skb after the frame is on the wire; skb->mark carries
- * (port<<3|worker). Bump that worker's completion count so it can release the window slot.
- * Runs in the driver's TX-cleanup context (any core) -- an atomic_inc is all it does; the
- * frag's put_page (releasing our window-page ref) happens right after in skb_release_data. */
-static void zc_tx_done(struct sk_buff *skb)
-{
-	u32 mark = skb->mark;
-
-	atomic_inc(&pv[(mark >> 3) & 1].zc_done[mark & 7]);
-}
-
 static int worker_fn(void *arg)
 {
 	long id = (long)arg;
@@ -805,11 +794,8 @@ static int worker_fn(void *arg)
 				p->ctrl->rx_prod = 0;
 				for (s = 0; s < RING_SZ; s++)
 					p->txd[s].flags = cpu_to_le32(TX_PHASE(s) ^ 1u);
-				for (s = 0; s < (u32)nworkers && s < MAX_WORKERS; s++) {
+				for (s = 0; s < (u32)nworkers && s < MAX_WORKERS; s++)
 					p->tx_cons_w[s] = s;
-					p->zc_rd[s] = s;		/* zc post cursor seed */
-					atomic_set(&p->zc_done[s], 0);	/* zc completion count */
-				}
 				wmb();
 				if (!dpi_up) {		/* shared engine: init once */
 					octdma_setup();	/* SLI outbound (needed by DPI too) */
@@ -870,7 +856,7 @@ static int worker_fn(void *arg)
 
 			if (!p->dma_ready || !p->up_dev)
 				continue;
-			tc = (zc && p->dma_ready) ? p->zc_rd[id] : p->tx_cons_w[id];
+			tc = p->tx_cons_w[id];
 			ts = tc & RING_MASK;
 			if (le32_to_cpu(p->txd[ts].flags) != TX_PHASE(tc))
 				continue;			/* slot not filled yet */
@@ -878,49 +864,49 @@ static int worker_fn(void *arg)
 			len = le32_to_cpu(p->txd[ts].len);
 
 			if (zc && p->dma_ready) {
-				/* zero-copy TX: tiny skb (14B eth header) + a frag pointing straight
-				 * at the window slot, so PKO DMA-gathers the body -- no 9KB alloc, no
-				 * memcpy. The slot is released only when PKO frees the skb (destructor
-				 * bumps zc_done, which becomes tx_cons -- so the host can't overwrite a
-				 * slot still being transmitted). zc_rd runs ahead as the post cursor. */
+				/* zero-copy TX: small skb with L2-L4 headers copied linear (so
+				 * cvm_oct_xmit's ip_hdr()/csum-offload block parses valid data) + a frag
+				 * pointing straight at the window slot, so PKO DMA-gathers the payload --
+				 * no 9KB alloc, no 9KB cold-cache memcpy. NO completion gate: the ring is
+				 * 128 deep and PKO drains at wire (9.89G) faster than the host fills over
+				 * PCIe (<=8.4G), so a slot is always long done transmitting before the host
+				 * wraps back to it. get_page balances the frag's put_page on skb free.
+				 * ponytail: relies on PKO-faster-than-host-fill; the copy path proves fill
+				 * <= 8.4G < 9.89G wire, so it holds. Earlier destructor+counter gate
+				 * throttled to 141/299Mbit via the tx_free_list lazy free -- removed. */
 				struct ethhdr *eh;
+				int hdr = len < ZC_HDR ? len : ZC_HDR;
 
-				if ((s32)(p->zc_rd[id] - p->tx_cons_w[id]) >= (s32)(RING_SZ - nworkers))
-					break;			/* ring full of in-flight frames: wait */
 				if (len < ETH_HLEN || len > BUF_SZ) {
-					atomic_inc(&p->zc_done[id]);	/* bad len: don't stall the ring */
+					/* bad len: drop, advance below */
 				} else if (!(skb = netdev_alloc_skb(p->up_dev,
-							ETH_HLEN + NET_IP_ALIGN + 32))) {
+							ZC_HDR + NET_IP_ALIGN + 32))) {
 					break;			/* no mem: retry slot next pass */
 				} else {
 					skb_reserve(skb, NET_IP_ALIGN);
-					memcpy(skb_put(skb, ETH_HLEN), p->txbuf + ts * BUF_SZ, ETH_HLEN);
+					memcpy(skb_put(skb, hdr), p->txbuf + ts * BUF_SZ, hdr);
 					eh = (struct ethhdr *)skb->data;
 					skb->dev = p->up_dev;
 					skb_reset_mac_header(skb);
+					skb_set_network_header(skb, ETH_HLEN);
 					skb->protocol = eh->h_proto;
 					if (ether_addr_equal_unaligned(eh->h_dest, p->up_dev->dev_addr) ||
 					    is_broadcast_ether_addr(eh->h_dest)) {
-						if (len > ETH_HLEN)	/* local dst (rare): full copy */
-							memcpy(skb_put(skb, len - ETH_HLEN),
-							       p->txbuf + ts * BUF_SZ + ETH_HLEN,
-							       len - ETH_HLEN);
+						if (len > hdr)		/* local dst (rare): copy the rest */
+							memcpy(skb_put(skb, len - hdr),
+							       p->txbuf + ts * BUF_SZ + hdr, len - hdr);
 						skb->pkt_type = PACKET_HOST;
 						netif_rx(skb);
-						atomic_inc(&p->zc_done[id]);	/* completes now, no PKO */
-					} else {
+					} else if (len > hdr) {		/* jumbo: header copied, payload frag */
 						get_page(p->pages);	/* frag holds a ref on the window */
 						skb_add_rx_frag(skb, 0, p->pages,
-								TXBUF_OFF + ts * BUF_SZ + ETH_HLEN,
-								len - ETH_HLEN, len - ETH_HLEN);
-						skb->mark = ((u32)pi << 3) | (u32)id;
-						skb->destructor = zc_tx_done;
+								TXBUF_OFF + ts * BUF_SZ + hdr,
+								len - hdr, len - hdr);
+						dev_queue_xmit(skb);
+					} else {			/* small frame fully linear: no frag */
 						dev_queue_xmit(skb);
 					}
 				}
-				p->zc_rd[id] = tc + nworkers;
-				p->tx_cons_w[id] = id +
-					(u32)atomic_read(&p->zc_done[id]) * nworkers;
 			} else if (ztx && p->dma_ready == 2) {
 				/* pipelined inbound DPI: post the DMA now, xmit later in
 				 * ztx_drain() once the marker confirms the frame landed. */
@@ -964,10 +950,8 @@ static int worker_fn(void *arg)
 					dev_queue_xmit(skb);
 				}
 			}
-			/* slot consumed: advance this worker's consumer + publish min floor.
-			 * zc already set tx_cons_w to its completion floor above -- don't clobber. */
-			if (!(zc && p->dma_ready))
-				p->tx_cons_w[id] = tc + nworkers;
+			/* slot consumed: advance this worker's consumer. */
+			p->tx_cons_w[id] = tc + nworkers;
 			m = p->tx_cons_w[0];
 			for (i = 1; i < (u32)nworkers; i++)
 				if ((s32)(p->tx_cons_w[i] - m) < 0)
@@ -1161,21 +1145,10 @@ static void __exit octshm_exit(void)
 	for (i = 0; i < MAX_WORKERS; i++)
 		if (!IS_ERR_OR_NULL(workers[i]))
 			kthread_stop(workers[i]);
-	if (zc) {			/* drain in-flight zc frames: they hold refs on the window
-					 * pages we're about to free (post cursor == completion floor). */
-		int t, w, pj, busy;
-
-		for (t = 0; t < 60; t++) {
-			busy = 0;
-			for (pj = 0; pj < ports; pj++)
-				for (w = 0; w < nworkers && w < MAX_WORKERS; w++)
-					if (pv[pj].zc_rd[w] != pv[pj].tx_cons_w[w])
-						busy = 1;
-			if (!busy)
-				break;
-			msleep(5);
-		}
-	}
+	if (zc)
+		msleep(200);		/* let in-flight zc frames drain off the NIC before we free
+					 * the window pages. Their frags hold get_page refs, so a late
+					 * free is refcount-safe anyway; this just avoids the churn. */
 	for (i = 0; i < ports; i++) {
 		if (!pv[i].up_dev)
 			continue;

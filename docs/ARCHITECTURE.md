@@ -45,13 +45,19 @@ host-RAM RX pool; the host reads the header locally (no per-frame MMIO descripto
 across PCIe), which is what lifts RX to ~10 G line rate. Eight POW-group RX IRQs are spread
 across cores on the card so RX NAPI runs multi-core. See [DMA-DESIGN](DMA-DESIGN.md).
 
-### TX (host → card) — PIO
+### TX (host → card) — PIO fill + zero-copy PKO gather
 
 The host posts frames by writing directly into the BAR2 TX buffer (write-combining), with a
 CAS-claimed slot + per-slot TX phase so multiple host TX queues (`ntxq`) can fill the single
-ring in parallel; the card drains by phase. TX is PIO (the inbound-DPI/zero-copy path
-wedges on this board), so under full bidirectional contention TX yields to the DMA'd RX
-(see [PERFORMANCE](PERFORMANCE.md)).
+ring in parallel; the card drains by phase. On the card side (`zc=1`, default) the drain is
+**zero-copy**: instead of allocating a 9 KB skb and `memcpy`-ing the window slot into it, the
+worker copies only the 64 B of L2-L4 headers linear and hands PKO a **frag pointing straight
+at the window slot**, so the NIC DMA-gathers the payload with no big alloc and no payload
+copy. That removes the per-frame CPU wall and takes TX to **line-rate 10 GbE** (see
+[PERFORMANCE](PERFORMANCE.md)). Slot reuse needs no completion handshake: PKO drains at wire
+faster than the host fills over PCIe, so ring depth (128) alone guarantees a slot is done
+transmitting before the host wraps to it. (The *inbound-DPI* variant — card DMA-*reads* host
+RAM — is a different path and stays off: it is read-latency-bound and loses to PIO fill.)
 
 ## XAUI uplink (`octcarrier`)
 
@@ -78,7 +84,8 @@ u-boot env is described in [FLASHING](FLASHING.md).
 
 ## What is deliberately not done
 
-- **No inbound-DPI / zero-copy TX** — it wedges this board; TX stays PIO.
+- **No inbound-DPI TX** — the card-DMA-reads-host-RAM variant is read-latency-bound and loses
+  to PIO fill; TX uses PIO fill + a zero-copy PKO frag gather on the card instead (`zc=1`).
 - **No flashing** — the NIC role runs entirely from RAM; the card is untouched and the host
   path is out-of-tree.
 - **Serial-free *first* install** — prototyped (`octconsole`, u-boot PCI console injection)
