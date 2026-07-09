@@ -435,18 +435,16 @@ out:
 	return rc;
 }
 
-static struct page *win_pages;
-static u8 *win;
-static u64 win_phys;
-static int win_order;			/* alloc order: 10=4MB (1 port), 11=8MB (2 ports) */
 #define MAX_WORKERS 8
 #define MAXPORT 2
-#define PORT_STRIDE 0x400000		/* per-port window region (4MB) */
 #define RX_PHASE(claimnum)  (((claimnum) >> 7) & 1u)	/* log2(RING_SZ)=7; flips each wrap */
 #define TX_PHASE(tc)        (((tc) >> 7) & 1u)		/* host stamps this per TX slot */
 /* Per-port ring state. The DPI engine + hrx_hdr ring + workers are SHARED
  * (one DPI); only the rings/netdev/dma-bases are per port. */
 struct oct_port {
+	struct page *pages;			/* own 4MB region (order WIN_ORDER) */
+	u64 phys;				/* its card phys (for BAR1 index map) */
+	u8 *base;				/* its kernel VA */
 	struct octshm_ctrl *ctrl;
 	struct octshm_desc *txd, *rxd;
 	u8 *txbuf, *rxbuf;
@@ -503,7 +501,7 @@ static int bench_fn(void *arg)
 	u32 i = 0;
 
 	while (!kthread_should_stop() && time_before(jiffies, tend)) {
-		host_write_dpi(pv[0].rx_dma_base + (u64)(i & 63) * BUF_SZ, win, blen);
+		host_write_dpi(pv[0].rx_dma_base + (u64)(i & 63) * BUF_SZ, pv[0].base, blen);
 		bytes += blen;
 		cnt++;
 		i++;
@@ -836,27 +834,30 @@ static int __init octshm_init(void)
 		ports = 1;
 	if (ports > MAXPORT)
 		ports = MAXPORT;
-	win_order = (ports > 1) ? (WIN_ORDER + 1) : WIN_ORDER;	/* 8MB for 2 ports */
 
-	win_pages = alloc_pages(GFP_KERNEL, win_order);
-	if (!win_pages)
-		return -ENOMEM;
-	win = page_address(win_pages);
-	win_phys = page_to_phys(win_pages);
-	memset(win, 0, 1UL << (win_order + PAGE_SHIFT));
-
-	/* carve one 4MB region per port. Port0's region == win base, so its layout
-	 * (and BAR1 IDX0 mapping) is byte-identical to the single-port build. */
+	/* One 4MB region per port. A single 8MB alloc would exceed the buddy
+	 * MAX_ORDER (top order-10 = 4MB), so each port allocates its own region and
+	 * gets its own BAR1 index -- the host sees them as one contiguous 8MB BAR
+	 * via the two index mappings even though the card phys need not be adjacent. */
 	for (i = 0; i < ports; i++) {
 		struct oct_port *p = &pv[i];
-		u8 *b = win + (unsigned long)i * PORT_STRIDE;
 
+		p->pages = alloc_pages(GFP_KERNEL, WIN_ORDER);
+		if (!p->pages) {
+			pr_err("octshm: port%d 4MB alloc failed\n", i);
+			while (--i >= 0)
+				__free_pages(pv[i].pages, WIN_ORDER);
+			return -ENOMEM;
+		}
+		p->base = page_address(p->pages);
+		p->phys = page_to_phys(p->pages);
+		memset(p->base, 0, 1UL << (WIN_ORDER + PAGE_SHIFT));
 		p->idx   = i;
-		p->ctrl  = (struct octshm_ctrl *)(b + CTRL_OFF);
-		p->txd   = (struct octshm_desc *)(b + TXDESC_OFF);
-		p->rxd   = (struct octshm_desc *)(b + RXDESC_OFF);
-		p->txbuf = b + TXBUF_OFF;
-		p->rxbuf = b + RXBUF_OFF;
+		p->ctrl  = (struct octshm_ctrl *)(p->base + CTRL_OFF);
+		p->txd   = (struct octshm_desc *)(p->base + TXDESC_OFF);
+		p->rxd   = (struct octshm_desc *)(p->base + RXDESC_OFF);
+		p->txbuf = p->base + TXBUF_OFF;
+		p->rxbuf = p->base + RXBUF_OFF;
 		atomic_set(&p->rx_claim_a, 0);
 		p->ctrl->magic   = cpu_to_le32(OCTSHM_MAGIC);
 		p->ctrl->version = cpu_to_le32(OCTSHM_VER);
@@ -869,13 +870,14 @@ static int __init octshm_init(void)
 	}
 	wmb();
 
-	idx = ((win_phys >> 22) << 4) | (1u << 1) | 0x9;	/* CA|ES=1|valid */
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_P2N_BAR0), host_bar0);
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_P2N_BAR1), host_bar1);
 	cvmx_write_csr(CVMX_ADD_IO_SEG(0x00011800C0000128ull), 0x10); /* BAR_CTL: bar1_siz=1 (64M) */
+	/* map each port's 4MB region into consecutive 4MB BAR1 windows */
+	idx = ((pv[0].phys >> 22) << 4) | (1u << 1) | 0x9;	/* CA|ES=1|valid */
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), idx);
-	if (ports > 1) {		/* map the 2nd 4MB region to host BAR1 offset 4MB */
-		u64 idx1 = (((win_phys + PORT_STRIDE) >> 22) << 4) | (1u << 1) | 0x9;
+	if (ports > 1) {
+		u64 idx1 = ((pv[1].phys >> 22) << 4) | (1u << 1) | 0x9;
 
 		cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), idx1);
 	}
@@ -903,7 +905,8 @@ static int __init octshm_init(void)
 				cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), 0);
 				if (ports > 1)
 					cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), 0);
-				__free_pages(win_pages, win_order);
+				for (i = 0; i < ports; i++)
+					__free_pages(pv[i].pages, WIN_ORDER);
 				return -ENODEV;
 			}
 		}
@@ -945,7 +948,8 @@ static int __init octshm_init(void)
 			cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), 0);
 			if (ports > 1)
 				cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), 0);
-			__free_pages(win_pages, win_order);
+			for (j = 0; j < ports; j++)
+				__free_pages(pv[j].pages, WIN_ORDER);
 			return ret;
 		}
 		/* no kthread_bind: let the scheduler float workers so RX softirq
@@ -960,7 +964,7 @@ static int __init octshm_init(void)
 	if (proc_dir)
 		proc_temp = proc_create("temp", 0222, proc_dir, &temp_pops);
 	pr_info("octshm M3: phys=0x%llx ring=%d ports=%d uplink=%s up\n",
-		(unsigned long long)win_phys, RING_SZ, ports, uplink);
+		(unsigned long long)pv[0].phys, RING_SZ, ports, uplink);
 	return 0;
 }
 
@@ -999,7 +1003,9 @@ static void __exit octshm_exit(void)
 		msleep(50);
 	}
 	kfree(hrx_hdr);
-	__free_pages(win_pages, win_order);
+	for (i = 0; i < ports; i++)
+		if (pv[i].pages)
+			__free_pages(pv[i].pages, WIN_ORDER);
 	pr_info("octshm: unloaded\n");
 }
 module_init(octshm_init);
