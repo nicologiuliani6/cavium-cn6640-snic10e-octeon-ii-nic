@@ -176,6 +176,11 @@ static int zc;			/* 1: zero-copy TX. Instead of alloc a 9KB skb + memcpy the
 				 * the 9216B netdev_alloc_skb (~30us) + cold-cache memcpy (~12.7us)
 				 * were ~43 of the ~50us/frame TX budget -> this is the 10G lever. */
 module_param(zc, int, 0444);
+static int bindcpu;		/* 1: pin worker[i] to cpu i (kthread_bind). With nworkers <
+				 * ncpus this frees the top cores for the RX NAPI softirq so a
+				 * full-rate zc TX blast can't starve RX capture off xaui (RX
+				 * collapses to ~0.6G under TX otherwise -- pure CPU contention). */
+module_param(bindcpu, int, 0444);
 
 /* per-DPI-queue ring of 8-byte {len,phase} headers (DMA source for hrx). A ring of
  * 64 gives ample headroom: the header is consumed by the DPI well before we wrap.
@@ -1118,8 +1123,12 @@ static int __init octshm_init(void)
 				__free_pages(pv[j].pages, WIN_ORDER);
 			return ret;
 		}
-		/* no kthread_bind: let the scheduler float workers so RX softirq
-		 * and the card's own tx aren't starved on reverse traffic. */
+		/* bindcpu: pin worker[i] to cpu i so nworkers<ncpus leaves the top
+		 * cores exclusively for the RX NAPI softirq (else the spinning TX
+		 * workers starve RX capture -> RX ~0.6G under a TX blast). Default off
+		 * = float (fine for one-directional TX). */
+		if (bindcpu && i < num_possible_cpus())
+			kthread_bind(workers[i], i);
 		wake_up_process(workers[i]);
 	}
 	ret = 0; (void)ret;

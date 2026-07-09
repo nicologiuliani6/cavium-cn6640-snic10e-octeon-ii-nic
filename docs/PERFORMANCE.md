@@ -42,10 +42,19 @@ config; 8.8–9.5 Gb/s run to run). Ping 0% loss.
 |---|---|
 | **2-port TX** (`oct0`+`oct1` FWD) | 5.69 + 4.84 = **10.53 Gb/s** aggregate |
 | **2-port RX** (`oct0`+`oct1` REV) | 3.48 + 3.47 = **6.95 Gb/s** aggregate |
-| **1-port full-duplex** (`oct0` OUT+IN) | OUT 8.34 Gb/s, IN 0.60 Gb/s |
+| **1-port full-duplex** (`oct0` OUT+IN) | **OUT 9.77 + IN 5.47 = 15.2 Gb/s** |
 
 2-port TX aggregate (~10.5 Gb/s) is the **PCIe host→card direction saturated** — the zero-copy
 TX is fast enough that two ports together fill the inbound PCIe budget.
+
+> **Full-duplex RX-starvation fix (`bindcpu=1`, now default).** A first zero-copy build let one
+> port's full-duplex RX collapse to 0.60 Gb/s while its TX ran at line rate — pure CPU contention,
+> not PCIe: the spinning TX workers starved the RX NAPI softirq that captures frames off XAUI, so
+> the RX queue stayed empty. `bindcpu` pins the (now 6) TX workers to cores 0–5 and the RX POW-group
+> IRQs to cores 6–7, giving RX capture two dedicated cores. Single-port full-duplex went **8.34/0.60
+> → 9.77/5.47 Gb/s** (TX unchanged, RX ×9). The 2-port 4-way case (below) still starves RX — a
+> second bottleneck (the worker-side RX deliver stage competes with TX) that dedicating *NAPI* cores
+> alone doesn't cover.
 
 ## Quad (4-way: both ports, both directions at once)
 
