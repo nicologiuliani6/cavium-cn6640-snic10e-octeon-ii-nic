@@ -4,3 +4,4 @@
 #   octcarrier  : un-gates xaui0/xaui1 TX on the QLogic DAC (cvmx_helper_link_set)
 obj-m += octshm_card.o
 obj-m += octcarrier.o
+obj-m += octnpi.o
