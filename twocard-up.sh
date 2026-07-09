@@ -16,7 +16,9 @@ MODE=${MODE:-host}
 HRX=${HRX:-1}		# host-RAM RX descriptors (matches card image rc.local hrx=1)
 RXTH=${RXTH:-8}		# parallel host RX drain threads (REV ~2.75G->7G). Needs HRX.
 NTXQ=${NTXQ:-8}		# multi-queue TX (FWD): N host txqs -> N cores PIO in parallel
-ZTX=${ZTX:-}		# zero-copy TX (empty=off). BROKEN: inbound DPI corrupts host->card DMA.
+ZTX=${ZTX:-}		# zero-copy TX (empty=off). WORKS now (pipelined inbound DPI, xtype fix),
+			# but ~6.6G < PIO 7.75G: card-reads-host is read-latency-bound vs posted
+			# PIO writes, so PIO ships. Kept for reference / future tuning.
 			# NB keep EMPTY not 0 -- ${ZTX:+..} triggers on any non-empty incl "0".
 NCNS=nc
 NCDEV=${NCDEV:-enp1s0f1}
@@ -79,6 +81,9 @@ else
     done
   fi
   setpci -s $BDF COMMAND=0x06
+  # match card PCIe MaxPayload to the bridge (256B); SBR leaves it at 128B = more TLPs/DMA
+  DC=$(setpci -s $BDF CAP_EXP+8.w 2>/dev/null)
+  [ -n "$DC" ] && setpci -s $BDF CAP_EXP+8.w=$(printf '%04x' $(( 0x$DC & ~0x00e0 | 0x0020 ))) 2>/dev/null
   rmmod octnic 2>/dev/null || true
   # octnic auto-discovers BAR2 (base=0) -> `modprobe octnic` if installed, else insmod by path.
   OPTS="ports=$PORTS dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1} ${NTXQ:+ntxq=$NTXQ}"

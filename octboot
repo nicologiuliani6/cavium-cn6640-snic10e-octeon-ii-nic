@@ -31,6 +31,14 @@ sleep 6						# u-boot boot + bootdelay + window program
 setpci -s "$CARD" BASE_ADDRESS_0=0xf800000c BASE_ADDRESS_2=0xf400000c BASE_ADDRESS_3=0x00000000 COMMAND=0x06
 ok "BAR restored"
 
+# Match the card's PCIe MaxPayload to the bridge (256B). SBR reset it to 128B, which
+# fragments every DMA into more TLPs. Set DevCtl.MPS[7:5]=001 (read-modify: OR 0x20).
+DEVCTL=$(setpci -s "$CARD" CAP_EXP+8.w 2>/dev/null)
+if [ -n "$DEVCTL" ]; then
+  NEW=$(printf '%04x' $(( 0x$DEVCTL & ~0x00e0 | 0x0020 )))
+  setpci -s "$CARD" CAP_EXP+8.w=$NEW 2>/dev/null && ok "MPS 256B (DevCtl $DEVCTL->$NEW)"
+fi
+
 OFF=$OFF CARD=$CARD python3 - "$IMG" <<'PY'
 import mmap,os,sys,time
 off=int(os.environ["OFF"],0); card=os.environ["CARD"]

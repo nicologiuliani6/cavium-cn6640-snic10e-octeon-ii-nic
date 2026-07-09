@@ -7,10 +7,17 @@ Measured with `iperf3 -P8`, MTU 9000, on a fresh card boot, over a DAC to an HP 
 
 | port | FWD (host → peer) | REV (peer → host) |
 |---|---|---|
-| `oct0` (xaui0) | 7.75 Gb/s | 7.74 Gb/s |
+| `oct0` (xaui0) | 8.29 Gb/s | 7.75 Gb/s |
 | `oct1` (xaui1) | 7.28 Gb/s | 6.91 Gb/s |
 
 Both directions near line rate. Ping 0% loss.
+
+> **PCIe MaxPayload (MPS).** The card is Gen2 ×4 (`lspci`: `5GT/s Width x4`) → ~16 Gb/s usable per
+> direction, so 10 Gb/s per port in one direction is within budget. A Secondary Bus Reset leaves the
+> card's MPS at 128 B while the bridge is 256 B; `octboot` now re-matches the card to **256 B**
+> (`setpci … CAP_EXP+8.w`), which lifted `oct0` FWD 7.75 → **8.29 Gb/s**. The remaining gap to line
+> rate is the card's per-packet CPU cost (skb alloc + copy on TX, RX tap clone), not the PCIe link or
+> the DMA engine (which benches > 14 Gb/s) — closing it needs a zero-copy card datapath.
 
 ## Simultaneous (both ports, full bidirectional)
 

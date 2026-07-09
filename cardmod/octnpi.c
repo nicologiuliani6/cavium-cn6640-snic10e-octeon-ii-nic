@@ -28,15 +28,25 @@
 
 /* SLI SCRATCH1 = card->host telemetry (host reads BAR0+0x3C0, one-shot, no DMA).
  * Packs: [63:32] frames xmit-OK, [31:16] frames dropped, [1] npi found, [0] npi open. */
-#define OCTNPI_SCRATCH 0x00011F00000103C0ull
+#define OCTNPI_SCRATCH  0x00011F00000103C0ull	/* SCRATCH1: [63:32]=n_ok [31:16]=n_drop [0]=opened */
+#define OCTNPI_SCRATCH2 0x00011F00000103D0ull	/* SCRATCH2: [63:32]=tx_pkts [31:16]=tx_err [15:0]=tx_drop */
+static struct net_device *npi_dev;
 static atomic_t n_ok = ATOMIC_INIT(0), n_drop = ATOMIC_INIT(0);
 static int npi_opened;
 static void report(void)
 {
+	struct rtnl_link_stats64 st = {0};
 	u64 v = ((u64)atomic_read(&n_ok) << 32) |
 		((u64)(atomic_read(&n_drop) & 0xffff) << 16) |
 		(npi_opened ? 1u : 0u);
 	cvmx_write_csr(CVMX_ADD_IO_SEG(OCTNPI_SCRATCH), v);
+	if (npi_dev) {
+		dev_get_stats(npi_dev, &st);
+		cvmx_write_csr(CVMX_ADD_IO_SEG(OCTNPI_SCRATCH2),
+			((u64)(st.tx_packets & 0xffffffff) << 32) |
+			((u64)(st.tx_errors & 0xffff) << 16) |
+			(u64)(st.tx_dropped & 0xffff));
+	}
 }
 
 static char *dev = "npi0";	/* NPI/PCI netdev to egress on */

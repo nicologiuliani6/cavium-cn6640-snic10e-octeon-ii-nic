@@ -172,6 +172,8 @@ module_param(ztx, int, 0444);
 static struct octshm_desc *hrx_hdr;
 static u32 hrx_hi[8];
 #define HRX_H(k, hi) (&hrx_hdr[(k) * 64 + (hi)])
+#define ZTX_RINGD 128		/* ztx: max outstanding per DPI queue (seq-source ring) */
+static u64 *ztx_done, *ztx_src;	/* ztx completion + marker-source cells (see ztx_post) */
 
 static int dpi_nic_init(void)
 {
@@ -190,6 +192,12 @@ static int dpi_nic_init(void)
 		return -ENOMEM;
 	if (hrx && !hrx_hdr)	/* kmalloc (linear map): virt_to_phys valid for DPI src */
 		hrx_hdr = kzalloc(DPI_NQ * 64 * sizeof(*hrx_hdr), GFP_KERNEL);
+	if (ztx && !ztx_done) {	/* pipelined-TX completion cells (linear map for DPI) */
+		ztx_done = kzalloc(DPI_NQ * sizeof(u64), GFP_KERNEL);
+		ztx_src  = kzalloc(DPI_NQ * ZTX_RINGD * sizeof(u64), GFP_KERNEL);
+		if (!ztx_done || !ztx_src)
+			return -ENOMEM;
+	}
 	for (i = 0; i < DPI_NBLK; i++)
 		cvmx_fpa_free((void *)(dpi_region + (unsigned long)i * DPI_PSIZE),
 			      DPI_POOL, 0);
@@ -405,7 +413,7 @@ static int host_read_dpi(u64 host_src, u64 dst_phys, u32 len)
 
 		if (chunk > DPI_MAXLEN)
 			chunk = DPI_MAXLEN;
-		cmd[0] = ((u64)1 << 48) | ((u64)1 << 44) | ((u64)1 << 40);	/* INBOUND: xtype[49:48]=1 */
+		cmd[0] = ((u64)1 << 54) | ((u64)1 << 44) | ((u64)1 << 40);	/* INBOUND: type[55:54]=1 (proven in octdpi_test ib=1; was 1<<48 => 100% drop) */
 		cmd[1] = ((u64)(chunk & 0x1FFF) << 40) |
 			 ((dst_phys + off) & 0x0000000FFFFFFFFFull);		/* local dest */
 		cmd[2] = ((u64)chunk & 0xFFFFull) << 48;
@@ -435,8 +443,100 @@ out:
 	return rc;
 }
 
+/* --- pipelined inbound-DPI TX (ztx) ---------------------------------------------
+ * The blocking host_read_dpi (wait DPIR_COUNTS==0 per frame) serialized TX to ~28M.
+ * Instead: post the frame's INBOUND DMA + an INTERNAL "marker" that copies this frame's
+ * seq into ztx_done[k] AFTER the data lands (same DPI queue -> single engine -> FIFO),
+ * never block, and xmit each frame once ztx_done[k] >= its seq. Uncached (CKSEG1) access
+ * to the seq cells so CPU<->DPI see each other's writes without cache games. */
+/* 64-bit uncached XKPHYS (cca=2) so the completion cells work regardless of where in
+ * card DRAM they land (CKSEG1 only maps the low 512MB). */
+#define OCT_UNC(p) ((volatile u64 *)(0x9000000000000000ull | (u64)virt_to_phys((void *)(p))))
+static u64  ztx_next[DPI_NQ];		/* producer seq (under dpi_lock[k]) */
+
+static inline u64 ztx_completed(int k) { return *OCT_UNC(&ztx_done[k]); }
+
+/* Post INBOUND DMA (host_src -> dst_phys, len) + FIFO completion marker on queue k.
+ * Returns assigned seq (>0), or 0 if pipeline full / post failed. Never blocks. */
+static u64 ztx_post(int k, u64 host_src, u64 dst_phys, u32 len)
+{
+	int q = DPI_Q0 + k;
+	u64 seq, cmd[4], scell;
+	u32 off = 0, nposted = 0;
+	unsigned long fl;
+
+	if (len == 0 || len > 2 * DPI_MAXLEN)
+		return 0;
+	spin_lock_irqsave(&dpi_lock[k], fl);
+	seq = ztx_next[k] + 1;
+	if (seq - ztx_completed(k) >= ZTX_RINGD - 8) {	/* backpressure: too many in flight */
+		spin_unlock_irqrestore(&dpi_lock[k], fl);
+		return 0;
+	}
+	while (off < len) {				/* INBOUND data, chunked to <8KB */
+		u32 chunk = min_t(u32, len - off, DPI_MAXLEN);
+
+		cmd[0] = ((u64)1 << 54) | ((u64)1 << 44) | ((u64)1 << 40);	/* type[55:54]=1 INBOUND */
+		cmd[1] = ((u64)(chunk & 0x1FFF) << 40) | ((dst_phys + off) & 0x0000000FFFFFFFFFull);
+		cmd[2] = ((u64)chunk & 0xFFFFull) << 48;
+		cmd[3] = host_src + off;
+		if (cvmx_cmd_queue_write(CVMX_CMD_QUEUE_DMA(q), 0, 4, cmd) != CVMX_CMD_QUEUE_SUCCESS)
+			goto fail;
+		off += chunk;
+		nposted += 4;
+	}
+	/* INTERNAL marker: copy the 8-byte seq cell -> ztx_done[k] (lands after data, FIFO) */
+	scell = (u64)k * ZTX_RINGD + (seq & (ZTX_RINGD - 1));
+	*OCT_UNC(&ztx_src[scell]) = seq;
+	cmd[0] = ((u64)2 << 54) | ((u64)1 << 44) | ((u64)1 << 40);	/* type[55:54]=2 INTERNAL */
+	cmd[1] = ((u64)8 << 40) | (virt_to_phys(&ztx_src[scell]) & 0x0000000FFFFFFFFFull);
+	cmd[2] = ((u64)8 << 40) | (virt_to_phys(&ztx_done[k])   & 0x0000000FFFFFFFFFull);
+	if (cvmx_cmd_queue_write(CVMX_CMD_QUEUE_DMA(q), 0, 3, cmd) != CVMX_CMD_QUEUE_SUCCESS)
+		goto fail;
+	nposted += 3;
+	CVMX_SYNCWS;
+	cvmx_write_csr(CVMX_ADD_IO_SEG(DPIR_DBELL(q)), nposted);
+	ztx_next[k] = seq;
+	spin_unlock_irqrestore(&dpi_lock[k], fl);
+	return seq;
+fail:
+	spin_unlock_irqrestore(&dpi_lock[k], fl);
+	return 0;
+}
+
 #define MAX_WORKERS 8
 #define MAXPORT 2
+/* per-worker ztx pipeline: frames posted (DMA in flight), awaiting completion + xmit.
+ * One DPI queue per worker (id % DPI_NQ) so FIFO head is always the oldest seq. */
+struct ztx_pend { struct sk_buff *skb; struct net_device *dev; u32 seq; u8 k; };
+#define ZTX_FIFO 256
+static struct ztx_pend ztx_fifo[MAX_WORKERS][ZTX_FIFO];
+static u32 ztx_h[MAX_WORKERS], ztx_t[MAX_WORKERS];
+
+/* xmit every pipelined frame whose data has landed (head = oldest seq on this queue) */
+static void ztx_drain(int id)
+{
+	while (ztx_h[id] != ztx_t[id]) {
+		struct ztx_pend *e = &ztx_fifo[id][ztx_h[id] & (ZTX_FIFO - 1)];
+		struct sk_buff *skb = e->skb;
+		struct ethhdr *eh;
+
+		if ((s64)(ztx_completed(e->k) - e->seq) < 0)
+			break;				/* not landed yet */
+		skb->dev = e->dev;
+		skb_reset_mac_header(skb);
+		skb->protocol = eth_hdr(skb)->h_proto;
+		eh = eth_hdr(skb);
+		if (ether_addr_equal_unaligned(eh->h_dest, e->dev->dev_addr) ||
+		    is_broadcast_ether_addr(eh->h_dest)) {
+			skb->pkt_type = PACKET_HOST;
+			netif_rx(skb);
+		} else {
+			dev_queue_xmit(skb);
+		}
+		ztx_h[id]++;
+	}
+}
 #define RX_PHASE(claimnum)  (((claimnum) >> 7) & 1u)	/* log2(RING_SZ)=7; flips each wrap */
 #define TX_PHASE(tc)        (((tc) >> 7) & 1u)		/* host stamps this per TX slot */
 /* Per-port ring state. The DPI engine + hrx_hdr ring + workers are SHARED
@@ -741,7 +841,6 @@ static int worker_fn(void *arg)
 			struct oct_port *p = &pv[pi];
 			struct sk_buff *skb;
 			u32 tc, ts, len, i, m;
-			int have = 0;
 
 			if (!p->dma_ready || !p->up_dev)
 				continue;
@@ -751,39 +850,42 @@ static int worker_fn(void *arg)
 				continue;			/* slot not filled yet */
 			rmb();					/* phase seen => len+data landed */
 			len = le32_to_cpu(p->txd[ts].len);
-			p->tx_cons_w[id] = tc + nworkers;
-			m = p->tx_cons_w[0];			/* publish tx_cons = min (bp floor) */
-			for (i = 1; i < (u32)nworkers; i++)
-				if ((s32)(p->tx_cons_w[i] - m) < 0)
-					m = p->tx_cons_w[i];
-			p->ctrl->tx_cons = cpu_to_le32(m);
-			did = 1;
-			if (!(len >= ETH_HLEN && len <= BUF_SZ))
-				continue;		/* bad len: slot consumed, skip */
-			skb = netdev_alloc_skb(p->up_dev, BUF_SZ + NET_IP_ALIGN);
-			if (!skb)
-				continue;
+
 			if (ztx && p->dma_ready == 2) {
-				have = 2;		/* DPI-fetch below */
-			} else {
-				skb_reserve(skb, NET_IP_ALIGN);
-				memcpy(skb_put(skb, len), p->txbuf + ts * BUF_SZ, len);
-				have = 1;
-			}
-			if (have == 2) {	/* ztx: DMA host RAM -> skb, no host PIO */
-				skb_reserve(skb, NET_IP_ALIGN);
-				if (host_read_dpi(p->tx_dma_base + (u64)ts * BUF_SZ,
-						  virt_to_phys(skb_put(skb, len)), len) != 0)
-					have = 0;	/* post failed: drop this frame */
-			}
-			if (have) {
+				/* pipelined inbound DPI: post the DMA now, xmit later in
+				 * ztx_drain() once the marker confirms the frame landed. */
+				int k = id & (DPI_NQ - 1);
+				u64 seq;
+
+				if (((ztx_t[id] + 1) & (ZTX_FIFO - 1)) == (ztx_h[id] & (ZTX_FIFO - 1)))
+					break;			/* pipeline full: drain + retry slot */
+				if (len >= ETH_HLEN && len <= BUF_SZ) {
+					skb = netdev_alloc_skb(p->up_dev, BUF_SZ + NET_IP_ALIGN);
+					if (!skb)
+						break;		/* no mem: retry slot next pass */
+					skb_reserve(skb, NET_IP_ALIGN);
+					seq = ztx_post(k, p->tx_dma_base + (u64)ts * BUF_SZ,
+						       virt_to_phys(skb_put(skb, len)), len);
+					if (!seq) {		/* pipeline full / post failed: retry */
+						dev_kfree_skb(skb);
+						break;
+					}
+					ztx_fifo[id][ztx_t[id] & (ZTX_FIFO - 1)] =
+						(struct ztx_pend){ .skb = skb, .dev = p->up_dev,
+								   .seq = seq, .k = (u8)k };
+					ztx_t[id]++;
+				}				/* bad len: slot consumed, no post */
+			} else if (len >= ETH_HLEN && len <= BUF_SZ &&
+				   (skb = netdev_alloc_skb(p->up_dev, BUF_SZ + NET_IP_ALIGN))) {
+				/* PIO copy path: host already wrote the frame into the window */
 				struct ethhdr *eh;
 
+				skb_reserve(skb, NET_IP_ALIGN);
+				memcpy(skb_put(skb, len), p->txbuf + ts * BUF_SZ, len);
 				skb->dev = p->up_dev;
 				skb_reset_mac_header(skb);
 				skb->protocol = eth_hdr(skb)->h_proto;
 				eh = eth_hdr(skb);
-				/* Host PCIe -> card IP on uplink: deliver locally. */
 				if (ether_addr_equal_unaligned(eh->h_dest, p->up_dev->dev_addr) ||
 				    is_broadcast_ether_addr(eh->h_dest)) {
 					skb->pkt_type = PACKET_HOST;
@@ -791,10 +893,17 @@ static int worker_fn(void *arg)
 				} else {
 					dev_queue_xmit(skb);
 				}
-			} else {
-				dev_kfree_skb(skb);
 			}
+			/* slot consumed: advance this worker's consumer + publish min floor */
+			p->tx_cons_w[id] = tc + nworkers;
+			m = p->tx_cons_w[0];
+			for (i = 1; i < (u32)nworkers; i++)
+				if ((s32)(p->tx_cons_w[i] - m) < 0)
+					m = p->tx_cons_w[i];
+			p->ctrl->tx_cons = cpu_to_le32(m);
+			did = 1;
 		}
+		ztx_drain(id);				/* xmit frames whose inbound DMA completed */
 		if (did)
 			cond_resched();
 		else
@@ -991,8 +1100,11 @@ static void __exit octshm_exit(void)
 		if (pv[i].ctrl)
 			pv[i].ctrl->card_ready = 0;
 	}
-	for (i = 0; i < MAX_WORKERS; i++)		/* free any skbs still queued */
+	for (i = 0; i < MAX_WORKERS; i++) {		/* free any skbs still queued */
 		skb_queue_purge(&rxq[i]);
+		while (ztx_h[i] != ztx_t[i])		/* free undrained pipelined TX skbs */
+			dev_kfree_skb(ztx_fifo[i][ztx_h[i]++ & (ZTX_FIFO - 1)].skb);
+	}
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), 0);
 	if (ports > 1)
 		cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), 0);
@@ -1004,6 +1116,7 @@ static void __exit octshm_exit(void)
 		msleep(50);
 	}
 	kfree(hrx_hdr);
+	kfree(ztx_done); kfree(ztx_src);
 	for (i = 0; i < ports; i++)
 		if (pv[i].pages)
 			__free_pages(pv[i].pages, WIN_ORDER);
