@@ -60,7 +60,7 @@ PY
 ok "Booting... (u-boot flush -> bootoctlinux)"
 
 # wait for the card NIC to raise its BAR2 heartbeat (magic 0x4f435348 + card_ready=1)
-for _ in $(seq 1 30); do
+for _ in $(seq 1 45); do
   v=$(python3 -c "import mmap,os
 fd=os.open('/sys/bus/pci/devices/0000:$CARD/resource2',os.O_RDONLY)
 m=mmap.mmap(fd,4096,mmap.PROT_READ)
