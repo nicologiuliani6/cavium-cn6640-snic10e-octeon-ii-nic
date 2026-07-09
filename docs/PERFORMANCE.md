@@ -7,11 +7,11 @@ Measured with `iperf3 -P8`, MTU 9000, on a fresh card boot, over a DAC to an HP 
 
 | port | FWD (host → peer) | REV (peer → host) |
 |---|---|---|
-| `oct0` (xaui0) | **9.71 Gb/s** | 7.51 Gb/s |
-| `oct1` (xaui1) | ~9.2 Gb/s | ~7.3 Gb/s |
+| `oct0` (xaui0) | 8.8 – **9.71** Gb/s | 7.4 Gb/s |
+| `oct1` (xaui1) | 9.2 – 9.5 Gb/s | 8.2 Gb/s |
 
-FWD is **line-rate 10 GbE**. Ping 0% loss. (`oct0` FWD reached 9.71 Gb/s single-port and 9.22 Gb/s
-in the shipped `ports=2` config.)
+FWD is **line-rate 10 GbE** (peak `oct0` 9.71 Gb/s single-port, 9.22 Gb/s in the shipped `ports=2`
+config; 8.8–9.5 Gb/s run to run). Ping 0% loss.
 
 > **Zero-copy TX = the 10G lever.** Reaching line rate took two card-side fixes:
 >
@@ -36,26 +36,33 @@ in the shipped `ports=2` config.)
 > throttled TX to 299 Mb/s through the driver's lazy `tx_free_list`; dropping it for ring-depth safety
 > is what unlocked line rate.
 
-## Simultaneous (both ports, full bidirectional)
+## Double (two streams at once)
 
-Full 4-way load = `oct0` TX+RX and `oct1` TX+RX all at once:
+| load | result |
+|---|---|
+| **2-port TX** (`oct0`+`oct1` FWD) | 5.69 + 4.84 = **10.53 Gb/s** aggregate |
+| **2-port RX** (`oct0`+`oct1` REV) | 3.48 + 3.47 = **6.95 Gb/s** aggregate |
+| **1-port full-duplex** (`oct0` OUT+IN) | OUT 8.34 Gb/s, IN 0.60 Gb/s |
+
+2-port TX aggregate (~10.5 Gb/s) is the **PCIe host→card direction saturated** — the zero-copy
+TX is fast enough that two ports together fill the inbound PCIe budget.
+
+## Quad (4-way: both ports, both directions at once)
 
 | port | TX (host → peer) | RX (peer → host) |
 |---|---|---|
-| `oct0` | 5.09 Gb/s | 2.85 Gb/s |
-| `oct1` | 5.09 Gb/s | 2.59 Gb/s |
+| `oct0` | 5.05 Gb/s | 0.28 Gb/s |
+| `oct1` | 5.08 Gb/s | 0.74 Gb/s |
 
-**Aggregate ≈ 15.6 Gb/s**, close to the PCIe Gen2 x4 full-duplex ceiling (~16 Gb/s per
-direction). TX ~10.2 Gb/s + RX ~5.4 Gb/s across the two ports.
+**TX aggregate ~10.1 Gb/s** (the inbound-PCIe ceiling again), 0% ping loss, no wedge.
 
-> **TX-starvation fix.** Earlier builds collapsed TX to ~0.45 Gb/s/port under this load
-> (aggregate ~6.4 Gb/s): the card's worker loop drained RX and then *skipped* the TX drain
-> whenever it had moved any RX, so a never-empty RX queue starved TX entirely. Bounding the
-> RX batch and always falling through to the TX drain lifted TX to ~5.09 Gb/s/port with no
-> RX cost — a 2.4× aggregate improvement. (commit `octshm_card: fix TX starvation`.)
-
-The remaining ceiling is the card's 8-core Octeon + PCIe bandwidth, shared across all
-flows — you still don't get 2 × 10 G by summing the ports, but both directions now coexist.
+> **RX starves under simultaneous TX — a trade-off of the zero-copy win.** With `zc` the TX
+> path is so much cheaper per frame that the card's 8 worker cores stay busy transmitting and
+> under-service the RX drain, so RX collapses under a full TX blast (quad RX ~1 Gb/s aggregate;
+> single-direction RX is a healthy 7–8 Gb/s). The card's 8-core Octeon, not the PCIe link, is
+> the shared resource here. Rebalancing the worker loop (bounding the TX batch per pass so RX
+> gets serviced under contention) is the open lever if balanced bidirectional throughput matters
+> more than peak one-way TX; the shipped default optimizes for line-rate TX.
 
 ## Takeaways
 
