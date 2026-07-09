@@ -42,19 +42,24 @@ config; 8.8–9.5 Gb/s run to run). Ping 0% loss.
 |---|---|
 | **2-port TX** (`oct0`+`oct1` FWD) | 5.69 + 4.84 = **10.53 Gb/s** aggregate |
 | **2-port RX** (`oct0`+`oct1` REV) | 3.48 + 3.47 = **6.95 Gb/s** aggregate |
-| **1-port full-duplex** (`oct0` OUT+IN) | **OUT 9.77 + IN 5.47 = 15.2 Gb/s** |
+| **1-port full-duplex** (`oct0` OUT+IN) | OUT 9.6–9.8 + IN 0.07–5.47 Gb/s (see note) |
 
 2-port TX aggregate (~10.5 Gb/s) is the **PCIe host→card direction saturated** — the zero-copy
 TX is fast enough that two ports together fill the inbound PCIe budget.
 
-> **Full-duplex RX-starvation fix (`bindcpu=1`, now default).** A first zero-copy build let one
-> port's full-duplex RX collapse to 0.60 Gb/s while its TX ran at line rate — pure CPU contention,
-> not PCIe: the spinning TX workers starved the RX NAPI softirq that captures frames off XAUI, so
-> the RX queue stayed empty. `bindcpu` pins the (now 6) TX workers to cores 0–5 and the RX POW-group
-> IRQs to cores 6–7, giving RX capture two dedicated cores. Single-port full-duplex went **8.34/0.60
-> → 9.77/5.47 Gb/s** (TX unchanged, RX ×9). The 2-port 4-way case (below) still starves RX — a
-> second bottleneck (the worker-side RX deliver stage competes with TX) that dedicating *NAPI* cores
-> alone doesn't cover.
+> **Full-duplex RX under TX — `bindcpu=1`, and an unresolved reproducibility caveat.** Under a
+> full-rate zc TX blast a port's full-duplex RX starves: the spinning TX workers crowd out the RX
+> NAPI softirq that captures frames off XAUI. `bindcpu=1` (default) pins the (now 6) TX workers to
+> cores 0–5 and the RX POW-group IRQs to cores 6–7 so RX capture has dedicated cores. **On a
+> freshly-booted card this lifted single-port full-duplex to 9.77 / 5.47 Gb/s (TX line-rate, RX ×9
+> over the un-pinned build). But the RX half did not reproduce after several more boot cycles
+> (9.60 / 0.07), alongside a drop in RX-alone (7.2 → 5.5) — i.e. the card's DRAM degrades under a
+> long session of boots ([troubleshooting](USAGE.md#troubleshooting)), and RX (a DPI read path) is
+> far more sensitive to that than TX (posted writes).** So: **TX line-rate is solid and
+> reproducible; the `bindcpu` full-duplex-RX gain is real on a fresh card but needs re-validation
+> from a cold boot before it's a headline number.** The 2-port 4-way case starves RX regardless of
+> core split (tried 2- and 4-RX-core layouts) — a shared-resource wall (DPI engine / memory
+> bandwidth), not core allocation.
 
 ## Quad (4-way: both ports, both directions at once)
 
