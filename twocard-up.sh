@@ -22,6 +22,10 @@ NCNS=nc
 NCDEV=${NCDEV:-enp1s0f1}
 NCMAC=${NCMAC:-c4:34:6b:cc:38:fc}
 CARD_XAUI0_MAC=00:0f:b7:96:8f:4c
+PORTS=${PORTS:-2}	# host netdevs: 1=oct0 only, 2=oct0+oct1 (needs 2nd DAC xaui1<->NC523 f0)
+NCNS2=nc2		# port1 peer (NC523 f0) in its own netns / subnet 10.9.10.x
+NC2DEV=${NC2DEV:-enp1s0f0}
+NC2MAC=${NC2MAC:-c4:34:6b:cc:38:f8}
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
 BDF=$(lspci -d 177d:0092 | awk '{print $1}' | head -1)
@@ -76,16 +80,27 @@ else
   fi
   setpci -s $BDF COMMAND=0x06
   rmmod octshm_host 2>/dev/null || true
-  insmod "$DIR/hostmod/octshm_host.ko" base=$BAR2 dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1} ${NTXQ:+ntxq=$NTXQ}
-  ip addr flush dev oct0; ip addr add $C/24 dev oct0; ip link set oct0 mtu 9000 up
-  OCT0MAC=$(cat /sys/class/net/oct0/address)
-  ip neigh replace $N lladdr $NCMAC dev oct0 nud permanent
-  ip netns exec $NCNS ip addr flush dev $NCDEV
-  ip netns exec $NCNS ip addr add $N/24 dev $NCDEV
-  ip netns exec $NCNS ip link set $NCDEV up mtu 9000
-  ip netns exec $NCNS ip neigh replace $C lladdr $OCT0MAC dev $NCDEV nud permanent
+  insmod "$DIR/hostmod/octshm_host.ko" base=$BAR2 ports=$PORTS dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1} ${NTXQ:+ntxq=$NTXQ}
+
+  # port i <-> its NC523 peer in a private netns + subnet (static ARP both sides)
+  setup_port() { # oct ns dev peermac cip nip
+    local OCT=$1 NS=$2 DEV=$3 PMAC=$4 CIP=$5 NIP=$6
+    ip netns add $NS 2>/dev/null || true
+    ip link set $DEV netns $NS 2>/dev/null || true
+    ip netns exec $NS ip link set lo up
+    ip addr flush dev $OCT; ip addr add $CIP/24 dev $OCT; ip link set $OCT mtu 9000 up
+    local OMAC=$(cat /sys/class/net/$OCT/address)
+    ip neigh replace $NIP lladdr $PMAC dev $OCT nud permanent
+    ip netns exec $NS ip addr flush dev $DEV
+    ip netns exec $NS ip addr add $NIP/24 dev $DEV
+    ip netns exec $NS ip link set $DEV up mtu 9000
+    ip netns exec $NS ip neigh replace $CIP lladdr $OMAC dev $DEV nud permanent
+  }
+  setup_port oct0 $NCNS  $NCDEV  $NCMAC  $C 10.9.9.2
+  [ "$PORTS" -ge 2 ] && setup_port oct1 $NCNS2 $NC2DEV $NC2MAC 10.9.10.1 10.9.10.2
   sleep 2
-  echo "[ping] $(ping -c3 -W1 $N 2>&1 | grep -oE '[0-9]+% packet loss')"
-  echo ">>> iperf server: sudo ip netns exec $NCNS iperf3 -s -B $N"
-  echo ">>> iperf client: sudo iperf3 -c $N -B $C -P4 -t10   (add -R for reverse)"
+  echo "[ping oct0] $(ping -c3 -W1 $N 2>&1 | grep -oE '[0-9]+% packet loss')"
+  [ "$PORTS" -ge 2 ] && echo "[ping oct1] $(ping -c3 -W1 10.9.10.2 2>&1 | grep -oE '[0-9]+% packet loss')"
+  echo ">>> oct0 iperf: sudo ip netns exec $NCNS iperf3 -s -B $N  |  sudo iperf3 -c $N -B $C -P8 -t10 [-R]"
+  [ "$PORTS" -ge 2 ] && echo ">>> oct1 iperf: sudo ip netns exec $NCNS2 iperf3 -s -B 10.9.10.2  |  sudo iperf3 -c 10.9.10.2 -B 10.9.10.1 -P8 -t10 [-R]"
 fi
