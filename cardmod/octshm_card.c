@@ -26,7 +26,8 @@
 #define PEM_P2N_BAR0   0x00011800C0000080ull
 #define PEM_P2N_BAR1   0x00011800C0000088ull
 #define PEM_BAR1_IDX0  0x00011800C00000A8ull
-#define WIN_ORDER      10			/* 4MB */
+#define PEM_BAR1_IDX1  0x00011800C00000B0ull	/* second 4MB granule (port1) */
+#define WIN_ORDER      10			/* 4MB (1 port); +1 => 8MB for 2 ports */
 
 /* host PCIe BAR base addresses (BIOS may reassign across host reboots) */
 static unsigned long host_bar0 = 0xf8000000;
@@ -78,9 +79,11 @@ static int bench;			/* >0: run a raw-DPI throughput benchmark for N sec */
 module_param(bench, int, 0444);
 static int blen = 1500;			/* benchmark transfer size (bytes) */
 module_param(blen, int, 0444);
-static struct net_device *up_dev;
-static int dma_ready;
-static u64 tx_dma_base, rx_dma_base;
+/* Multi-port: one host netdev per card uplink (oct0<->xaui0, oct1<->xaui1),
+ * each owning a private 4MB window region at PORT_STRIDE*i. ports=1 keeps
+ * port0 byte-identical to the single-port build. uplink is a comma-list. */
+static int ports = 1;
+module_param(ports, int, 0444);
 
 static inline u64 host_va(u64 busaddr)
 {
@@ -435,10 +438,29 @@ out:
 static struct page *win_pages;
 static u8 *win;
 static u64 win_phys;
-static struct octshm_ctrl *ctrl;
-static struct octshm_desc *txd, *rxd;
-static u8 *txbuf, *rxbuf;
+static int win_order;			/* alloc order: 10=4MB (1 port), 11=8MB (2 ports) */
 #define MAX_WORKERS 8
+#define MAXPORT 2
+#define PORT_STRIDE 0x400000		/* per-port window region (4MB) */
+#define RX_PHASE(claimnum)  (((claimnum) >> 7) & 1u)	/* log2(RING_SZ)=7; flips each wrap */
+#define TX_PHASE(tc)        (((tc) >> 7) & 1u)		/* host stamps this per TX slot */
+/* Per-port ring state. The DPI engine + hrx_hdr ring + workers are SHARED
+ * (one DPI); only the rings/netdev/dma-bases are per port. */
+struct oct_port {
+	struct octshm_ctrl *ctrl;
+	struct octshm_desc *txd, *rxd;
+	u8 *txbuf, *rxbuf;
+	struct net_device *up_dev;
+	struct packet_type ptype;
+	u64 tx_dma_base, rx_dma_base;
+	atomic_t rx_claim_a;			/* lockfree CAS slot claim */
+	u32 rx_claim;				/* locked-path claim index */
+	u8 rx_done[RING_SZ];			/* ordered-publish flags (non-lockfree) */
+	u32 tx_cons_w[MAX_WORKERS];		/* per-worker TX consumer (stride nworkers) */
+	int dma_ready;				/* 0 none, 1 SLI copy, 2 DPI */
+	int idx;
+};
+static struct oct_port pv[MAXPORT];
 static struct task_struct *workers[MAX_WORKERS];
 static int nworkers = 2;	/* rev ~1.93G (rx_lock-driven); 2 = best fwd consistency */
 module_param(nworkers, int, 0444);
@@ -449,10 +471,7 @@ static int rxwork;		/* offload RX DPI off the single cpu0 NAPI: the ptype tap ju
 module_param(rxwork, int, 0444);
 #define RXQ_MAX 256		/* per-worker backlog cap; over -> deliver inline (no drop) */
 static struct sk_buff_head rxq[MAX_WORKERS];
-static DEFINE_SPINLOCK(tx_lock);	/* serializes TX slot claim + copy + tx_cons */
-static DEFINE_SPINLOCK(rx_lock);	/* guards rx_claim + ordered rx_prod publish */
-static u32 rx_claim;			/* RX slot claim index (ahead of published rx_prod) */
-static u8 rx_done[RING_SZ];		/* per-slot DMA-complete flags for ordered publish */
+static DEFINE_SPINLOCK(rx_lock);	/* guards non-lockfree rx_done + rx_prod publish (all ports) */
 /* lockfree=1: drop rx_lock entirely. Claim a slot with an atomic CAS (clean drop on
  * full, no hole), and instead of publishing a monotonic rx_prod under lock, stamp a
  * PHASE bit into the slot's desc.flags. The host reads the phase to tell ready vs stale
@@ -460,13 +479,19 @@ static u8 rx_done[RING_SZ];		/* per-slot DMA-complete flags for ordered publish 
  * host change required (octshm_host lockfree=1). */
 static int lockfree;
 module_param(lockfree, int, 0444);
-static atomic_t rx_claim_a = ATOMIC_INIT(0);
-#define RX_PHASE(claimnum)  (((claimnum) >> 7) & 1u)	/* log2(RING_SZ)=7; flips each wrap */
-#define TX_PHASE(tc)        (((tc) >> 7) & 1u)		/* host stamps this per TX slot */
-static u32 tx_cons_w[MAX_WORKERS];			/* per-worker TX consumer (stride nworkers) */
 #define RXF_PHASE  0x1u
 static u32 beat;
 static struct task_struct *bench_thread;
+static int dpi_up;			/* shared SLI+DPI engine level (0/1/2), init once */
+static struct oct_port *port_of_dev(struct net_device *d)
+{
+	int i;
+
+	for (i = 0; i < ports; i++)
+		if (pv[i].up_dev == d)
+			return &pv[i];
+	return NULL;
+}
 
 /* Raw-DPI throughput benchmark: hammer host_write_dpi (card L2 -> host RAM) as fast as
  * possible for `bench` seconds, no network/tap/skb involved. Isolates the DPI engine's
@@ -478,7 +503,7 @@ static int bench_fn(void *arg)
 	u32 i = 0;
 
 	while (!kthread_should_stop() && time_before(jiffies, tend)) {
-		host_write_dpi(rx_dma_base + (u64)(i & 63) * BUF_SZ, win, blen);
+		host_write_dpi(pv[0].rx_dma_base + (u64)(i & 63) * BUF_SZ, win, blen);
 		bytes += blen;
 		cnt++;
 		i++;
@@ -496,112 +521,24 @@ static int bench_fn(void *arg)
 	return 0;
 }
 
-/* RX: uplink inbound frame -> card->host RX ring. Registered as an ETH_P_ALL
- * packet_type (like tcpdump), which every netif_receive_skb path invokes. The
- * skb is shared (not owned) here: read it, copy into the ring, do not free. */
-static struct packet_type oct_ptype;
-static netdev_tx_t (*orig_ndo_xmit)(struct sk_buff *, struct net_device *);
-static struct net_device_ops oct_netdev_ops;
-
-/* Push one L2 frame into the card->host RX ring (shared by RX tap + TX mirror). */
-static void oct_push_rx_l2(const unsigned char *l2, u32 len)
-{
-	u32 claim, rc, rs;
-	unsigned long rxflags;
-
-	if (!(len && len <= BUF_SZ))
-		return;
-
-	if (lockfree) {
-		for (;;) {
-			claim = (u32)atomic_read(&rx_claim_a);
-			rc = le32_to_cpu(ctrl->rx_cons);
-			if ((claim - rc) >= RING_SZ)
-				return;
-			if ((u32)atomic_cmpxchg(&rx_claim_a, (int)claim,
-						(int)(claim + 1)) == claim)
-				break;
-		}
-		rs = claim & RING_MASK;
-	} else {
-		spin_lock_irqsave(&rx_lock, rxflags);
-		claim = rx_claim;
-		rc = le32_to_cpu(ctrl->rx_cons);
-		if ((claim - rc) >= RING_SZ) {
-			spin_unlock_irqrestore(&rx_lock, rxflags);
-			return;
-		}
-		rs = claim & RING_MASK;
-		rx_claim = claim + 1;
-		spin_unlock_irqrestore(&rx_lock, rxflags);
-	}
-
-	if (dma_ready == 2)
-		host_write_dpi_h(rx_dma_base + (u64)rs * BUF_SZ, l2, len,
-				 hrx ? RX_PHASE(claim) : 0);
-	else if (dma_ready)
-		host_write(rx_dma_base + (u64)rs * BUF_SZ + (hrx ? HRX_HDR : 0), l2, len);
-	else
-		memcpy(rxbuf + rs * BUF_SZ, l2, len);
-
-	if (hrx) {
-		/* descriptor already rode the DPI into host RAM (phase written last),
-		 * host reads {len,phase} locally -> no card-window desc, no rx_prod. */
-	} else if (lockfree) {
-		rxd[rs].len = cpu_to_le32(len);
-		wmb();
-		rxd[rs].flags = cpu_to_le32(RX_PHASE(claim));
-		wmb();
-	} else {
-		rxd[rs].len = cpu_to_le32(len);
-		rxd[rs].flags = 0;
-		wmb();
-		spin_lock_irqsave(&rx_lock, rxflags);
-		rx_done[rs] = 1;
-		{
-			u32 p = le32_to_cpu(ctrl->rx_prod);
-			while (p != rx_claim && rx_done[p & RING_MASK]) {
-				rx_done[p & RING_MASK] = 0;
-				p++;
-			}
-			ctrl->rx_prod = cpu_to_le32(p);
-		}
-		wmb();
-		spin_unlock_irqrestore(&rx_lock, rxflags);
-	}
-}
-
-static void oct_mirror_skb(struct sk_buff *skb)
-{
-	const unsigned char *l2;
-
-	if (!skb || skb->dev != up_dev)
-		return;
-	l2 = skb_mac_header(skb);
-	if (!l2 || l2 > skb->data)
-		l2 = skb->data;
-	oct_push_rx_l2(l2, skb->len + (u32)(skb->data - l2));
-}
-
-static netdev_tx_t oct_wrap_xmit(struct sk_buff *skb, struct net_device *dev)
-{
-	oct_mirror_skb(skb);
-	return orig_ndo_xmit(skb, dev);
-}
-
-/* claim a slot, DMA the frame to host, publish. Runs either inline in the ptype tap
- * (cpu0 NAPI) or, with rxwork=1, on a worker core (DPI parallelized off cpu0). */
+/* RX: uplink inbound frame -> that port's card->host RX ring. Claim a slot, DMA
+ * the frame to host, publish. Runs either inline in the ptype tap (cpu0 NAPI) or,
+ * with rxwork=1, on a worker core (DPI parallelized off cpu0). Port resolved from
+ * skb->dev so both the tap and the worker drain reach the right ring. */
 static void oct_rx_deliver(struct sk_buff *skb)
 {
+	struct oct_port *p = port_of_dev(skb->dev);
 	unsigned char *l2;
 	u32 len, claim, rc, rs;
 	unsigned long rxflags;
 
+	if (!p)
+		return;
 	l2 = skb_mac_header(skb);
 	if (!l2 || l2 > skb->data)
 		l2 = skb->data;
 	len = skb->len + (u32)(skb->data - l2);		/* full L2 frame */
-	if (dma_ready != 2 && skb_headlen(skb) < skb->len)	/* non-DPI needs linear */
+	if (p->dma_ready != 2 && skb_headlen(skb) < skb->len)	/* non-DPI needs linear */
 		return;
 	if (!(len && len <= BUF_SZ))
 		return;
@@ -616,43 +553,43 @@ static void oct_rx_deliver(struct sk_buff *skb)
 		/* atomic CAS claim: on full, drop WITHOUT incrementing (no hole that
 		 * would stall the phase sequence); else reserve the slot lock-free. */
 		for (;;) {
-			claim = (u32)atomic_read(&rx_claim_a);
-			rc = le32_to_cpu(ctrl->rx_cons);
+			claim = (u32)atomic_read(&p->rx_claim_a);
+			rc = le32_to_cpu(p->ctrl->rx_cons);
 			if ((claim - rc) >= RING_SZ)
 				return;				/* ring full: clean drop */
-			if ((u32)atomic_cmpxchg(&rx_claim_a, (int)claim,
+			if ((u32)atomic_cmpxchg(&p->rx_claim_a, (int)claim,
 						(int)(claim + 1)) == claim)
 				break;
 		}
 		rs = claim & RING_MASK;
 	} else {
 		spin_lock_irqsave(&rx_lock, rxflags);
-		claim = rx_claim;
-		rc = le32_to_cpu(ctrl->rx_cons);
+		claim = p->rx_claim;
+		rc = le32_to_cpu(p->ctrl->rx_cons);
 		if ((claim - rc) >= RING_SZ) {		/* ring full: drop */
 			spin_unlock_irqrestore(&rx_lock, rxflags);
 			return;
 		}
 		rs = claim & RING_MASK;
-		rx_claim = claim + 1;
+		p->rx_claim = claim + 1;
 		spin_unlock_irqrestore(&rx_lock, rxflags);
 	}
 
-	if (dma_ready == 2) {			/* DPI hardware DMA (copy offloaded) */
+	if (p->dma_ready == 2) {			/* DPI hardware DMA (copy offloaded) */
 		if (linrx && skb_headlen(skb) < skb->len &&
 		    skb_linearize(skb) == 0)
 			l2 = skb_mac_header(skb);	/* head may have moved */
 		if (linrx && skb_headlen(skb) == skb->len)
-			host_write_dpi_h(rx_dma_base + (u64)rs * BUF_SZ, l2, len,
+			host_write_dpi_h(p->rx_dma_base + (u64)rs * BUF_SZ, l2, len,
 					 hrx ? RX_PHASE(claim) : 0);
 		else				/* scatter-gather head + frags */
-			host_write_dpi_skb(rx_dma_base + (u64)rs * BUF_SZ, skb, l2,
+			host_write_dpi_skb(p->rx_dma_base + (u64)rs * BUF_SZ, skb, l2,
 					   len, hrx ? RX_PHASE(claim) : 0);
 	}
-	else if (dma_ready)			/* CPU SLI-mem-access copy (~2.2G cap) */
-		host_write(rx_dma_base + (u64)rs * BUF_SZ + (hrx ? HRX_HDR : 0), l2, len);
+	else if (p->dma_ready)			/* CPU SLI-mem-access copy (~2.2G cap) */
+		host_write(p->rx_dma_base + (u64)rs * BUF_SZ + (hrx ? HRX_HDR : 0), l2, len);
 	else
-		memcpy(rxbuf + rs * BUF_SZ, l2, len);
+		memcpy(p->rxbuf + rs * BUF_SZ, l2, len);
 
 	if (hrx) {
 		/* descriptor rode the DPI into host RAM (phase last); host reads locally */
@@ -660,23 +597,23 @@ static void oct_rx_deliver(struct sk_buff *skb)
 		/* lock-free completion: write len, then stamp the PHASE bit LAST so the
 		 * host, seeing the new phase, is guaranteed the len+data are already there.
 		 * No rx_prod, no completion lock -> cores never serialize here. */
-		rxd[rs].len = cpu_to_le32(len);
+		p->rxd[rs].len = cpu_to_le32(len);
 		wmb();
-		rxd[rs].flags = cpu_to_le32(RX_PHASE(claim));
+		p->rxd[rs].flags = cpu_to_le32(RX_PHASE(claim));
 		wmb();
 	} else {
-		rxd[rs].len = cpu_to_le32(len);
-		rxd[rs].flags = 0;
+		p->rxd[rs].len = cpu_to_le32(len);
+		p->rxd[rs].flags = 0;
 		wmb();
 		spin_lock_irqsave(&rx_lock, rxflags);	/* ordered completion */
-		rx_done[rs] = 1;
+		p->rx_done[rs] = 1;
 		{
-			u32 p = le32_to_cpu(ctrl->rx_prod);
-			while (p != rx_claim && rx_done[p & RING_MASK]) {
-				rx_done[p & RING_MASK] = 0;
-				p++;
+			u32 pr = le32_to_cpu(p->ctrl->rx_prod);
+			while (pr != p->rx_claim && p->rx_done[pr & RING_MASK]) {
+				p->rx_done[pr & RING_MASK] = 0;
+				pr++;
 			}
-			ctrl->rx_prod = cpu_to_le32(p);
+			p->ctrl->rx_prod = cpu_to_le32(pr);
 		}
 		wmb();
 		spin_unlock_irqrestore(&rx_lock, rxflags);
@@ -688,9 +625,11 @@ static void oct_rx_deliver(struct sk_buff *skb)
 static int oct_rx_pack(struct sk_buff *skb, struct net_device *dev,
 		       struct packet_type *pt, struct net_device *orig)
 {
-	if (skb->dev != up_dev)
+	struct oct_port *p = container_of(pt, struct oct_port, ptype);
+
+	if (skb->dev != p->up_dev)
 		goto out;
-	if (rxwork && dma_ready == 2) {
+	if (rxwork && p->dma_ready == 2) {
 		int k = raw_smp_processor_id() % nworkers;
 
 		if (skb_queue_len(&rxq[k]) < RXQ_MAX) {
@@ -712,63 +651,75 @@ out:
 	return 0;
 }
 
-/* TX: drain host->card TX ring, transmit each frame out the uplink. */
+/* TX: drain each port's host->card TX ring, transmit out that port's uplink. */
 static int worker_fn(void *arg)
 {
 	long id = (long)arg;
-	unsigned int idle = 0;		/* consecutive empty polls -> backoff */
 
 	while (!kthread_should_stop()) {
-		struct sk_buff *skb = NULL;
-		u32 ts = 0, len = 0;
-		int have = 0;
-		unsigned long flags;
+		int pi, any_ready = 0, any2 = 0, did = 0;
 
-		/* DMA activation: only worker 0 arms it (single writer) */
-		if (id == 0 && dma && !dma_ready &&
-		    le32_to_cpu(ctrl->dma_enable)) {
-			u64 tb = le64_to_cpu(ctrl->tx_dma_base);
-			u64 rb = le64_to_cpu(ctrl->rx_dma_base);
-			if (rb && tb && rb < (1ull << 40) && tb < (1ull << 40)) {
+		/* DMA activation: only worker 0 arms (single writer). Each port arms
+		 * independently when its host sets dma_enable + valid bases. The SLI
+		 * outbound + DPI engine are SHARED, so init them once (dpi_up). */
+		if (id == 0 && dma) {
+			for (pi = 0; pi < ports; pi++) {
+				struct oct_port *p = &pv[pi];
+				u64 tb, rb;
 				u32 s;
 
-				tx_dma_base = tb;
-				rx_dma_base = rb;
-				/* fresh ring: any pre-DMA frame bumped the claim; realign to 0
-				 * so the phase sequence matches the host's rc=0 fresh start. */
-				atomic_set(&rx_claim_a, 0);
-				rx_claim = 0;
-				if (ctrl) { ctrl->rx_cons = 0; ctrl->rx_prod = 0; }
-				/* TX: fresh ring at 0. Seed each slot's TX phase to "not ready"
-				 * (opposite of first expected) so workers wait for the host to
-				 * stamp it; per-worker consumer starts at its worker id. */
+				if (p->dma_ready || !le32_to_cpu(p->ctrl->dma_enable))
+					continue;
+				tb = le64_to_cpu(p->ctrl->tx_dma_base);
+				rb = le64_to_cpu(p->ctrl->rx_dma_base);
+				if (!(rb && tb && rb < (1ull << 40) && tb < (1ull << 40)))
+					continue;
+				p->tx_dma_base = tb;
+				p->rx_dma_base = rb;
+				/* fresh ring: realign claim to 0 so the phase sequence matches
+				 * the host's rc=0 fresh start; seed TX phases "not ready". */
+				atomic_set(&p->rx_claim_a, 0);
+				p->rx_claim = 0;
+				p->ctrl->rx_cons = 0;
+				p->ctrl->rx_prod = 0;
 				for (s = 0; s < RING_SZ; s++)
-					txd[s].flags = cpu_to_le32(TX_PHASE(s) ^ 1u);
+					p->txd[s].flags = cpu_to_le32(TX_PHASE(s) ^ 1u);
 				for (s = 0; s < (u32)nworkers && s < MAX_WORKERS; s++)
-					tx_cons_w[s] = s;
+					p->tx_cons_w[s] = s;
 				wmb();
-				octdma_setup();		/* arms SLI outbound (needed by DPI too) */
-				dma_ready = 1;
-				if (dma == 2 && dpi_nic_init() == 0)
-					dma_ready = 2;	/* DPI hardware-DMA RX offload */
-				if (dma_ready == 2 && bench > 0 && !bench_thread)
+				if (!dpi_up) {		/* shared engine: init once */
+					octdma_setup();	/* SLI outbound (needed by DPI too) */
+					dpi_up = 1;
+					if (dma == 2 && dpi_nic_init() == 0)
+						dpi_up = 2;
+				}
+				p->dma_ready = (dma == 2 && dpi_up == 2) ? 2 : 1;
+				if (p->dma_ready == 2 && bench > 0 && !bench_thread)
 					bench_thread = kthread_run(bench_fn, NULL,
 								   "octshm-bench");
-				pr_info("octshm: DMA on (mode=%d), tx_base=0x%llx rx_base=0x%llx\n",
-					dma_ready, (unsigned long long)tb,
+				pr_info("octshm: port%d DMA on (mode=%d) tx=0x%llx rx=0x%llx\n",
+					pi, p->dma_ready, (unsigned long long)tb,
 					(unsigned long long)rb);
 			}
 		}
-		if (id == 0) {			/* heartbeat: single writer */
+		if (id == 0) {			/* heartbeat: single writer, all ports */
 			beat++;
-			ctrl->heartbeat = cpu_to_le32(beat);
+			for (pi = 0; pi < ports; pi++)
+				pv[pi].ctrl->heartbeat = cpu_to_le32(beat);
+		}
+
+		for (pi = 0; pi < ports; pi++) {
+			if (pv[pi].dma_ready)
+				any_ready = 1;
+			if (pv[pi].dma_ready == 2)
+				any2 = 1;
 		}
 
 		/* RX offload: drain this core's queue, DPI each frame (parallel across
-		 * workers -> off the single cpu0 NAPI). Stay hot while frames flow. */
-		if (rxwork && dma_ready == 2) {
+		 * workers -> off the single cpu0 NAPI). oct_rx_deliver resolves the port. */
+		if (rxwork && any2) {
 			struct sk_buff *rs;
-			int b = 64, did = 0;
+			int b = 64;
 
 			while (b-- && (rs = skb_dequeue(&rxq[id]))) {
 				oct_rx_deliver(rs);
@@ -779,71 +730,76 @@ static int worker_fn(void *arg)
 				continue;
 		}
 
-		(void)idle; (void)flags;
-		if (!dma_ready) {		/* wait for arm: txd phases seeded there */
+		if (!any_ready) {		/* wait for arm: txd phases seeded there */
 			usleep_range(50, 100);
 			continue;
 		}
-		/* phase-based TX drain: this worker owns slots where slot%nworkers==id.
-		 * Host stamps txd[slot].flags (TX phase) LAST, after the PIO+len, so a
-		 * matching phase means the slot is fully written -> no tx_lock, workers
-		 * drain disjoint slots + PKO-xmit in parallel (mirrors the RX rxthreads win). */
-		{
-			u32 tc = tx_cons_w[id];
-			u32 i, m;
+		/* phase-based TX drain: this worker owns slots where slot%nworkers==id,
+		 * across every armed port. Host stamps txd[slot].flags (TX phase) LAST,
+		 * after PIO+len, so a matching phase means the slot is fully written ->
+		 * no tx_lock; workers drain disjoint slots + PKO-xmit in parallel. */
+		for (pi = 0; pi < ports; pi++) {
+			struct oct_port *p = &pv[pi];
+			struct sk_buff *skb;
+			u32 tc, ts, len, i, m;
+			int have = 0;
 
+			if (!p->dma_ready || !p->up_dev)
+				continue;
+			tc = p->tx_cons_w[id];
 			ts = tc & RING_MASK;
-			if (!up_dev ||
-			    le32_to_cpu(txd[ts].flags) != TX_PHASE(tc)) {
-				usleep_range(20, 40);
+			if (le32_to_cpu(p->txd[ts].flags) != TX_PHASE(tc))
 				continue;			/* slot not filled yet */
-			}
 			rmb();					/* phase seen => len+data landed */
-			len = le32_to_cpu(txd[ts].len);
-			tx_cons_w[id] = tc + nworkers;
-			m = tx_cons_w[0];			/* publish tx_cons = min (bp floor) */
+			len = le32_to_cpu(p->txd[ts].len);
+			p->tx_cons_w[id] = tc + nworkers;
+			m = p->tx_cons_w[0];			/* publish tx_cons = min (bp floor) */
 			for (i = 1; i < (u32)nworkers; i++)
-				if ((s32)(tx_cons_w[i] - m) < 0)
-					m = tx_cons_w[i];
-			ctrl->tx_cons = cpu_to_le32(m);
-		}
-		if (!(len >= ETH_HLEN && len <= BUF_SZ))
-			continue;			/* bad len: slot consumed, skip */
-		skb = netdev_alloc_skb(up_dev, BUF_SZ + NET_IP_ALIGN);
-		if (!skb) { usleep_range(20, 40); continue; }
-		if (ztx && dma_ready == 2) {
-			have = 2;			/* DPI-fetch below */
-		} else {
-			skb_reserve(skb, NET_IP_ALIGN);
-			memcpy(skb_put(skb, len), txbuf + ts * BUF_SZ, len);
-			have = 1;
-		}
-
-		if (have == 2) {		/* ztx: DMA host RAM -> skb, no host PIO */
-			skb_reserve(skb, NET_IP_ALIGN);
-			if (host_read_dpi(tx_dma_base + (u64)ts * BUF_SZ,
-					  virt_to_phys(skb_put(skb, len)), len) != 0)
-				have = 0;	/* post failed: drop this frame */
-		}
-		if (have) {			/* alloc-heavy xmit OUTSIDE lock */
-			struct ethhdr *eh;
-
-			skb->dev = up_dev;
-			skb_reset_mac_header(skb);
-			skb->protocol = eth_hdr(skb)->h_proto;
-			eh = eth_hdr(skb);
-			/* Host PCIe -> card IP on uplink: deliver locally (no DAC loopback). */
-			if (ether_addr_equal_unaligned(eh->h_dest, up_dev->dev_addr) ||
-			    is_broadcast_ether_addr(eh->h_dest)) {
-				skb->pkt_type = PACKET_HOST;
-				netif_rx(skb);
+				if ((s32)(p->tx_cons_w[i] - m) < 0)
+					m = p->tx_cons_w[i];
+			p->ctrl->tx_cons = cpu_to_le32(m);
+			did = 1;
+			if (!(len >= ETH_HLEN && len <= BUF_SZ))
+				continue;		/* bad len: slot consumed, skip */
+			skb = netdev_alloc_skb(p->up_dev, BUF_SZ + NET_IP_ALIGN);
+			if (!skb)
+				continue;
+			if (ztx && p->dma_ready == 2) {
+				have = 2;		/* DPI-fetch below */
 			} else {
-				dev_queue_xmit(skb);
+				skb_reserve(skb, NET_IP_ALIGN);
+				memcpy(skb_put(skb, len), p->txbuf + ts * BUF_SZ, len);
+				have = 1;
 			}
-			cond_resched();
-		} else {
-			dev_kfree_skb(skb);	/* empty or bad-len slot */
+			if (have == 2) {	/* ztx: DMA host RAM -> skb, no host PIO */
+				skb_reserve(skb, NET_IP_ALIGN);
+				if (host_read_dpi(p->tx_dma_base + (u64)ts * BUF_SZ,
+						  virt_to_phys(skb_put(skb, len)), len) != 0)
+					have = 0;	/* post failed: drop this frame */
+			}
+			if (have) {
+				struct ethhdr *eh;
+
+				skb->dev = p->up_dev;
+				skb_reset_mac_header(skb);
+				skb->protocol = eth_hdr(skb)->h_proto;
+				eh = eth_hdr(skb);
+				/* Host PCIe -> card IP on uplink: deliver locally. */
+				if (ether_addr_equal_unaligned(eh->h_dest, p->up_dev->dev_addr) ||
+				    is_broadcast_ether_addr(eh->h_dest)) {
+					skb->pkt_type = PACKET_HOST;
+					netif_rx(skb);
+				} else {
+					dev_queue_xmit(skb);
+				}
+			} else {
+				dev_kfree_skb(skb);
+			}
 		}
+		if (did)
+			cond_resched();
+		else
+			usleep_range(20, 40);
 	}
 	return 0;
 }
@@ -862,9 +818,9 @@ static ssize_t temp_write(struct file *f, const char __user *ubuf, size_t n, lof
 	if (copy_from_user(buf, ubuf, n))
 		return -EFAULT;
 	buf[n] = '\0';
-	if (sscanf(buf, "%u %u", &board, &die) >= 1 && ctrl) {
-		ctrl->resv[0] = cpu_to_le32(board);
-		ctrl->resv[1] = cpu_to_le32(die);
+	if (sscanf(buf, "%u %u", &board, &die) >= 1 && pv[0].ctrl) {
+		pv[0].ctrl->resv[0] = cpu_to_le32(board);
+		pv[0].ctrl->resv[1] = cpu_to_le32(die);
 		wmb();
 	}
 	return n;
@@ -876,26 +832,40 @@ static int __init octshm_init(void)
 	u64 idx;
 	int ret, i;
 
-	win_pages = alloc_pages(GFP_KERNEL, WIN_ORDER);
+	if (ports < 1)
+		ports = 1;
+	if (ports > MAXPORT)
+		ports = MAXPORT;
+	win_order = (ports > 1) ? (WIN_ORDER + 1) : WIN_ORDER;	/* 8MB for 2 ports */
+
+	win_pages = alloc_pages(GFP_KERNEL, win_order);
 	if (!win_pages)
 		return -ENOMEM;
 	win = page_address(win_pages);
 	win_phys = page_to_phys(win_pages);
-	memset(win, 0, 1UL << (WIN_ORDER + PAGE_SHIFT));
+	memset(win, 0, 1UL << (win_order + PAGE_SHIFT));
 
-	ctrl  = (struct octshm_ctrl *)(win + CTRL_OFF);
-	txd   = (struct octshm_desc *)(win + TXDESC_OFF);
-	rxd   = (struct octshm_desc *)(win + RXDESC_OFF);
-	txbuf = win + TXBUF_OFF;
-	rxbuf = win + RXBUF_OFF;
+	/* carve one 4MB region per port. Port0's region == win base, so its layout
+	 * (and BAR1 IDX0 mapping) is byte-identical to the single-port build. */
+	for (i = 0; i < ports; i++) {
+		struct oct_port *p = &pv[i];
+		u8 *b = win + (unsigned long)i * PORT_STRIDE;
 
-	ctrl->magic   = cpu_to_le32(OCTSHM_MAGIC);
-	ctrl->version = cpu_to_le32(OCTSHM_VER);
-	if (lockfree) {			/* seed desc phase = 1 (opposite of first expected
-					 * phase 0) so no slot reads "ready" before it's filled */
-		int s;
-		for (s = 0; s < RING_SZ; s++)
-			rxd[s].flags = cpu_to_le32(RXF_PHASE);
+		p->idx   = i;
+		p->ctrl  = (struct octshm_ctrl *)(b + CTRL_OFF);
+		p->txd   = (struct octshm_desc *)(b + TXDESC_OFF);
+		p->rxd   = (struct octshm_desc *)(b + RXDESC_OFF);
+		p->txbuf = b + TXBUF_OFF;
+		p->rxbuf = b + RXBUF_OFF;
+		atomic_set(&p->rx_claim_a, 0);
+		p->ctrl->magic   = cpu_to_le32(OCTSHM_MAGIC);
+		p->ctrl->version = cpu_to_le32(OCTSHM_VER);
+		if (lockfree) {		/* seed rx desc phase = 1 so no slot reads ready early */
+			int s;
+
+			for (s = 0; s < RING_SZ; s++)
+				p->rxd[s].flags = cpu_to_le32(RXF_PHASE);
+		}
 	}
 	wmb();
 
@@ -904,31 +874,55 @@ static int __init octshm_init(void)
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_P2N_BAR1), host_bar1);
 	cvmx_write_csr(CVMX_ADD_IO_SEG(0x00011800C0000128ull), 0x10); /* BAR_CTL: bar1_siz=1 (64M) */
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), idx);
+	if (ports > 1) {		/* map the 2nd 4MB region to host BAR1 offset 4MB */
+		u64 idx1 = (((win_phys + PORT_STRIDE) >> 22) << 4) | (1u << 1) | 0x9;
+
+		cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), idx1);
+	}
 	CVMX_SYNCW;
-	pr_info("octshm: P2N_BAR1=0x%llx BAR_CTL=0x%llx IDX0=0x%llx (host_bar1=0x%lx)\n",
+	pr_info("octshm: P2N_BAR1=0x%llx BAR_CTL=0x%llx IDX0=0x%llx ports=%d (host_bar1=0x%lx)\n",
 		(unsigned long long)cvmx_read_csr(CVMX_ADD_IO_SEG(PEM_P2N_BAR1)),
 		(unsigned long long)cvmx_read_csr(CVMX_ADD_IO_SEG(0x00011800C0000128ull)),
 		(unsigned long long)cvmx_read_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0)),
-		host_bar1);
+		ports, host_bar1);
 
-	up_dev = dev_get_by_name(&init_net, uplink);
-	if (!up_dev) {
-		pr_err("octshm: uplink %s not found\n", uplink);
-		__free_pages(win_pages, WIN_ORDER);
-		return -ENODEV;
+	/* resolve one uplink netdev per port from the comma-list (e.g. xaui0,xaui1) */
+	{
+		char names[64], *sp = names, *tok;
+
+		strscpy(names, uplink, sizeof(names));
+		for (i = 0; i < ports; i++) {
+			tok = strsep(&sp, ",");
+			pv[i].up_dev = (tok && *tok) ?
+				dev_get_by_name(&init_net, tok) : NULL;
+			if (!pv[i].up_dev) {
+				pr_err("octshm: uplink #%d missing/not found (uplink=%s)\n",
+				       i, uplink);
+				while (--i >= 0)
+					dev_put(pv[i].up_dev);
+				cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), 0);
+				if (ports > 1)
+					cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), 0);
+				__free_pages(win_pages, win_order);
+				return -ENODEV;
+			}
+		}
 	}
 	{
 		int qi;
+
 		for (qi = 0; qi < MAX_WORKERS; qi++)
 			skb_queue_head_init(&rxq[qi]);
 	}
-	oct_ptype.type = htons(ETH_P_ALL);
-	oct_ptype.dev  = up_dev;
-	oct_ptype.func = oct_rx_pack;
-	dev_add_pack(&oct_ptype);
-	rtnl_lock();				/* promisc: accept frames for host MAC */
-	dev_set_promiscuity(up_dev, 1);
-	rtnl_unlock();
+	for (i = 0; i < ports; i++) {		/* one ptype tap per port (dev-filtered) */
+		pv[i].ptype.type = htons(ETH_P_ALL);
+		pv[i].ptype.dev  = pv[i].up_dev;
+		pv[i].ptype.func = oct_rx_pack;
+		dev_add_pack(&pv[i].ptype);
+		rtnl_lock();			/* promisc: accept frames for host MAC */
+		dev_set_promiscuity(pv[i].up_dev, 1);
+		rtnl_unlock();
+	}
 
 	if (nworkers < 1) nworkers = 1;
 	if (nworkers > MAX_WORKERS) nworkers = MAX_WORKERS;
@@ -936,12 +930,22 @@ static int __init octshm_init(void)
 		workers[i] = kthread_create(worker_fn, (void *)(long)i,
 					    "octshm/%d", i);
 		if (IS_ERR(workers[i])) {
+			int j;
+
 			ret = PTR_ERR(workers[i]);
 			workers[i] = NULL;
 			while (--i >= 0) kthread_stop(workers[i]);
-			dev_remove_pack(&oct_ptype);
-			dev_put(up_dev);
-			__free_pages(win_pages, WIN_ORDER);
+			for (j = 0; j < ports; j++) {
+				dev_remove_pack(&pv[j].ptype);
+				rtnl_lock();
+				dev_set_promiscuity(pv[j].up_dev, -1);
+				rtnl_unlock();
+				dev_put(pv[j].up_dev);
+			}
+			cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), 0);
+			if (ports > 1)
+				cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), 0);
+			__free_pages(win_pages, win_order);
 			return ret;
 		}
 		/* no kthread_bind: let the scheduler float workers so RX softirq
@@ -949,14 +953,14 @@ static int __init octshm_init(void)
 		wake_up_process(workers[i]);
 	}
 	ret = 0; (void)ret;
-	ctrl->card_ready = cpu_to_le32(1);
+	for (i = 0; i < ports; i++)
+		pv[i].ctrl->card_ready = cpu_to_le32(1);
 	wmb();
 	proc_dir = proc_mkdir("octshm", NULL);
 	if (proc_dir)
 		proc_temp = proc_create("temp", 0222, proc_dir, &temp_pops);
-	pr_info("octshm M3: phys=0x%llx idx=0x%llx ring=%d uplink=%s up\n",
-		(unsigned long long)win_phys, (unsigned long long)idx,
-		RING_SZ, uplink);
+	pr_info("octshm M3: phys=0x%llx ring=%d ports=%d uplink=%s up\n",
+		(unsigned long long)win_phys, RING_SZ, ports, uplink);
 	return 0;
 }
 
@@ -971,19 +975,23 @@ static void __exit octshm_exit(void)
 	for (i = 0; i < MAX_WORKERS; i++)
 		if (!IS_ERR_OR_NULL(workers[i]))
 			kthread_stop(workers[i]);
-	if (up_dev) {
-		dev_remove_pack(&oct_ptype);
+	for (i = 0; i < ports; i++) {
+		if (!pv[i].up_dev)
+			continue;
+		dev_remove_pack(&pv[i].ptype);
 		rtnl_lock();
-		dev_set_promiscuity(up_dev, -1);
+		dev_set_promiscuity(pv[i].up_dev, -1);
 		rtnl_unlock();
-		dev_put(up_dev);
+		dev_put(pv[i].up_dev);
+		if (pv[i].ctrl)
+			pv[i].ctrl->card_ready = 0;
 	}
 	for (i = 0; i < MAX_WORKERS; i++)		/* free any skbs still queued */
 		skb_queue_purge(&rxq[i]);
-	if (ctrl)
-		ctrl->card_ready = 0;
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), 0);
-	if (dma_ready == 2) {			/* quiesce DPI before dropping its chunks */
+	if (ports > 1)
+		cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), 0);
+	if (dpi_up == 2) {			/* quiesce DPI before dropping its chunks */
 		int q;
 		for (q = DPI_Q0; q < DPI_Q0 + DPI_NQ; q++)
 			cvmx_write_csr(CVMX_ADD_IO_SEG(DPIR_IBUFF(q)), 0);
@@ -991,7 +999,7 @@ static void __exit octshm_exit(void)
 		msleep(50);
 	}
 	kfree(hrx_hdr);
-	__free_pages(win_pages, WIN_ORDER);
+	__free_pages(win_pages, win_order);
 	pr_info("octshm: unloaded\n");
 }
 module_init(octshm_init);
