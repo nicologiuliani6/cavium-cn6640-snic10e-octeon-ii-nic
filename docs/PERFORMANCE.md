@@ -12,26 +12,26 @@ Measured with `iperf3 -P8`, MTU 9000, on a fresh card boot, over a DAC to an HP 
 
 Both directions near line rate. Ping 0% loss.
 
-## Simultaneous — the card is the ceiling
+## Simultaneous (both ports, full bidirectional)
 
-The bottleneck is the card's 8-core Octeon + its PCIe bandwidth, **shared across all active
-flows** — you do not get 2 × 10 G by summing the ports.
+Full 4-way load = `oct0` TX+RX and `oct1` TX+RX all at once:
 
-| load | aggregate |
-|---|---|
-| both ports, FWD only, simultaneous | 3.18 + 3.14 = **6.3 Gb/s** |
-| both ports, full bidirectional (4 streams) | **~6.4 Gb/s** |
-
-Full 4-way breakdown (oct0+oct1, TX+RX all at once):
-
-| port | TX (uscita) | RX (entrata) |
+| port | TX (host → peer) | RX (peer → host) |
 |---|---|---|
-| `oct0` | 0.44 Gb/s | 2.87 Gb/s |
-| `oct1` | 0.48 Gb/s | 2.58 Gb/s |
+| `oct0` | 5.09 Gb/s | 2.85 Gb/s |
+| `oct1` | 5.09 Gb/s | 2.59 Gb/s |
 
-Under full contention **RX wins and TX starves**: RX rides the card's DPI DMA engine while
-TX is host PIO, so the shared budget goes to RX. If you need high TX and high RX at once,
-use one port per direction (TX on one, RX on the other) rather than full-duplex on both.
+**Aggregate ≈ 15.6 Gb/s**, close to the PCIe Gen2 x4 full-duplex ceiling (~16 Gb/s per
+direction). TX ~10.2 Gb/s + RX ~5.4 Gb/s across the two ports.
+
+> **TX-starvation fix.** Earlier builds collapsed TX to ~0.45 Gb/s/port under this load
+> (aggregate ~6.4 Gb/s): the card's worker loop drained RX and then *skipped* the TX drain
+> whenever it had moved any RX, so a never-empty RX queue starved TX entirely. Bounding the
+> RX batch and always falling through to the TX drain lifted TX to ~5.09 Gb/s/port with no
+> RX cost — a 2.4× aggregate improvement. (commit `octshm_card: fix TX starvation`.)
+
+The remaining ceiling is the card's 8-core Octeon + PCIe bandwidth, shared across all
+flows — you still don't get 2 × 10 G by summing the ports, but both directions now coexist.
 
 ## Takeaways
 
