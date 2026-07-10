@@ -35,6 +35,15 @@ After the card has booted its NIC image and programmed its PEM inbound windows:
 
 `octnic` auto-discovers BAR2 from the PCI device; you normally never hard-code these.
 
+> ⚠️ **BAR0 indirect-window freeze hazard.** The SLI window registers (BAR0 `0x00–0x40`) can
+> read/write arbitrary card NCB addresses — but `SLI_WINDOW_CTL` (BAR0 `0x2E0`) defaults to
+> **0 = infinite wait**: a window read to any space that doesn't respond stalls the PCIe bus
+> and **hard-freezes the host** (three confirmed freezes during zero-serial experiments). The
+> vendor driver writes `0x200000` there first ("avoid host hang when reads invalid register").
+> On this OEM board the window answers only for some devices (DPI yes; DRAM, PEM and SLI-self
+> all hang) — do not touch the window without setting `SLI_WINDOW_CTL` first, and ideally not
+> at all.
+
 ## Serial console (one-time provisioning only)
 
 Normal operation is serial-free. You need the console **once** to persist the u-boot boot
