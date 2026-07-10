@@ -177,8 +177,17 @@ static int l2ca = 1;		/* BAR1 window CA bit. 1 (historic): host PIO writes ALLOC
 				 * in the shared 2MB L2 -> a full-rate TX blast cycling the 1.15MB
 				 * TX buffer evicts the whole cache and the RX capture path goes
 				 * DRAM-latency-bound (RX 8.9 -> ~2G with ANY TX, step-like).
-				 * 0: PIO writes bypass L2 (still HW-coherent) -> no thrash. */
+				 * 0: PIO writes bypass L2 -- but BREAKS coherency under load
+				 * (port wedge). Keep 1; use wpar instead. */
 module_param(l2ca, int, 0444);
+static int wpar;		/* L2 way-partition mask for the IOB (0 = off). E.g. wpar=0x3
+				 * limits IOB (host PIO writes and all IO-side allocation) to L2
+				 * ways 0-1 (256KB), so a TX blast can't evict the RX capture
+				 * working set from the other 14 ways. Coherency is unaffected
+				 * (WPAR only constrains ALLOCATION, lookups still hit all ways).
+				 * The duplex-collapse lever to test on the next boot budget. */
+module_param(wpar, int, 0444);
+#define L2C_WPAR_IOBX(i) (0x0001180080840200ull + ((i) & 1) * 8)
 static int ztx;			/* 1: zero-copy TX. host->card frame is DMA'd (DPI INBOUND)
 				 * from host RAM straight into the card skb, instead of the
 				 * host PIO'ing it byte-by-byte over PCIe into the card window.
@@ -1160,6 +1169,11 @@ static int __init octshm_init(void)
 		u64 idx1 = ((pv[1].phys >> 22) << 4) | (1u << 1) | (l2ca ? 0x9 : 0x1);
 
 		cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), idx1);
+	}
+	if (wpar) {	/* partition L2: IOB (PIO/IO allocation) confined to `wpar` ways */
+		cvmx_write_csr(CVMX_ADD_IO_SEG(L2C_WPAR_IOBX(0)), (u64)(wpar & 0xFFFF));
+		cvmx_write_csr(CVMX_ADD_IO_SEG(L2C_WPAR_IOBX(1)), (u64)(wpar & 0xFFFF));
+		pr_info("octshm: L2C WPAR_IOB=0x%x (IOB L2 ways limited)\n", wpar & 0xFFFF);
 	}
 	CVMX_SYNCW;
 	pr_info("octshm: P2N_BAR1=0x%llx BAR_CTL=0x%llx IDX0=0x%llx ports=%d (host_bar1=0x%lx)\n",
