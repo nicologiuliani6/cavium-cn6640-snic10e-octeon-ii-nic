@@ -147,6 +147,9 @@ static void octdma_free(struct host_port *p)
 {
 	if (!pdev) return;
 	pwr(p, C_DMA_ENABLE, 0);
+	wmb();
+	msleep(100);	/* let the card disarm + in-flight DPI writes drain before the
+			 * coherent pools are freed (else a late DMA lands in reused RAM) */
 	if (p->tx_dma_va) dma_free_coherent(&pdev->dev, POOL_SZ, p->tx_dma_va, p->tx_dma_bus);
 	if (p->rx_dma_va) dma_free_coherent(&pdev->dev, POOL_SZ, p->rx_dma_va, p->rx_dma_bus);
 	p->tx_dma_va = p->rx_dma_va = NULL;

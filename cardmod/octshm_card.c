@@ -866,6 +866,15 @@ static int worker_fn(void *arg)
 				u64 tb, rb;
 				u32 s;
 
+				if (p->dma_ready && !le32_to_cpu(p->ctrl->dma_enable)) {
+					/* host detached (octnic unload writes dma_enable=0):
+					 * disarm so the next octnic load re-arms with its new
+					 * pool addresses -- makes a host-side module reload a
+					 * full ring-resync WITHOUT a card reboot. */
+					p->dma_ready = 0;
+					pr_info("octshm: port%d DMA off (host detached)\n", pi);
+					continue;
+				}
 				if (p->dma_ready || !le32_to_cpu(p->ctrl->dma_enable))
 					continue;
 				tb = le64_to_cpu(p->ctrl->tx_dma_base);
