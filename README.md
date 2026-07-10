@@ -6,7 +6,7 @@ host interfaces** (`oct0`, `oct1`) over a reverse-engineered PCIe BAR2 shared-me
 datapath. No vendor NDA firmware. Host OS untouched, fully reversible.
 
 > Status: **working.** Both ports link at 10 G on a DAC and pass traffic bidirectionally —
-> TX at **line-rate 10 GbE** (`oct0` FWD 9.71 Gb/s, zero-copy datapath), RX ~7.5 Gb/s (see
+> TX at **line-rate 10 GbE** (9.7–9.8 Gb/s, zero-copy datapath) and RX at **8.1–8.8 Gb/s** (see
 > [PERFORMANCE](docs/PERFORMANCE.md)). Card boots with no serial cable; the host brings both
 > NICs up automatically at boot.
 

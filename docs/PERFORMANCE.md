@@ -7,11 +7,19 @@ Measured with `iperf3 -P8`, MTU 9000, on a fresh card boot, over a DAC to an HP 
 
 | port | FWD (host → peer) | REV (peer → host) |
 |---|---|---|
-| `oct0` (xaui0) | 8.8 – **9.71** Gb/s | 7.4 Gb/s |
-| `oct1` (xaui1) | 9.2 – 9.5 Gb/s | 8.2 Gb/s |
+| `oct0` (xaui0) | **9.71 Gb/s** | **8.10 Gb/s** |
+| `oct1` (xaui1) | **9.81 Gb/s** | **8.82 Gb/s** |
 
-FWD is **line-rate 10 GbE** (peak `oct0` 9.71 Gb/s single-port, 9.22 Gb/s in the shipped `ports=2`
-config; 8.8–9.5 Gb/s run to run). Ping 0% loss.
+FWD is **line-rate 10 GbE** and REV is at ~85–90 % of wire. Ping 0% loss. (Shipped `ports=2`
+config, single fresh boot, one measurement pass.)
+
+> **RX 5.4 → 8.9 Gb/s: the capture cores were the wall.** RX frames die *between* PIP and the
+> driver tap (the POW/NAPI capture layer) when the NAPI cores can't keep up — proven with UDP
+> probes (38 % loss while the card's own counters showed PIP drops = 0, DPI queue ~empty, and
+> deliver cost only 0.6 µs/frame). RX scales with the number of NAPI cores: 2 cores = 5.4 G,
+> 4 = 8.2, 6 = 8.9, 8 = 7.2 (cross-core contention). Meanwhile the zero-copy TX path needs only
+> **two** worker cores for line rate. The shipped split is therefore `nworkers=2` (cpu0-1) +
+> RX POW IRQs pinned to cpu2-7 (**6 NAPI cores**) — set by `bindcpu=1` + rc.local.
 
 > **Zero-copy TX = the 10G lever.** Reaching line rate took two card-side fixes:
 >
@@ -36,54 +44,52 @@ config; 8.8–9.5 Gb/s run to run). Ping 0% loss.
 > throttled TX to 299 Mb/s through the driver's lazy `tx_free_list`; dropping it for ring-depth safety
 > is what unlocked line rate.
 
-## Double (two streams at once)
+## Double (two streams at once, same direction)
 
 | load | result |
 |---|---|
-| **2-port TX** (`oct0`+`oct1` FWD) | 5.69 + 4.84 = **10.53 Gb/s** aggregate |
-| **2-port RX** (`oct0`+`oct1` REV) | 3.48 + 3.47 = **6.95 Gb/s** aggregate |
-| **1-port full-duplex** (`oct0` OUT+IN) | OUT 9.6–9.8 + IN 0.07–5.47 Gb/s (see note) |
+| **2-port TX** (`oct0`+`oct1` FWD) | 4.91 + 5.66 = **10.6 Gb/s** aggregate |
+| **2-port RX** (`oct0`+`oct1` REV) | 6.24 + 3.97 = **10.2 Gb/s** aggregate |
 
-2-port TX aggregate (~10.5 Gb/s) is the **PCIe host→card direction saturated** — the zero-copy
-TX is fast enough that two ports together fill the inbound PCIe budget.
+Both single-direction aggregates now sit at ~10.5 Gb/s (2-port RX was 5–7 before the NAPI-core
+split — it nearly doubled).
 
-> **Full-duplex RX under TX — `bindcpu=1`, and an unresolved reproducibility caveat.** Under a
-> full-rate zc TX blast a port's full-duplex RX starves: the spinning TX workers crowd out the RX
-> NAPI softirq that captures frames off XAUI. `bindcpu=1` (default) pins the (now 6) TX workers to
-> cores 0–5 and the RX POW-group IRQs to cores 6–7 so RX capture has dedicated cores. **On a
-> freshly-booted card this lifted single-port full-duplex to 9.77 / 5.47 Gb/s (TX line-rate, RX ×9
-> over the un-pinned build). But the RX half did not reproduce after several more boot cycles
-> (9.60 / 0.07), alongside a drop in RX-alone (7.2 → 5.5) — i.e. the card's DRAM degrades under a
-> long session of boots ([troubleshooting](USAGE.md#troubleshooting)), and RX (a DPI read path) is
-> far more sensitive to that than TX (posted writes).** So: **TX line-rate is solid and
-> reproducible; the `bindcpu` full-duplex-RX gain is real on a fresh card but needs re-validation
-> from a cold boot before it's a headline number.** The 2-port 4-way case starves RX regardless of
-> core split (tried 2- and 4-RX-core layouts) — a shared-resource wall (DPI engine / memory
-> bandwidth), not core allocation.
+> **2-port TX ~10.5 Gb/s is the host-PIO wall, not a tuning gap.** The host fills the TX rings
+> with CPU stores through a write-combining BAR2 mapping; x86 WC buffers flush as **64-byte**
+> PCIe TLPs, whose header overhead caps the Gen2 ×4 link at ~73 % efficiency ≈ 11.7 Gb/s
+> theoretical — the measured 10.5 is ~90 % of that, with the host CPUs far from saturated
+> (mpstat ~36 % idle during the blast). Beating it would need ≥ 256 B TLPs, i.e. card-pulled DMA
+> (the `ztx` inbound-DPI path) — which is read-latency-bound at ~6.6 Gb/s and loses. 10.5 stands.
 
-## Quad (4-way: both ports, both directions at once)
+## Full-duplex (TX and RX at once) — the open front
 
-| port | TX (host → peer) | RX (peer → host) |
-|---|---|---|
-| `oct0` | 5.05 Gb/s | 0.28 Gb/s |
-| `oct1` | 5.08 Gb/s | 0.74 Gb/s |
+Any substantial *real* TX traffic collapses RX — even across ports (`oct0` TX + `oct1` RX:
+9.5 + 2.2 Gb/s), and near-independently of the TX rate (paced TX at 4 G still leaves RX at
+2.75). A long elimination session (all runtime experiments, counters on the card) ruled out:
 
-**TX aggregate ~10.1 Gb/s** (the inbound-PCIe ceiling again), 0% ping loss, no wedge.
+- **PCIe direction contention** — a synthetic 100 %-duty BAR2 write flood has *zero* RX impact;
+- **ACK drops at the host TX ring** — `tx_dropped = 0` under duplex;
+- **DPI engine starvation** — DPI doorbell backlog stays ≤ 36 under duplex;
+- **PIP/RED capture drops** — PIP drop counters stay 0;
+- **host qdisc ACK queuing** — `fq` helps only marginally (RX 0.13 → 0.73 Gb/s) and its single
+  qdisc lock costs TX 3.5 Gb/s;
+- **L2 thrash via the BAR1 CA bit** — plausible (host PIO writes allocate in the shared 2 MB L2,
+  and a TX blast cycles a 1.15 MB window), but `l2ca=0` breaks store/load coherency under load
+  (port wedge) — documented dead end as tried.
 
-> **RX starves under simultaneous TX — a trade-off of the zero-copy win.** With `zc` the TX
-> path is so much cheaper per frame that the card's 8 worker cores stay busy transmitting and
-> under-service the RX drain, so RX collapses under a full TX blast (quad RX ~1 Gb/s aggregate;
-> single-direction RX is a healthy 7–8 Gb/s). The card's 8-core Octeon, not the PCIe link, is
-> the shared resource here. Rebalancing the worker loop (bounding the TX batch per pass so RX
-> gets serviced under contention) is the open lever if balanced bidirectional throughput matters
-> more than peak one-way TX; the shipped default optimizes for line-rate TX.
+What the counters *do* show under duplex: the card keeps **delivering** ~130 k frames/s (9.3 Gb/s
+raw) while goodput is ~0 — an out-of-order/retransmit storm seeded by RX-ring-full drops. The
+next candidate lever is **L2 way-partitioning** (`L2C_WPAR_IOB`: restrict IOB/PIO allocation to a
+couple of L2 ways so the RX path keeps the rest) — CSR-only, untested. Until then, balanced
+duplex exists only with application-level TX pacing (e.g. `iperf3 -b`: TX 1 G → RX 5.5 G).
 
 ## Takeaways
 
-- **Line-rate 10 GbE on TX per port** in isolation (`oct0` FWD 9.71 Gb/s) — a genuine 10 GbE
-  host NIC out of an OEM SmartNIC with no vendor firmware, via a zero-copy card datapath.
-- **~15.6 Gb/s aggregate** with both ports fully loaded — the PCIe Gen2 ×4 full-duplex
-  ceiling, not the links. You don't get 2 × 10 G by summing ports (40 > 32 Gb/s bus).
+- **TX line-rate per port** (9.7–9.8 Gb/s) *and* **RX at 85–90 % of wire** (8.1–8.8 Gb/s), one
+  direction at a time — a genuine 10 GbE dual NIC out of an OEM SmartNIC with no vendor firmware.
+- **~10.5 Gb/s aggregate in either single direction** with both ports loaded — the host-PIO
+  64 B-TLP wall (TX) and its RX counterpart, ~80 % of the Gen2 ×4 usable budget.
+- **Full-duplex under load is the one open front** (card-global step effect, see above).
 - Numbers are for a **freshly booted** card. A card that has been driven hard can wedge and
   report degraded/zero throughput until re-booted with `octboot` (see
   [USAGE → troubleshooting](USAGE.md#troubleshooting)).
