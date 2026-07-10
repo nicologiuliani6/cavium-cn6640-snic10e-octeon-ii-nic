@@ -6,11 +6,11 @@ iptables -F 2>/dev/null; iptables -P INPUT ACCEPT 2>/dev/null
 ip link set xaui0 up mtu 9000 promisc on 2>/dev/null
 ip link set xaui1 up mtu 9000 promisc on 2>/dev/null
 insmod /root/octcarrier.ko dev=xaui0,xaui1 ipd_port=0,16 2>/dev/null
-insmod /root/octshm_card.ko uplink=xaui0,xaui1 ports=2 dma=2 dpiwait=0 lockfree=1 hrx=1 nworkers=6 zc=1 bindcpu=1 2>/dev/null
-# pin the POW-group "Ethernet" RX IRQs to cpu6,7 (bindcpu keeps TX workers on cpu0-5) so RX
-# NAPI capture has dedicated cores a full-rate zc TX blast cant starve. IRQ nums vary -> by name.
+insmod /root/octshm_card.ko uplink=xaui0,xaui1 ports=2 dma=2 dpiwait=0 lockfree=1 hrx=1 nworkers=2 zc=1 bindcpu=1 rxdrop=1 2>/dev/null
+# pin the POW-group "Ethernet" RX IRQs to cpu2-7 (bindcpu keeps the 2 zc TX workers on cpu0-1):
+# 6 NAPI cores for RX capture (RX-alone 5.4->8.9G), 2 suffice for line-rate zc TX. By name.
 ( n=0; for irq in $(awk -F: '/Ethernet/{gsub(/ /,"",$1);print $1}' /proc/interrupts); do
-    printf '%x\n' $((1 << (6 + (n % 2)))) > /proc/irq/$irq/smp_affinity 2>/dev/null; n=$((n+1));
+    printf '%x\n' $((1 << (2 + (n % 6)))) > /proc/irq/$irq/smp_affinity 2>/dev/null; n=$((n+1));
   done ) 2>/dev/null
 ( while :; do
     t1=$(cat /sys/class/hwmon/hwmon0/temp1_input 2>/dev/null)

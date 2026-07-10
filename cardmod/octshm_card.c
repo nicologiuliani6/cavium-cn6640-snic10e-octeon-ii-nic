@@ -173,6 +173,12 @@ static int rxdrop;		/* 1: after the tap delivers a frame to the host, mark it
 				 * of walking IP/route to an inevitable drop (xaui has no IPs in
 				 * NIC mode) -- saves per-frame CPU on the RX-capture cores. */
 module_param(rxdrop, int, 0444);
+static int l2ca = 1;		/* BAR1 window CA bit. 1 (historic): host PIO writes ALLOCATE
+				 * in the shared 2MB L2 -> a full-rate TX blast cycling the 1.15MB
+				 * TX buffer evicts the whole cache and the RX capture path goes
+				 * DRAM-latency-bound (RX 8.9 -> ~2G with ANY TX, step-like).
+				 * 0: PIO writes bypass L2 (still HW-coherent) -> no thrash. */
+module_param(l2ca, int, 0444);
 static int ztx;			/* 1: zero-copy TX. host->card frame is DMA'd (DPI INBOUND)
 				 * from host RAM straight into the card skb, instead of the
 				 * host PIO'ing it byte-by-byte over PCIe into the card window.
@@ -1145,11 +1151,13 @@ static int __init octshm_init(void)
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_P2N_BAR0), host_bar0);
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_P2N_BAR1), host_bar1);
 	cvmx_write_csr(CVMX_ADD_IO_SEG(0x00011800C0000128ull), 0x10); /* BAR_CTL: bar1_siz=1 (64M) */
-	/* map each port's 4MB region into consecutive 4MB BAR1 windows */
-	idx = ((pv[0].phys >> 22) << 4) | (1u << 1) | 0x9;	/* CA|ES=1|valid */
+	/* map each port's 4MB region into consecutive 4MB BAR1 windows.
+	 * l2ca=0 drops the CA bit: host PIO writes bypass the shared L2 (no
+	 * allocation, still coherent) so a TX blast can't evict the RX path. */
+	idx = ((pv[0].phys >> 22) << 4) | (1u << 1) | (l2ca ? 0x9 : 0x1);
 	cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX0), idx);
 	if (ports > 1) {
-		u64 idx1 = ((pv[1].phys >> 22) << 4) | (1u << 1) | 0x9;
+		u64 idx1 = ((pv[1].phys >> 22) << 4) | (1u << 1) | (l2ca ? 0x9 : 0x1);
 
 		cvmx_write_csr(CVMX_ADD_IO_SEG(PEM_BAR1_IDX1), idx1);
 	}
