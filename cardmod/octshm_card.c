@@ -22,6 +22,7 @@
 #include <linux/uaccess.h>
 #include <asm/octeon/octeon.h>
 #include <asm/octeon/cvmx.h>
+#include <asm/octeon/cvmx-pip.h>	/* cvmx_pip_get_port_status (RX drop profiling) */
 
 #define PEM_P2N_BAR0   0x00011800C0000080ull
 #define PEM_P2N_BAR1   0x00011800C0000088ull
@@ -157,11 +158,21 @@ static spinlock_t dpi_lock[DPI_NQ];
  * across all 4 queues -> 4 engines DMA in parallel. DPI_NQ is a power of 2. */
 static atomic_t dpi_rr = ATOMIC_INIT(0);
 #define DPI_RR_K() ((u32)atomic_inc_return(&dpi_rr) & (DPI_NQ - 1))
+/* RX profiling counters (racy += across NAPI cores: approximation is fine).
+ * Worker 0 mirrors them into the port0 ctrl page at +0x100 each heartbeat so the
+ * host can read them over BAR2 (mmap resource2). Cycle unit = 1.6GHz core clock. */
+static u64 rxp_frames, rxp_cyc, rxp_cyc_dpi, rxp_fallback, rxp_ringfull;
+#define RXPROF_OFF 0x100
 static int dpiwait = 1;		/* 1: wait for dbell drain per pkt; 0: async (faster) */
 module_param(dpiwait, int, 0444);
 static int linrx;		/* 1: linearize jumbo RX skb -> one contiguous DPI op
 				 * (fewer DPI descriptors than head+N-frag scatter) */
 module_param(linrx, int, 0444);
+static int rxdrop;		/* 1: after the tap delivers a frame to the host, mark it
+				 * PACKET_OTHERHOST so the card stack drops it at ip_rcv instead
+				 * of walking IP/route to an inevitable drop (xaui has no IPs in
+				 * NIC mode) -- saves per-frame CPU on the RX-capture cores. */
+module_param(rxdrop, int, 0444);
 static int ztx;			/* 1: zero-copy TX. host->card frame is DMA'd (DPI INBOUND)
 				 * from host RAM straight into the card skb, instead of the
 				 * host PIO'ing it byte-by-byte over PCIe into the card window.
@@ -289,7 +300,9 @@ static void host_write_dpi_h(u64 busaddr, const void *src, u32 len, u32 phase)
 	 * isolation, so no unproven multi-pointer layout to wedge the engine. */
 	{
 		u32 off = 0, nposted = 0;
-		while (off < len) {
+		int ok = 1;
+
+		while (ok && off < len) {
 			u32 chunk = len - off;
 			if (chunk > DPI_MAXLEN)
 				chunk = DPI_MAXLEN;
@@ -300,15 +313,15 @@ static void host_write_dpi_h(u64 busaddr, const void *src, u32 len, u32 phase)
 			cmd[3] = busaddr + doff + off;
 			if (cvmx_cmd_queue_write(CVMX_CMD_QUEUE_DMA(q), 0, 4, cmd) !=
 			    CVMX_CMD_QUEUE_SUCCESS) {
-				spin_unlock_irqrestore(&dpi_lock[k], fl);
-				host_write(busaddr + doff, src, len);	/* pool empty: CPU fallback */
-				return;
+				ok = 0;		/* queue full: full CPU fallback below */
+				break;
 			}
 			off += chunk;
 			nposted += 4;
 		}
-		if (hrx && hrx_hdr) {	/* header LAST: posted after data -> DPI FIFO lands it
-					 * after the data, so host seeing the phase == data ready */
+		if (ok && hrx && hrx_hdr) {	/* header LAST: posted after data -> DPI FIFO
+					 * lands it after the data, so host seeing the
+					 * phase == data ready */
 			u32 hi = hrx_hi[k]; u64 hp;
 			HRX_H(k, hi)->len = cpu_to_le32(len);
 			HRX_H(k, hi)->flags = cpu_to_le32(phase);
@@ -318,26 +331,38 @@ static void host_write_dpi_h(u64 busaddr, const void *src, u32 len, u32 phase)
 			cmd[1] = ((u64)(8 & 0x1FFF) << 40) | (hp & 0x0000000FFFFFFFFFull);
 			cmd[2] = ((u64)8 & 0xFFFFull) << 48;
 			cmd[3] = busaddr;			/* header at slot offset 0 */
-			if (cvmx_cmd_queue_write(CVMX_CMD_QUEUE_DMA(q), 0, 4, cmd) ==
+			if (cvmx_cmd_queue_write(CVMX_CMD_QUEUE_DMA(q), 0, 4, cmd) !=
 			    CVMX_CMD_QUEUE_SUCCESS)
-				nposted += 4;
+				ok = 0;		/* header MUST land or the host slot
+						 * stalls forever: fall back whole-frame */
 		}
-		CVMX_SYNCWS;
-		cvmx_write_csr(CVMX_ADD_IO_SEG(DPIR_DBELL(q)), nposted);
+		if (nposted) {		/* ring what was queued -- content-identical to the
+					 * CPU fallback, so a late DPI landing is harmless */
+			CVMX_SYNCWS;
+			cvmx_write_csr(CVMX_ADD_IO_SEG(DPIR_DBELL(q)), nposted);
+		}
+		if (dpiwait && nposted) {
+			for (spins = 0; spins < 20000; spins++) {
+				if ((cvmx_read_csr(CVMX_ADD_IO_SEG(DPIR_COUNTS(q))) &
+				     0x00000000FFFFFFFFull) == 0)
+					break;
+				cpu_relax();
+			}
+		}
+		spin_unlock_irqrestore(&dpi_lock[k], fl);
+		if (!ok) {
+			struct octshm_desc hdr;
+
+			rxp_fallback++;
+			host_write(busaddr + doff, src, len);
+			if (hrx) {
+				hdr.len = cpu_to_le32(len);
+				hdr.flags = cpu_to_le32(phase);
+				host_write(busaddr, &hdr, 8);	/* phase header LAST */
+			}
+		}
 	}
 	(void)nw;
-	/* Wait for this queue's pending doorbell (dbell[31:0]) to drain to 0 = the
-	 * DPI has fetched+issued our instruction. (fcnt lingers, so mask dbell only.)
-	 * dpiwait=0 skips the wait entirely (async; relies on DMA<<host-poll timing). */
-	if (dpiwait) {
-		for (spins = 0; spins < 20000; spins++) {
-			if ((cvmx_read_csr(CVMX_ADD_IO_SEG(DPIR_COUNTS(q))) &
-			     0x00000000FFFFFFFFull) == 0)
-				break;
-			cpu_relax();
-		}
-	}
-	spin_unlock_irqrestore(&dpi_lock[k], fl);
 }
 
 static void host_write_dpi(u64 busaddr, const void *src, u32 len)
@@ -349,7 +374,7 @@ static void host_write_dpi(u64 busaddr, const void *src, u32 len)
  * region without a CPU copy. Posts one DPI instruction per skb segment (linear
  * head + each paged frag, each split to <=DPI_MAXLEN), one doorbell for the lot.
  * This is where the DPI beats the CPU: hardware gathers the frags. */
-static void post_seg(int q, u32 *nposted, u64 sp, u32 seglen, u64 dstbase, u32 *dst)
+static int post_seg(int q, u32 *nposted, u64 sp, u32 seglen, u64 dstbase, u32 *dst)
 {
 	u32 off = 0;
 	u64 cmd[4];
@@ -363,11 +388,15 @@ static void post_seg(int q, u32 *nposted, u64 sp, u32 seglen, u64 dstbase, u32 *
 		cmd[3] = dstbase + *dst;
 		if (cvmx_cmd_queue_write(CVMX_CMD_QUEUE_DMA(q), 0, 4, cmd) !=
 		    CVMX_CMD_QUEUE_SUCCESS)
-			return;
+			return 0;	/* queue full: caller MUST fall back for the whole
+					 * frame -- a silent partial post = corrupt frame
+					 * (data holes) or a permanently stalled RX slot
+					 * (missing phase header) on the host. */
 		off += c;
 		*dst += c;
 		*nposted += 4;
 	}
+	return 1;
 }
 
 static void host_write_dpi_skb(u64 busaddr, struct sk_buff *skb, const void *l2,
@@ -378,23 +407,27 @@ static void host_write_dpi_skb(u64 busaddr, struct sk_buff *skb, const void *l2,
 			 (const unsigned char *)l2) + skb_headlen(skb);
 	u32 dst = hrx ? HRX_HDR : 0, nposted = 0, i, spins;
 	unsigned long fl;
+	int ok;
 
 	spin_lock_irqsave(&dpi_lock[k], fl);
-	post_seg(q, &nposted, virt_to_phys((void *)l2), head, busaddr, &dst);
-	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+	ok = post_seg(q, &nposted, virt_to_phys((void *)l2), head, busaddr, &dst);
+	for (i = 0; ok && i < skb_shinfo(skb)->nr_frags; i++) {
 		skb_frag_t *f = &skb_shinfo(skb)->frags[i];
 
-		post_seg(q, &nposted, virt_to_phys(skb_frag_address(f)),
-			 skb_frag_size(f), busaddr, &dst);
+		ok = post_seg(q, &nposted, virt_to_phys(skb_frag_address(f)),
+			      skb_frag_size(f), busaddr, &dst);
 	}
-	if (hrx && hrx_hdr && nposted) {		/* header LAST -> lands after data (FIFO) */
+	if (ok && hrx && hrx_hdr) {			/* header LAST -> lands after data (FIFO) */
 		u32 hi = hrx_hi[k], hd = 0;
 		HRX_H(k, hi)->len = cpu_to_le32(flen);
 		HRX_H(k, hi)->flags = cpu_to_le32(phase);
 		hrx_hi[k] = (hi + 1) & 63;
-		post_seg(q, &nposted, virt_to_phys(HRX_H(k, hi)), 8, busaddr, &hd);
+		ok = post_seg(q, &nposted, virt_to_phys(HRX_H(k, hi)), 8, busaddr, &hd);
 	}
-	if (nposted) {
+	if (nposted) {			/* ring whatever was queued (even on failure: the
+					 * chunks carry the same bytes the CPU fallback will
+					 * write -- content-identical, so a late DPI landing
+					 * is harmless) */
 		CVMX_SYNCWS;
 		cvmx_write_csr(CVMX_ADD_IO_SEG(DPIR_DBELL(q)), nposted);
 		if (dpiwait) {
@@ -407,6 +440,29 @@ static void host_write_dpi_skb(u64 busaddr, struct sk_buff *skb, const void *l2,
 		}
 	}
 	spin_unlock_irqrestore(&dpi_lock[k], fl);
+
+	if (!ok) {
+		/* DPI cmd queue full under load: CPU-write the WHOLE frame (segment
+		 * walk), then the phase header LAST. Never silent-partial (corrupt
+		 * frame) and never a missing header (host slot stalls forever). */
+		u32 d = hrx ? HRX_HDR : 0;
+		struct octshm_desc hdr;
+
+		rxp_fallback++;
+		host_write(busaddr + d, l2, head);
+		d += head;
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *f = &skb_shinfo(skb)->frags[i];
+
+			host_write(busaddr + d, skb_frag_address(f), skb_frag_size(f));
+			d += skb_frag_size(f);
+		}
+		if (hrx) {
+			hdr.len = cpu_to_le32(flen);
+			hdr.flags = cpu_to_le32(phase);
+			host_write(busaddr, &hdr, 8);	/* phase header LAST */
+		}
+	}
 }
 
 /* DPI INBOUND: DMA a frame host RAM -> card L2 (dst_phys), the reverse of host_write_dpi.
@@ -646,6 +702,7 @@ static void oct_rx_deliver(struct sk_buff *skb)
 	unsigned char *l2;
 	u32 len, claim, rc, rs;
 	unsigned long rxflags;
+	u64 t0 = cvmx_get_cycle(), t1, t2;
 
 	if (!p)
 		return;
@@ -670,8 +727,10 @@ static void oct_rx_deliver(struct sk_buff *skb)
 		for (;;) {
 			claim = (u32)atomic_read(&p->rx_claim_a);
 			rc = le32_to_cpu(p->ctrl->rx_cons);
-			if ((claim - rc) >= RING_SZ)
+			if ((claim - rc) >= RING_SZ) {
+				rxp_ringfull++;
 				return;				/* ring full: clean drop */
+			}
 			if ((u32)atomic_cmpxchg(&p->rx_claim_a, (int)claim,
 						(int)(claim + 1)) == claim)
 				break;
@@ -694,12 +753,15 @@ static void oct_rx_deliver(struct sk_buff *skb)
 		if (linrx && skb_headlen(skb) < skb->len &&
 		    skb_linearize(skb) == 0)
 			l2 = skb_mac_header(skb);	/* head may have moved */
+		t1 = cvmx_get_cycle();
 		if (linrx && skb_headlen(skb) == skb->len)
 			host_write_dpi_h(p->rx_dma_base + (u64)rs * BUF_SZ, l2, len,
 					 hrx ? RX_PHASE(claim) : 0);
 		else				/* scatter-gather head + frags */
 			host_write_dpi_skb(p->rx_dma_base + (u64)rs * BUF_SZ, skb, l2,
 					   len, hrx ? RX_PHASE(claim) : 0);
+		t2 = cvmx_get_cycle();
+		rxp_cyc_dpi += t2 - t1;
 	}
 	else if (p->dma_ready)			/* CPU SLI-mem-access copy (~2.2G cap) */
 		host_write(p->rx_dma_base + (u64)rs * BUF_SZ + (hrx ? HRX_HDR : 0), l2, len);
@@ -733,6 +795,8 @@ static void oct_rx_deliver(struct sk_buff *skb)
 		wmb();
 		spin_unlock_irqrestore(&rx_lock, rxflags);
 	}
+	rxp_cyc += cvmx_get_cycle() - t0;
+	rxp_frames++;
 }
 
 /* ptype tap (cpu0 NAPI): filter to our uplink, then either enqueue to a worker
@@ -762,6 +826,10 @@ static int oct_rx_pack(struct sk_buff *skb, struct net_device *dev,
 	}
 	oct_rx_deliver(skb);
 out:
+	if (rxdrop)
+		/* host has its copy (or the frame wasn't ours); tell the card stack to
+		 * drop at ip_rcv instead of walking IP/route to an inevitable drop. */
+		skb->pkt_type = PACKET_OTHERHOST;
 	kfree_skb(skb);					/* drop our ref from deliver_skb */
 	return 0;
 }
@@ -821,6 +889,39 @@ static int worker_fn(void *arg)
 			beat++;
 			for (pi = 0; pi < ports; pi++)
 				pv[pi].ctrl->heartbeat = cpu_to_le32(beat);
+			if (pv[0].ctrl) {	/* mirror RX profiling counters for the host
+						 * (BAR2 ctrl page +0x100, 8 LE u64s) */
+				__le64 *rp = (__le64 *)((u8 *)pv[0].ctrl + RXPROF_OFF);
+
+				rp[0] = cpu_to_le64(rxp_frames);
+				rp[1] = cpu_to_le64(rxp_cyc);
+				rp[2] = cpu_to_le64(rxp_cyc_dpi);
+				rp[3] = cpu_to_le64(rxp_fallback);
+				rp[4] = cpu_to_le64(rxp_ringfull);
+				if (dpi_up == 2 && (beat & 255) == 0) {
+					/* sampled: deepest DPI dbell backlog (is the
+					 * outbound DMA keeping up?) + PIP hard drops
+					 * (frames lost BEFORE the tap = the TCP loss) */
+					u64 d, m = le64_to_cpu(rp[5]);
+					int qq;
+					cvmx_pip_port_status_t ps;
+
+					for (qq = 0; qq < DPI_NQ; qq++) {
+						d = cvmx_read_csr(CVMX_ADD_IO_SEG(
+							DPIR_COUNTS(DPI_Q0 + qq))) &
+						    0xFFFFFFFFull;
+						if (d > m)
+							m = d;
+					}
+					rp[5] = cpu_to_le64(m);
+					cvmx_pip_get_port_status(0, 0, &ps);
+					rp[6] = cpu_to_le64(ps.dropped_packets);
+					if (ports > 1) {
+						cvmx_pip_get_port_status(16, 0, &ps);
+						rp[7] = cpu_to_le64(ps.dropped_packets);
+					}
+				}
+			}
 		}
 
 		for (pi = 0; pi < ports; pi++) {
