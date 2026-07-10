@@ -94,6 +94,10 @@ The card feeds its board + die temperature to the host over the BAR2 control pag
 - **`oct1` has no IPv4 after autostart** — NetworkManager grabbed it; install
   `99-octnic-unmanaged.conf` (above). `twocard-up.sh` also sets `nmcli device set oct1
   managed no`.
+- **One port stops receiving (TX still fine) after heavy load** — the RX ring desynced
+  under drop pressure. First-line recovery, no card reboot needed: `sudo rmmod octnic &&
+  sudo modprobe octnic ports=2` and re-add the IPs — the card disarms on unload and re-arms
+  with the new pools (validated: full ring resync, RX back to line rate).
 - **Host hard-freeze under heavy load** — this OEM card can *wedge* under sustained
   traffic; a synchronous BAR read to a wedged card stalls the CPU and freezes the host. It
   is a defect of this (second-hand) board, not the driver. Recover with a host reboot. To

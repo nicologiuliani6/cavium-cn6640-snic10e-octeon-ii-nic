@@ -78,10 +78,21 @@ Any substantial *real* TX traffic collapses RX — even across ports (`oct0` TX 
   (port wedge) — documented dead end as tried.
 
 What the counters *do* show under duplex: the card keeps **delivering** ~130 k frames/s (9.3 Gb/s
-raw) while goodput is ~0 — an out-of-order/retransmit storm seeded by RX-ring-full drops. The
-next candidate lever is **L2 way-partitioning** (`L2C_WPAR_IOB`: restrict IOB/PIO allocation to a
-couple of L2 ways so the RX path keeps the rest) — CSR-only, untested. Until then, balanced
-duplex exists only with application-level TX pacing (e.g. `iperf3 -b`: TX 1 G → RX 5.5 G).
+raw) while goodput is ~0 — an out-of-order/retransmit storm seeded by RX-ring-full drops.
+**L2 way-partitioning** (`wpar=0x3`, `L2C_WPAR_IOB`) was tested and is **neutral** — also ruled out.
+
+**The quantified truth (UDP probes, no TCP dynamics):** the card sustains **TX 8.7 + RX 4.8 =
+13.5 Gb/s aggregate full-duplex** — RX halves under any big TX (the card-global step: DRAM/IOB
+bandwidth, ~39 Gb/s of combined window traffic under duplex) but does *not* collapse. What
+collapses is **TCP**: the RX side runs at ~46 % frame loss at that operating point, and TCP
+goodput dies under that loss. Even with both directions app-paced, TCP holds at most
+~**4.0 + 2.8 = 6.8 Gb/s** balanced. So:
+
+| duplex mode | aggregate |
+|---|---|
+| UDP / loss-tolerant | **13.5 Gb/s** (8.7 TX + 4.8 RX) |
+| TCP, both sides paced | ~6.8 Gb/s (4.0 + 2.8) |
+| TCP, unpaced (default) | ~9.6 Gb/s (TX-priority, RX ~0) |
 
 ## Takeaways
 
