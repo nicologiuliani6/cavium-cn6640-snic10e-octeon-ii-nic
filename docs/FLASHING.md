@@ -93,19 +93,30 @@ a serial boot via `cexec.sh` / `boot-clean.sh`.
 
 Then bring up the NICs — see [USAGE](USAGE.md).
 
-## 5. Editing the u-boot env without serial (`fw_setenv`)
+## 5. Where the u-boot env lives (and why serial is still needed to change it)
 
-Once the card is running our image you can read **and persist** the u-boot environment with
-no serial cable. The card's NOR exposes a partition named `environment` (mtd2, 64 KiB,
-erasesize `0x2000`) — the u-boot `CONFIG_ENV` location. `uboot-envtools` is baked in, and
-`/root/envdiag.sh` (run automatically from `rc.local` ~20 s after boot) auto-detects the
-partition and writes `/etc/fw_env.config`, so `fw_setenv` / `fw_printenv` just work on the
-card shell.
+Short version: **the u-boot environment cannot be edited from Linux on this board — it is in
+NAND, and `bootdelay=1` + the `octboot` bootcmd are already persisted there permanently.**
 
-Because the card has no serial and no login, `envdiag.sh` reports its result over a clean
-control-page channel: it writes a verdict string to `/proc/octshm/env`, which the card
-module (`octshm_card`) mirrors into the shared ctrl page at **offset `0x200`**. Read it from
-the host over BAR2:
+The obvious target is the NOR partition named `environment` (mtd2, 64 KiB, erasesize `0x2000`),
+and `uboot-envtools` + `fw_setenv`/`fw_printenv` do work against it. But that partition is a
+**decoy**: it ships blank, so u-boot falls back to its compiled-in default env there
+(`bootcmd=bootp; … bootm`). A write to it round-trips fine but **u-boot never reads it**.
+
+Proven by scanning every NOR partition (mtd0 `bootloader`, mtd1 `rootfs_data`, mtd2
+`environment`) for a valid env whose `bootcmd` contains `bootoctlinux` (octboot's signature):
+**none found**. So u-boot's real env — the one `octboot` depends on (`bootdelay=1`, the
+`wa/wb/wc/wd` PEM-window vars, `bootcmd = run wa … ; bootoctlinux …`) — lives in the 1 GiB
+**NAND**, which this OpenWrt kernel does not expose as an mtd. `fw_setenv` from Linux has no
+path to it.
+
+That env is already **permanent**: it was written once via the serial console (`saveenv`) and
+is empirically re-proven every boot — `octboot` requires `bootdelay=1` and boots the card every
+time. So there is nothing left to persist for `bootdelay`; it is definitive.
+
+`/root/envdiag.sh` (run from `rc.local` ~20 s after boot) confirms this at runtime and reports
+over a clean control-page channel — it writes a verdict to `/proc/octshm/env`, which
+`octshm_card` mirrors into the shared ctrl page at **offset `0x200`**. Read it from the host:
 
 ```bash
 sudo python3 - <<'PY'
@@ -113,17 +124,13 @@ import mmap,os
 m=mmap.mmap(os.open("/sys/bus/pci/devices/0000:03:00.0/resource2",os.O_RDWR),4096,mmap.MAP_SHARED)
 print(bytes(m[0x200:0x300]).split(b"\0",1)[0].decode())
 PY
-# FWENV_RW_OK /dev/mtd2 0x0 0x00002000 | probe=33.19 (env initialised, persists serial-free)
+# ENV_NAND: u-boot env in NAND (not fw_setenv-reachable). bootdelay=1 already permanent (octboot). NOR /dev/mtd2=writable decoy.
 ```
 
-Verdicts: `FWENV_OK` (valid env already present), `FWENV_RW_OK` (env was blank, initialised
-+ round-trip write/read proven), `FWENV_NOPART` (no `environment` partition),
-`FWENV_WRITE_FAIL` (NOR write refused). **Confirmed on hardware: a `fw_setenv` write to mtd2
-persists and reads back with no serial** — the env shipped blank (u-boot ran compiled
-defaults), so the first write initialises it.
+**To actually change the u-boot env** (custom `bootcmd`, `bootdelay`, etc.) you still need the
+serial console once — see §3. There is no serial-free path on this board: the writable NOR env
+is ignored by u-boot, and the effective NAND env is not reachable from Linux.
 
-To **persist real settings** (e.g. a custom `bootcmd`/`bootdelay`) serial-free: add
-`fw_setenv KEY VALUE` lines to `envdiag.sh`, rebake the image (§2), and `octboot` once. u-boot
-reads this same partition on the next cold boot. This finally makes the one-time serial
-provisioning in §3 optional for env tweaks (the *first* PEM/boot env still needs §3 once on a
-virgin card, since fw_setenv needs the card already running our image).
+> The `/proc/octshm/env` ⇄ BAR2 `0x200` control-page channel itself is reusable for any
+> card-side → host status reporting where there is no serial/login (same pattern as the temp
+> feed at `/proc/octshm/temp`).
