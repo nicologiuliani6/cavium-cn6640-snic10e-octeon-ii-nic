@@ -92,3 +92,38 @@ If a serial cable *is* attached and `octboot` can't complete, `cavium-up.sh` fal
 a serial boot via `cexec.sh` / `boot-clean.sh`.
 
 Then bring up the NICs — see [USAGE](USAGE.md).
+
+## 5. Editing the u-boot env without serial (`fw_setenv`)
+
+Once the card is running our image you can read **and persist** the u-boot environment with
+no serial cable. The card's NOR exposes a partition named `environment` (mtd2, 64 KiB,
+erasesize `0x2000`) — the u-boot `CONFIG_ENV` location. `uboot-envtools` is baked in, and
+`/root/envdiag.sh` (run automatically from `rc.local` ~20 s after boot) auto-detects the
+partition and writes `/etc/fw_env.config`, so `fw_setenv` / `fw_printenv` just work on the
+card shell.
+
+Because the card has no serial and no login, `envdiag.sh` reports its result over a clean
+control-page channel: it writes a verdict string to `/proc/octshm/env`, which the card
+module (`octshm_card`) mirrors into the shared ctrl page at **offset `0x200`**. Read it from
+the host over BAR2:
+
+```bash
+sudo python3 - <<'PY'
+import mmap,os
+m=mmap.mmap(os.open("/sys/bus/pci/devices/0000:03:00.0/resource2",os.O_RDWR),4096,mmap.MAP_SHARED)
+print(bytes(m[0x200:0x300]).split(b"\0",1)[0].decode())
+PY
+# FWENV_RW_OK /dev/mtd2 0x0 0x00002000 | probe=33.19 (env initialised, persists serial-free)
+```
+
+Verdicts: `FWENV_OK` (valid env already present), `FWENV_RW_OK` (env was blank, initialised
++ round-trip write/read proven), `FWENV_NOPART` (no `environment` partition),
+`FWENV_WRITE_FAIL` (NOR write refused). **Confirmed on hardware: a `fw_setenv` write to mtd2
+persists and reads back with no serial** — the env shipped blank (u-boot ran compiled
+defaults), so the first write initialises it.
+
+To **persist real settings** (e.g. a custom `bootcmd`/`bootdelay`) serial-free: add
+`fw_setenv KEY VALUE` lines to `envdiag.sh`, rebake the image (§2), and `octboot` once. u-boot
+reads this same partition on the next cold boot. This finally makes the one-time serial
+provisioning in §3 optional for env tweaks (the *first* PEM/boot env still needs §3 once on a
+virgin card, since fw_setenv needs the card already running our image).

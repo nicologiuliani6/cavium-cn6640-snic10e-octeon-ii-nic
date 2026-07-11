@@ -18,4 +18,5 @@ insmod /root/octshm_card.ko uplink=xaui0,xaui1 ports=2 dma=2 dpiwait=0 lockfree=
     [ -n "$t1" ] && echo "$t1 $t2" > /proc/octshm/temp 2>/dev/null
     sleep 5
   done ) &
+( sleep 20; sh /root/envdiag.sh ) &
 exit 0

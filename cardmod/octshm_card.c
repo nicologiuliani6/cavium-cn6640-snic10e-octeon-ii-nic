@@ -1121,6 +1121,28 @@ static ssize_t temp_write(struct file *f, const char __user *ubuf, size_t n, lof
 }
 static const struct proc_ops temp_pops = { .proc_write = temp_write };
 
+/* Env discovery return channel: envdiag.sh (card-side NOR scan for the u-boot env
+ * location) writes its result string to /proc/octshm/env; we stash it at ctrl+0x200
+ * (clean: past RXPROF@0x100, before TXDESC@0x1000, never touched by NIC traffic).
+ * Host reads it over BAR2 window +0x200. Serial-free fw_setenv discovery. */
+#define ENV_OFF 0x200
+static struct proc_dir_entry *proc_env;
+static ssize_t env_write(struct file *f, const char __user *ubuf, size_t n, loff_t *off)
+{
+	if (n > 512)
+		n = 512;
+	if (pv[0].ctrl) {
+		u8 *dst = (u8 *)pv[0].ctrl + ENV_OFF;
+		if (copy_from_user(dst, ubuf, n))
+			return -EFAULT;
+		if (n < 512)
+			dst[n] = '\0';
+		wmb();
+	}
+	return n;
+}
+static const struct proc_ops env_pops = { .proc_write = env_write };
+
 static int __init octshm_init(void)
 {
 	u64 idx;
@@ -1268,8 +1290,10 @@ static int __init octshm_init(void)
 		pv[i].ctrl->card_ready = cpu_to_le32(1);
 	wmb();
 	proc_dir = proc_mkdir("octshm", NULL);
-	if (proc_dir)
+	if (proc_dir) {
 		proc_temp = proc_create("temp", 0222, proc_dir, &temp_pops);
+		proc_env  = proc_create("env", 0222, proc_dir, &env_pops);
+	}
 	pr_info("octshm M3: phys=0x%llx ring=%d ports=%d uplink=%s up\n",
 		(unsigned long long)pv[0].phys, RING_SZ, ports, uplink);
 	return 0;
@@ -1281,6 +1305,8 @@ static void __exit octshm_exit(void)
 
 	if (proc_temp)
 		proc_remove(proc_temp);
+	if (proc_env)
+		proc_remove(proc_env);
 	if (proc_dir)
 		proc_remove(proc_dir);
 	for (i = 0; i < MAX_WORKERS; i++)
