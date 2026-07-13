@@ -52,7 +52,9 @@ send() { printf '%s\r\n' "$1" > "$DEV"; sleep "${2:-1.5}"; }
 # u-boot 2012 quirks (see cavium-noserial-boot memory): escape ';' as '\;', NO surrounding quotes,
 # keep the line short enough for CBSIZE (only the sleep number changed vs the working bootcmd).
 send "printenv bootcmd" 1.2                                   # capture the BEFORE value into the log
-send "setenv bootcmd run wa wb wc wd \\; sleep ${SLEEP} \\; flush_l2c \\; flush_dcache \\; bootoctlinux ${BOOTOCT} numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=${RGO}"
+# NOTE: u-boot 2012 runs only the FIRST arg of `run a b c d` — each var needs its own `run`
+# (cavium-noserial-boot memory). Keep the four separate `run` calls exactly like the OEM bootcmd.
+send "setenv bootcmd run wa \\; run wb \\; run wc \\; run wd \\; sleep ${SLEEP} \\; flush_l2c \\; flush_dcache \\; bootoctlinux ${BOOTOCT} numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=${RGO}"
 send "saveenv" 5                                              # persist to NAND
 send "printenv bootcmd" 1.2                                   # capture the AFTER value
 send "printenv bootdelay" 1.2

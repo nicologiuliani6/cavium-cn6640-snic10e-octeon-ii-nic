@@ -18,6 +18,11 @@ if ! lspci -d 177d:0092 >/dev/null 2>&1 || [ -z "$(lspci -d 177d:0092)" ]; then
   echo "FATAL: Cavium 177d:0092 not on PCI bus"; exit 1
 fi
 
+# Detach any stale host NIC driver FIRST: octboot SBRs the card and pushes a fresh image over
+# BAR2, and a still-loaded octnic keeps hammering BAR2 with sync reads during that reset/push —
+# it can corrupt the push and risks a host stall on the reset. No-op on a cold boot (not loaded).
+rmmod octnic 2>/dev/null || true
+
 # 1) boot the card — no serial first (retry), then serial fallback if a console exists
 booted=0
 for t in 1 2 3; do
