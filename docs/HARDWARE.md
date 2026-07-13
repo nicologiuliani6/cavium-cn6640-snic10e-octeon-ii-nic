@@ -73,10 +73,11 @@ card xaui0  <--DAC-->  peer port A   (=> host oct0)
 card xaui1  <--DAC-->  peer port B   (=> host oct1)
 ```
 
-This repo's reference peer is an **HP NC523 (dual SFP+)** in the same host, with each NC523
+The peer can be any 10 GbE device — a switch or another machine — and is **not part of this
+deliverable**. During development we used an **HP NC523 (dual SFP+)** in the same host, with each
 port placed in its own network namespace so traffic actually crosses the wire (see
-[USAGE → test rig](USAGE.md#test-rig-netns)). In real use the peer is a switch or another
-machine and no namespaces are needed.
+[USAGE → test rig](USAGE.md#test-rig-netns)); that same-host loopback is a dev convenience only.
+In real use the peer is a switch or another machine and no namespaces are needed.
 
 ## XAUI `ipd_port` mapping
 

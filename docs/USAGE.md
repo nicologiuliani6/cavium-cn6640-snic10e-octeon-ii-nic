@@ -60,8 +60,10 @@ The autostart uses `ports=2 dma=1 hrx=1 rxthreads=8 ntxq=8 poll_us=20`.
 
 ## Test rig (netns)
 
-To benchmark on a single host where the peer NIC (HP NC523) is in the **same** machine, put
-each peer port in its own network namespace — otherwise the kernel short-circuits the two
+This is a **development-only** convenience for benchmarking on a single host — the peer NIC
+is not part of the deliverable; any 10 GbE peer (switch or another machine) works and needs
+no namespaces. We happened to use an HP NC523 in the same host. When the peer NIC lives in the
+**same** machine, put each peer port in its own network namespace — otherwise the kernel short-circuits the two
 local IPs in RAM and never touches the card. `twocard-up.sh` does this automatically:
 
 ```

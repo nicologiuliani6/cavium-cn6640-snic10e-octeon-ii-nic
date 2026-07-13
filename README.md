@@ -103,8 +103,9 @@ lives outside the repo and is not published.
 ## Requirements
 
 - The Cavium CN6640-SNIC10E card in a PCIe slot, **BIOS "Above 4G decoding" enabled**.
-- A second 10 GbE peer for real traffic (another NIC + DAC per port; this repo uses an
-  HP NC523 as the loopback peer).
+- A second 10 GbE peer for real traffic (a switch or any other 10 GbE NIC + DAC per port).
+  During development we used an HP NC523 in the same host as a loopback peer — that is a dev
+  convenience only, **not required** and not part of this deliverable.
 - Host: modern Linux (developed on 6.14), an OpenWrt build tree for the card image.
 - A USB-serial (FT232) adapter for the **one-time** u-boot provisioning only; normal
   operation is serial-free.

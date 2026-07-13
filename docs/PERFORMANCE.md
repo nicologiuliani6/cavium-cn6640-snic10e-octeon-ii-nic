@@ -1,7 +1,8 @@
 # Performance
 
-Measured with `iperf3 -P8`, MTU 9000, on a fresh card boot, over a DAC to an HP NC523 peer
-(each peer port in its own netns — see [USAGE → test rig](USAGE.md#test-rig-netns)).
+Measured with `iperf3 -P8`, MTU 9000, on a fresh card boot, over a DAC to a 10 GbE peer (our
+dev-only test peer here was an HP NC523 in the same host, each port in its own netns — see
+[USAGE → test rig](USAGE.md#test-rig-netns)); the peer is not part of the deliverable.
 
 ## Per-port, one port at a time
 
