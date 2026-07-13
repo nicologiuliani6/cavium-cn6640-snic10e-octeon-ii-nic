@@ -35,9 +35,31 @@ CARD=$(lspci -d 177d:0092 | awk '{print $1}' | head -1)
 BRIDGE=$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/0000:$CARD)")" | sed 's/^0000://')
 ok "CN6640 detected ($CARD, bridge $BRIDGE)"
 
-setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
-ok "Secondary Bus Reset"
-sleep 6						# u-boot boot + bootdelay + window program
+# Fast path: the card is already sitting in u-boot with a live BAR2 window (cold boot — u-boot
+# programmed the window and is in its long pre-boot sleep). Push straight in: no SBR, no race.
+# SBR only if the card runs OpenWrt (reload) or the window is not live (at prompt / wedged).
+STATE=$(CARD=$CARD python3 - <<'PY'
+import mmap,os
+try:
+    fd=os.open("/sys/bus/pci/devices/0000:%s/resource2"%os.environ["CARD"],os.O_RDWR)
+    m=mmap.mmap(fd,64*1024*1024,mmap.MAP_SHARED)
+    if int.from_bytes(bytes(m[0:4]),"little")==0x4f435348:
+        print("os")                          # OpenWrt already running -> SBR to reload
+    else:
+        m[0x10000:0x10008]=b"NSRLIVE0"; m.flush()
+        print("live" if bytes(m[0x10000:0x10008])==b"NSRLIVE0" else "dead")
+    m.close(); os.close(fd)
+except Exception:
+    print("dead")
+PY
+)
+if [ "$STATE" = live ]; then
+  ok "Window already live (u-boot waiting) -- direct push, no SBR"
+else
+  setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
+  ok "Secondary Bus Reset"
+  sleep 6					# u-boot boot + bootdelay + window program
+fi
 
 setpci -s "$CARD" BASE_ADDRESS_0=0xf800000c BASE_ADDRESS_2=0xf400000c BASE_ADDRESS_3=0x00000000 COMMAND=0x06
 ok "BAR restored"
