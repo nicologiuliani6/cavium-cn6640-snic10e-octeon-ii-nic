@@ -53,9 +53,34 @@ except Exception:
     print("dead")
 PY
 )
+DOSBR=1
 if [ "$STATE" = live ]; then
-  ok "Window already live (u-boot waiting) -- direct push, no SBR"
-else
+  ok "Window already live (u-boot waiting) -- direct push, no SBR"; DOSBR=0
+elif [ "$STATE" = dead ]; then
+  # Not a live window and not running OS -- but this can just be a card mid-boot, NOT a wedge.
+  # Killer case: host firmware double-boots on cold power (a warm reset ~40s in). The card stays
+  # powered across the host warm reset, so it keeps counting its u-boot sleep and bootoctlinux's
+  # on its own -- but this second octboot run catches it mid-Linux-boot (window down, magic not
+  # up yet) and used to SBR it, wedging it mid-jump (magic 0xffffffff, only a power cycle
+  # recovers). So wait for the NIC heartbeat first; SBR only if it never comes.
+  ok "Window not live -- waiting up to 90s for a mid-boot card to surface (avoid SBR-wedge)"
+  for _ in $(seq 1 90); do
+    up=$(CARD=$CARD python3 - <<'PY'
+import mmap,os
+try:
+    fd=os.open("/sys/bus/pci/devices/0000:%s/resource2"%os.environ["CARD"],os.O_RDWR)
+    m=mmap.mmap(fd,4096,mmap.MAP_SHARED)
+    print(1 if int.from_bytes(bytes(m[0:4]),"little")==0x4f435348 and int.from_bytes(bytes(m[8:12]),"little") else 0)
+    m.close(); os.close(fd)
+except Exception: print(0)
+PY
+)
+    [ "$up" = 1 ] && { ok "Card came up on its own (prior push) -- no SBR, no reload"; exit 0; }
+    sleep 1
+  done
+  ok "Still not up after 90s -- assume wedged, SBR"
+fi   # STATE=os falls through with DOSBR=1 (OpenWrt running -> SBR to reload a fresh image)
+if [ "$DOSBR" = 1 ]; then
   setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
   ok "Secondary Bus Reset"
   sleep 6					# u-boot boot + bootdelay + window program
