@@ -86,8 +86,23 @@ if [ "$DOSBR" = 1 ]; then
   sleep 6					# u-boot boot + bootdelay + window program
 fi
 
-setpci -s "$CARD" BASE_ADDRESS_0=0xf800000c BASE_ADDRESS_2=0xf400000c BASE_ADDRESS_3=0x00000000 COMMAND=0x06
-ok "BAR restored"
+if [ "$DOSBR" = 1 ]; then
+  # SBR zeroed the card BARs. Restore them to the addresses the kernel/BIOS assigned, read LIVE
+  # from sysfs -- do NOT hardcode. A reseat / re-enumeration moves them (this card went
+  # f4000000 -> c4000000 after a reseat), and a stale hardcode points the card's decode at an
+  # address the bridge doesn't forward and the host doesn't mmap => BAR2 "never writable" and a
+  # working window gets broken. Low nibble 0x0c = 64-bit prefetchable memory (both BARs).
+  RES=/sys/bus/pci/devices/0000:$CARD/resource
+  B0=$(( ($(awk 'NR==1{print $1}' "$RES")) & 0xffffffff | 0xc ))
+  B2=$(( ($(awk 'NR==3{print $1}' "$RES")) & 0xffffffff | 0xc ))
+  setpci -s "$CARD" BASE_ADDRESS_0=$(printf '0x%08x' $B0) BASE_ADDRESS_1=0x00000000 \
+                    BASE_ADDRESS_2=$(printf '0x%08x' $B2) BASE_ADDRESS_3=0x00000000 COMMAND=0x06
+  ok "BAR restored (BAR0=$(printf '0x%08x' $B0) BAR2=$(printf '0x%08x' $B2))"
+else
+  # Fast path: window already live, BARs are the BIOS-assigned ones and the card is decoding.
+  # Rewriting them here (esp. with a stale hardcode) only risks breaking a working window.
+  ok "BARs left as enumerated (window already live)"
+fi
 
 # Match the card's PCIe MaxPayload to the bridge (256B). SBR reset it to 128B, which
 # fragments every DMA into more TLPs. Set DevCtl.MPS[7:5]=001 (read-modify: OR 0x20).
@@ -105,8 +120,8 @@ fd=os.open("/sys/bus/pci/devices/0000:%s/resource2"%card,os.O_RDWR)
 m=mmap.mmap(fd,64*1024*1024,mmap.MAP_SHARED)
 # wait until BAR2 is writable (u-boot has programmed the window) via a marker round-trip
 mark=b"NSRLIVE0"; live=False
-for _ in range(40):
-    m[off:off+8]=mark; m.flush()
+for _ in range(120):                         # up to 60s: after an SBR u-boot can take >20s
+    m[off:off+8]=mark; m.flush()             # (DRAM training) before it programs the window
     if bytes(m[off:off+8])==mark: live=True; print("[ \033[32mOK\033[0m ] Window live (%s tries)"%(_+1)); break
     time.sleep(0.5)
 if not live:
