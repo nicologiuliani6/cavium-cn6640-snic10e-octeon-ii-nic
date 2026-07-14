@@ -58,7 +58,14 @@ One-shot install (builds + installs the host module, drops the configs, enables 
 sudo ./install.sh                     # host side; add --start to also boot the card now
 ```
 
-Then (card already provisioned — one-time u-boot env, see [FLASHING](docs/FLASHING.md)):
+First time only — provision the card's u-boot env over serial (one command, see
+[FLASHING](docs/FLASHING.md)); already-provisioned cards skip this:
+
+```bash
+sudo ./card-prep-hostboot.sh          # serial, once — reads this machine's BARs, saveenv to NAND
+```
+
+Then, every boot, no serial:
 
 ```bash
 sudo systemctl start cavium-nic      # boots the card + brings up oct0 and oct1 (no serial)
@@ -89,7 +96,8 @@ install.sh                                   — one-shot host installer (module
 octboot                                      — host bootloader (no serial)
 cavium-up.sh, twocard-up.sh, cexec.sh        — bring-up orchestration (+ serial fallback)
 card-temp.sh                                 — card temperature feed
-set-hostboot.sh, boot-clean.sh, restore-*.sh — one-time provisioning / fallbacks
+card-prep-hostboot.sh                        — first-time serial u-boot provisioning (once)
+boot-clean.sh, set-hostboot.sh, restore-*.sh — serial fallbacks / legacy / revert
 openwrt/     snic10e.config, build-openwrt.sh, files/  — OpenWrt image build + overlay
 system/      cavium-nic.service, blacklist-liquidio.conf, 99-octnic-unmanaged.conf
 docs/        HARDWARE, FLASHING, USAGE, ARCHITECTURE, PERFORMANCE, DMA-DESIGN

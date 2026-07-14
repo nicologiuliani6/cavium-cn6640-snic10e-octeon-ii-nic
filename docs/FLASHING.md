@@ -53,25 +53,38 @@ Result is an **initramfs** image, e.g.
 > uncompressed inside the ELF — `grep -a` the `.bin` for a module string to confirm the
 > embed.
 
-## 3. One-time u-boot provisioning (serial, once)
+## 3. One-time u-boot provisioning (serial, once) — `card-prep-hostboot.sh`
 
 `octboot` relies on a persisted u-boot environment that, on reset, **programs the card's
-PEM inbound window and then boots the pushed image**. Set it once over the serial console
-([HARDWARE → serial](HARDWARE.md#serial-console-one-time-provisioning-only)):
+PEM inbound window and then boots the pushed image**. Provision it **once** over the serial
+console ([HARDWARE → serial](HARDWARE.md#serial-console-one-time-provisioning-only)):
 
-The environment must, in `bootcmd`:
+```bash
+sudo ./card-prep-hostboot.sh      # writes + saveenv the self-programming env, then: sudo ./octboot
+```
 
-1. program the PEM inbound BARs so the host can reach card DRAM:
-   - `write64 0x00011800C0000080 0x00000000F8000000`  (`PEMX_P2N_BAR0_START`)
-   - `write64 0x00011800C0000088 0x00000000F4000000`  (`PEMX_P2N_BAR1_START`)
-   - program `PEMX_BAR1_INDEX0` / `BAR_CTL` for the 64 MiB window
-   - `flush_l2c; flush_dcache` to activate,
-2. `sleep` long enough for the host to push the image over BAR2 (~25 s),
-3. `bootoctlinux 0x20010000 numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=3`
+That is the whole first-time step. The script auto-detects the card, the bridge, and the
+serial port, resets the card to its u-boot prompt, and writes a persistent (`saveenv` → NAND)
+environment:
 
-with `bootdelay=1` and `saveenv` to persist. `set-hostboot.sh` / `card-prep-hostboot.sh`
-in this repo are the serial helpers used to poke these; `restore-bootapp.sh` reverts to the
-stock boot-app.
+- `bootdelay=1`
+- `wa/wb/wc/wd` — program the PEM inbound window (`PEMX_P2N_BAR0/BAR1_START` + 8× `BAR1_INDEX`
+  for the 64 MiB DRAM window), ending in `flush_l2c; flush_dcache` to activate it,
+- `bootcmd = run wa ; run wb ; run wc ; run wd ; sleep <N> ; flush ; bootoctlinux 0x20010000
+  numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=3`
+
+**The window is programmed to THIS machine's BIOS-assigned BAR0/BAR2, read live from sysfs —
+never hardcoded.** BAR bases move across reseats and differ between machines (this card went
+`f4000000` → `c4000000` after a reseat); a stale hardcode aims the card's decode where the
+host can't reach it. Because provisioning is per-machine anyway, baking in the real BARs makes
+it correct by construction: on a different machine, just run `card-prep-hostboot.sh` once there.
+
+`sleep <N>` defaults to **120 s** (race-free: the host always reaches `octboot` while u-boot is
+still waiting). Tighten with `sudo SLEEP=25 ./card-prep-hostboot.sh` for a faster boot with less
+margin — or after the fact with `provision-hostboot.sh` (which only re-tunes the sleep value).
+
+Related helpers: `restore-bootapp.sh` reverts to the stock boot-app autoboot; `set-hostboot.sh`
+is the (legacy) liquidio host-boot prep, not this env.
 
 > The fully serial-**free** first install (injecting these commands over the u-boot PCI
 > console instead of a cable) is prototyped but shelved — see `_lab/hostmod-dead/octconsole.c`.
