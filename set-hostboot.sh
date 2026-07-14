@@ -11,9 +11,12 @@ stty -F $DEV $BAUD raw -echo 2>/dev/null
 ( timeout 40 cat $DEV > $LOG ) &
 LP=$!
 sleep 0.2
-setpci -s 00:03.0 BRIDGE_CONTROL=40:40
+# bridge BDF moves across reseats/re-enumeration (was 00:03.0, now 00:01.0) -- detect it
+CARD=$(lspci -d 177d:0092 | awk '{print $1}' | head -1)
+BR=$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/0000:$CARD)")" | sed 's/^0000://')
+setpci -s "$BR" BRIDGE_CONTROL=40:40
 sleep 0.12
-setpci -s 00:03.0 BRIDGE_CONTROL=00:40
+setpci -s "$BR" BRIDGE_CONTROL=00:40
 # hammer Enter ~12s to stop autoboot
 t=0
 while [ $t -lt 240 ]; do printf '\r' > $DEV; sleep 0.05; t=$((t+1)); done
