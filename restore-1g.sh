@@ -33,12 +33,17 @@ s.close()
 PY
 
 echo "[*] host: BAR2 + module + oct0"
-setpci -s $BDF BASE_ADDRESS_0=0xf8000000
-setpci -s $BDF BASE_ADDRESS_2=0xf400000c
+# BAR bases move across reseats/re-enumeration (f4000000 -> c4000000 seen) -- read them LIVE
+# from sysfs, never hardcode, or the card's decode points where the host can't reach it.
+RES=/sys/bus/pci/devices/0000:$BDF/resource
+B0=$(( ($(awk 'NR==1{print $1}' "$RES")) & 0xffffffff | 0xc ))
+B2=$(( ($(awk 'NR==3{print $1}' "$RES")) & 0xffffffff | 0xc ))
+setpci -s $BDF BASE_ADDRESS_0=$(printf '0x%08x' $B0)
+setpci -s $BDF BASE_ADDRESS_2=$(printf '0x%08x' $B2)
 setpci -s $BDF BASE_ADDRESS_3=0x00000000
 setpci -s $BDF COMMAND=0x06
 rmmod octshm_host 2>/dev/null || true
-insmod "$DIR/hostmod/octshm_host.ko" base=0xf4000000 dma=1
+insmod "$DIR/hostmod/octshm_host.ko" base=$(printf '0x%08x' $(( B2 & ~0xf ))) dma=1
 ip addr flush dev oct0 2>/dev/null || true
 ip addr add 10.9.9.1/24 dev oct0
 ip link set oct0 mtu 9000 up
