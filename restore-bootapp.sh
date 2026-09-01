@@ -1,7 +1,8 @@
 #!/bin/sh
 # Revert card u-boot to stock autoboot of boot-app (undo set-hostboot.sh).
-DEV=/dev/ttyUSB0
-LOG=/home/nico/Desktop/cavium/.cav-restore.log
+DIR="$(cd "$(dirname "$0")" && pwd)"
+DEV=${DEV:-/dev/ttyUSB0}
+LOG=${LOG:-$DIR/.cav-restore.log}
 BAUD=115200
 if [ "$(id -u)" != "0" ]; then echo "run with sudo"; exit 1; fi
 stty -F $DEV $BAUD raw -echo 2>/dev/null

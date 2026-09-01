@@ -46,7 +46,7 @@ fi
 
 # 4) autostart service, with ExecStart pinned to THIS repo location
 say "installing cavium-nic.service (ExecStart -> $REPO/cavium-up.sh)"
-sed "s#^ExecStart=.*#ExecStart=$REPO/cavium-up.sh#" "$REPO/system/cavium-nic.service" \
+sed "s|@REPO@|$REPO|g" "$REPO/system/cavium-nic.service" \
   > /etc/systemd/system/cavium-nic.service || die "write service"
 systemctl daemon-reload
 systemctl enable cavium-nic.service >/dev/null 2>&1 && say "service enabled (starts at boot)"

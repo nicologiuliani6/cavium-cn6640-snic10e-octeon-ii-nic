@@ -12,8 +12,18 @@
 # All PCI locations + BARs are AUTO-DETECTED (survives adding/removing other cards). Override
 # any of CARD/BRIDGE/BAR0/BAR2/DEV/IMG via env if detection is wrong.
 set -u
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 DEV=${DEV:-/dev/ttyUSB0}
-IMG=${IMG:-/home/nico/openwrt/bin/targets/octeon/generic/openwrt-octeon-generic-snic10e-initramfs-kernel.bin}
+if [ -z "${IMG:-}" ]; then
+  for c in \
+    "$DIR"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
+    "$HOME"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
+    "$DIR"/*snic10e-initramfs-kernel.bin ; do
+    [ -f "$c" ] && IMG="$c" && break
+  done
+fi
+IMG=${IMG:-}
+[ -n "$IMG" ] && [ -f "$IMG" ] || { echo "boot-clean: card image not found (set IMG=... or build OpenWrt first)"; exit 1; }
 ADDR=${ADDR:-0x20000000}          # proven working addr (cavium-fast-bar2-boot memory, verified 2026-07-02)
 OFF=${OFF:-0x10000}               # push image OFF bytes into the window: dodges the bad 0x1c cell
 RGO=${RGO:-3}

@@ -11,7 +11,7 @@
 # Assumes the card is already booted (boot-clean.sh) with /tmp/octshm.ko present.
 # Run: sudo bash twocard-up.sh   [MODE=wire|host]  (default host)
 set -u
-DIR=/home/nico/Desktop/cavium
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 MODE=${MODE:-host}
 HRX=${HRX:-1}		# host-RAM RX descriptors (matches card image rc.local hrx=1)
 RXTH=${RXTH:-8}		# parallel host RX drain threads (REV ~2.75G->7G). Needs HRX.

@@ -2,8 +2,9 @@
 # Configure card u-boot to stay at prompt after reset (host-boot ready for liquidio).
 # Sets bootdelay=-1 and clears bootcmd, then saveenv (persists in NOR env partition).
 # Reversible: re-run restore-bootapp.sh to put it back.
-DEV=/dev/ttyUSB0
-LOG=/home/nico/Desktop/cavium/.cav-set.log
+DIR="$(cd "$(dirname "$0")" && pwd)"
+DEV=${DEV:-/dev/ttyUSB0}
+LOG=${LOG:-$DIR/.cav-set.log}
 BAUD=115200
 if [ "$(id -u)" != "0" ]; then echo "run with sudo"; exit 1; fi
 stty -F $DEV $BAUD raw -echo 2>/dev/null

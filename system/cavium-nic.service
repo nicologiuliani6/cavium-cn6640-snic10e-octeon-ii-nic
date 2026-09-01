@@ -12,7 +12,7 @@ Wants=basic.target
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=360
-ExecStart=/home/nico/Desktop/cavium/cavium-up.sh
+ExecStart=@REPO@/cavium-up.sh
 
 [Install]
 WantedBy=multi-user.target

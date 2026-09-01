@@ -16,12 +16,13 @@
 # card won't reach the prompt; power-cycle (host reboot) first, let the no-serial service bring it
 # up, THEN run this. Reversible: re-run with SLEEP=25 (or restore-bootapp.sh for the OEM env).
 set -u
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 DEV=${DEV:-$(ls /dev/serial/by-id/*FT232* /dev/serial/by-id/*if00* /dev/ttyUSB0 2>/dev/null | head -1)}
 BAUD=${BAUD:-115200}
 SLEEP=${SLEEP:-120}                       # new u-boot pre-boot wait (was 25)
 BOOTOCT=${BOOTOCT:-0x20010000}            # image entry inside the window (window base 0x20000000 + OFF 0x10000)
 RGO=${RGO:-3}
-LOG=${LOG:-/home/nico/Desktop/cavium/.cav-provision.log}
+LOG=${LOG:-$DIR/.cav-provision.log}
 [ "$(id -u)" = 0 ] || exec sudo DEV="$DEV" BAUD="$BAUD" SLEEP="$SLEEP" BOOTOCT="$BOOTOCT" RGO="$RGO" LOG="$LOG" "$0" "$@"
 [ -n "$DEV" ] && [ -e "$DEV" ] || { echo "[FAIL] no serial device (set DEV=/dev/ttyUSB0); is the FT232 plugged in?"; exit 1; }
 

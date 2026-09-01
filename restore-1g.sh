@@ -3,7 +3,7 @@
 # Preconditions: Cavium card running OpenWrt at shell prompt on /dev/ttyUSB0 @115200,
 # host sees the EP (lspci -d 177d:), IOMMU on. Run with sudo.
 set -e
-DIR=/home/nico/Desktop/cavium
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
 # find the Cavium BDF (moves across reseats/reboots)

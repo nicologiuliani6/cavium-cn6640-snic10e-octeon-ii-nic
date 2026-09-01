@@ -22,13 +22,14 @@
 #   sudo ./card-prep-hostboot.sh            # provision (sleep 120), then boot with: octboot
 #   sudo SLEEP=25 ./card-prep-hostboot.sh   # tighter u-boot pre-boot wait (faster, less margin)
 set -u
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 DEV=${DEV:-$(ls /dev/serial/by-id/*FT232* /dev/serial/by-id/*if00* /dev/ttyUSB0 2>/dev/null | head -1)}
 BAUD=${BAUD:-115200}
 SLEEP=${SLEEP:-120}                        # u-boot pre-boot wait: host must reach octboot within it
 ADDR=${ADDR:-0x20000000}                   # card DRAM load base (cavium-fast-bar2-boot memory)
 OFF=${OFF:-0x10000}                        # image pushed OFF into the window (dodges bad 0x1c cell)
 RGO=${RGO:-3}                              # octeon-ethernet.receive_group_order (8 POW groups)
-LOG=${LOG:-/home/nico/Desktop/cavium/.cav-prep.log}
+LOG=${LOG:-$DIR/.cav-prep.log}
 BADDR=$(printf '0x%X' $(( ADDR + OFF )))   # bootoctlinux entry = window base + OFF
 [ "$(id -u)" = 0 ] || exec sudo DEV="$DEV" BAUD="$BAUD" SLEEP="$SLEEP" ADDR="$ADDR" OFF="$OFF" RGO="$RGO" LOG="$LOG" "$0" "$@"
 [ -n "$DEV" ] && [ -e "$DEV" ] || { echo "[FAIL] no serial device (set DEV=/dev/ttyUSB0); FT232 plugged in?"; exit 1; }
