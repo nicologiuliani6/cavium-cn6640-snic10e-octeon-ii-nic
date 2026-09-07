@@ -1,5 +1,8 @@
 #!/bin/bash
-# twocard-up.sh — bring up the Cavium <-> NC523 10G link and both iperf paths.
+# twocard-up.sh — bring up oct0/oct1, and (if a loopback peer NIC is present) its iperf rig.
+#
+# The peer NIC (dev NC523 loopback rig) is OPTIONAL: if $NCDEV/$NC2DEV are absent the
+# card + oct0/oct1 still come up fully, just with no test rig on the other end of the DAC.
 #
 # THE UNLOCK: the DAC connects NC523 enp1s0f1 <-> card xaui0. xaui0 RX works but
 # its Vitesse VSC8488 PHY reports link-down on the foreign QLogic DAC, so the
@@ -33,18 +36,25 @@ NC2MAC=${NC2MAC:-c4:34:6b:cc:38:f8}
 BDF=$(lspci -d 177d:0092 | awk '{print $1}' | head -1)
 BAR2=$(printf '0x%08x' $(( $(awk 'NR==3{print $1}' /sys/bus/pci/devices/0000:$BDF/resource) & 0xffffffff )))
 
-# NC523 into a netns so both ends can live on one host without route confusion
-ip netns add $NCNS 2>/dev/null || true
-ip link set $NCDEV netns $NCNS 2>/dev/null || true
-ip netns exec $NCNS ip link set lo up
+# peer NIC present? (still in the root ns, or already moved into its netns). Absent is fine.
+have_peer() { # dev ns
+  ip link show "$1" >/dev/null 2>&1 || ip netns exec "$2" ip link show "$1" >/dev/null 2>&1
+}
 
-# transfer card modules (idempotent): octcarrier (xaui0 link force) + octshm (host NIC)
-BAUD=115200 bash "$DIR/ko-xfer.sh" "$DIR/cardmod/octcarrier.ko" /tmp/octcarrier.ko >/dev/null 2>&1
-[ "$MODE" = wire ] || BAUD=115200 bash "$DIR/ko-xfer.sh" "$DIR/cardmod/octshm_card.ko" /tmp/octshm.ko >/dev/null 2>&1
+# transfer card modules over serial (idempotent): octcarrier + octshm. NOSER=1 means the
+# card's baked rc.local already insmod'd both, so skip the serial round-trip entirely.
+if [ "$MODE" = wire ] || [ "${NOSER:-0}" != 1 ]; then
+  BAUD=115200 bash "$DIR/ko-xfer.sh" "$DIR/cardmod/octcarrier.ko" /tmp/octcarrier.ko >/dev/null 2>&1
+  [ "$MODE" = wire ] || BAUD=115200 bash "$DIR/ko-xfer.sh" "$DIR/cardmod/octshm_card.ko" /tmp/octshm.ko >/dev/null 2>&1
+fi
 
 if [ "$MODE" = wire ]; then
   # direct card xaui0 <-> NC523, no octshm (measures the raw 10G SFP+ link)
   C=192.168.50.1; N=192.168.50.2
+  have_peer $NCDEV $NCNS || { echo "FATAL: MODE=wire needs peer NIC $NCDEV, not present"; exit 1; }
+  ip netns add $NCNS 2>/dev/null || true
+  ip link set $NCDEV netns $NCNS 2>/dev/null || true
+  ip netns exec $NCNS ip link set lo up
   BAUD=115200 bash "$DIR/cexec.sh" \
     'rmmod octshm_card 2>/dev/null; /etc/init.d/firewall stop 2>/dev/null; iptables -F; iptables -P INPUT ACCEPT' \
     "ip addr flush dev xaui0; ip addr add $C/24 dev xaui0; ip link set xaui0 up mtu 9000 promisc on" \
@@ -89,16 +99,18 @@ else
   OPTS="ports=$PORTS dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1} ${NTXQ:+ntxq=$NTXQ}"
   modprobe octnic $OPTS 2>/dev/null || insmod "$DIR/hostmod/octnic.ko" $OPTS
 
-  # port i <-> its NC523 peer in a private netns + subnet (static ARP both sides)
+  # bring oct$i up; if its loopback peer NIC exists, also wire the peer into a private
+  # netns + subnet (static ARP both sides). Returns 1 when there is no peer to wire.
   setup_port() { # oct ns dev peermac cip nip
     local OCT=$1 NS=$2 DEV=$3 PMAC=$4 CIP=$5 NIP=$6
     # octnic registers oct1 a hair after oct0 -> wait for the netdev so its IP actually lands
     local n=0; while ! ip link show $OCT >/dev/null 2>&1 && [ $n -lt 40 ]; do sleep 0.25; n=$((n+1)); done
     nmcli device set $OCT managed no 2>/dev/null || true	# else NM flushes the IP (oct1 loss)
+    ip addr flush dev $OCT; ip addr add $CIP/24 dev $OCT; ip link set $OCT mtu 9000 up
+    have_peer $DEV $NS || { echo "[$OCT] up ($CIP/24, mtu 9000) -- no peer $DEV, test rig skipped"; return 1; }
     ip netns add $NS 2>/dev/null || true
     ip link set $DEV netns $NS 2>/dev/null || true
     ip netns exec $NS ip link set lo up
-    ip addr flush dev $OCT; ip addr add $CIP/24 dev $OCT; ip link set $OCT mtu 9000 up
     local OMAC=$(cat /sys/class/net/$OCT/address)
     ip neigh replace $NIP lladdr $PMAC dev $OCT nud permanent
     ip netns exec $NS ip addr flush dev $DEV
@@ -106,11 +118,20 @@ else
     ip netns exec $NS ip link set $DEV up mtu 9000
     ip netns exec $NS ip neigh replace $CIP lladdr $OMAC dev $DEV nud permanent
   }
-  setup_port oct0 $NCNS  $NCDEV  $NCMAC  $C 10.9.9.2
-  [ "$PORTS" -ge 2 ] && setup_port oct1 $NCNS2 $NC2DEV $NC2MAC 10.9.10.1 10.9.10.2
-  sleep 2
-  echo "[ping oct0] $(ping -c3 -W1 $N 2>&1 | grep -oE '[0-9]+% packet loss')"
-  [ "$PORTS" -ge 2 ] && echo "[ping oct1] $(ping -c3 -W1 10.9.10.2 2>&1 | grep -oE '[0-9]+% packet loss')"
-  echo ">>> oct0 iperf: sudo ip netns exec $NCNS iperf3 -s -B $N  |  sudo iperf3 -c $N -B $C -P8 -t10 [-R]"
-  [ "$PORTS" -ge 2 ] && echo ">>> oct1 iperf: sudo ip netns exec $NCNS2 iperf3 -s -B 10.9.10.2  |  sudo iperf3 -c 10.9.10.2 -B 10.9.10.1 -P8 -t10 [-R]"
+  P0=0; P1=0
+  setup_port oct0 $NCNS  $NCDEV  $NCMAC  $C 10.9.9.2 && P0=1
+  if [ "$PORTS" -ge 2 ]; then setup_port oct1 $NCNS2 $NC2DEV $NC2MAC 10.9.10.1 10.9.10.2 && P1=1; fi
+  if [ "$P0$P1" = 00 ]; then
+    echo "oct0${PORTS:+/oct1} up, no loopback peer NIC -- nothing to ping. Card is live."
+  else
+    sleep 2
+    [ "$P0" = 1 ] && {
+      echo "[ping oct0] $(ping -c3 -W1 $N 2>&1 | grep -oE '[0-9]+% packet loss')"
+      echo ">>> oct0 iperf: sudo ip netns exec $NCNS iperf3 -s -B $N  |  sudo iperf3 -c $N -B $C -P8 -t10 [-R]"
+    }
+    [ "$P1" = 1 ] && {
+      echo "[ping oct1] $(ping -c3 -W1 10.9.10.2 2>&1 | grep -oE '[0-9]+% packet loss')"
+      echo ">>> oct1 iperf: sudo ip netns exec $NCNS2 iperf3 -s -B 10.9.10.2  |  sudo iperf3 -c 10.9.10.2 -B 10.9.10.1 -P8 -t10 [-R]"
+    }
+  fi
 fi
