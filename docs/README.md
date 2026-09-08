@@ -8,7 +8,7 @@ are grouped by what you are trying to do.
 | Page | Read it when |
 |---|---|
 | [FLASHING](FLASHING.md) | Building the modules and the card image, the one-time serial u-boot provisioning, and booting the card with `octboot`. |
-| [USAGE](USAGE.md) | Day-to-day operation: the systemd autostart, `octnic` module parameters, temperatures and power in `sensors`, the single-host test rig, troubleshooting. |
+| [USAGE](USAGE.md) | Day-to-day operation: the systemd autostart, `octnic` module parameters, temperatures and power in `sensors`, benchmarking, troubleshooting. |
 
 ## Reference
 

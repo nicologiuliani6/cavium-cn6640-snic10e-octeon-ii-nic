@@ -40,7 +40,7 @@ After `systemctl start cavium-nic` you get `oct0` and `oct1` as ordinary 10 GbE 
 ```bash
 sudo ./octboot                       # boot the card (waits for heartbeat)
 sudo modprobe octnic ports=2         # oct0 + oct1
-sudo ip addr add 10.0.0.1/24 dev oct0
+sudo ip addr add 10.9.9.1/24 dev oct0
 sudo ip link set oct0 mtu 9000 up
 # ... same for oct1, or bridge them, or hand to your app
 ```
@@ -64,35 +64,21 @@ sudo ip link set oct0 mtu 9000 up
 
 The autostart uses `ports=2 dma=1 hrx=1 rxthreads=8 ntxq=8 poll_us=20`.
 
-## Test rig (netns)
+## Benchmarking
 
-This is a **development-only** convenience for benchmarking on a single host — the peer NIC
-is not part of the deliverable; any 10 GbE peer (switch or another machine) works and needs no
-namespaces. When the peer NIC lives in the **same** machine, put each peer port in its own
-network namespace — otherwise the kernel short-circuits the two local IPs in RAM and never
-touches the card. Name the peer ports and `scripts/nic-up.sh` wires the rig automatically:
+Both ports are ordinary netdevs, so `iperf3` over the DAC to whatever the card is cabled to
+is the whole method. `scripts/nic-up.sh` puts `10.9.9.1/24` on `oct0` and `10.9.10.1/24` on
+`oct1` (override with `IP0=` / `IP1=`); give the peer an address in the same subnet and:
 
 ```bash
-sudo PEER0_DEV=enp1s0f1 PEER0_MAC=<mac> \
-     PEER1_DEV=enp1s0f0 PEER1_MAC=<mac> bash scripts/nic-up.sh
+# on the peer
+iperf3 -s
+# on this host, per port
+sudo iperf3 -c <peer-ip> -B 10.9.9.1 -P8 -t10        # add -R for the reverse direction
 ```
 
-```
-oct0 (default ns) 10.9.9.1   <->  card xaui0 <->DAC<-> PEER0_DEV  (ns peer0, 10.9.9.2)
-oct1 (default ns) 10.9.10.1  <->  card xaui1 <->DAC<-> PEER1_DEV  (ns peer1, 10.9.10.2)
-```
-
-```bash
-# iperf3, port 0
-sudo ip netns exec peer0 iperf3 -s -B 10.9.9.2 &
-sudo iperf3 -c 10.9.9.2 -B 10.9.9.1 -P8 -t10        # add -R for reverse
-# port 1
-sudo ip netns exec peer1 iperf3 -s -B 10.9.10.2 &
-sudo iperf3 -c 10.9.10.2 -B 10.9.10.1 -P8 -t10
-```
-
-With a real external peer (switch / another machine) you don't need namespaces — just
-assign IPs to `oct0`/`oct1`.
+MTU is set to 9000 on `oct0`/`oct1`; set the same on the peer. Benchmark on a **freshly
+booted** card — see [PERFORMANCE](PERFORMANCE.md) for the numbers and the caveats.
 
 ## Card temperature and power
 
@@ -108,25 +94,44 @@ card (estimate):   19.50 W
 ```
 
 **`power1` is a model, not a measurement.** The card has no power sensor: it is PCIe
-bus-powered and its two i2c buses carry only the tmp421, the SFP/TLV EEPROMs and a
-pca9554 (see `snic10e.dts`) — there is no shunt or PMBus monitor to read. `octnic`
-therefore estimates the draw as `baseline + per-Gbit/s of traffic` from the `oct0`/`oct1`
-counters, and labels the channel `card (estimate)` so it can't be mistaken for a reading.
-Calibrate the two coefficients against a wall meter (writable at runtime, mW):
+bus-powered and its two i2c buses carry only the tmp421, the SFP/TLV EEPROMs and a pca9554
+(see `snic10e.dts`). `octnic` estimates the draw as `baseline + per-Gbit/s of traffic` from
+the `oct0`/`oct1` counters, and labels the channel `card (estimate)`. Calibrate the two
+coefficients against a wall meter (writable at runtime, mW):
 
 ```bash
 echo 18000 | sudo tee /sys/module/octnic/parameters/p_base_mw   # card as installed, idle
 echo   700 | sudo tee /sys/module/octnic/parameters/p_gbps_mw   # extra per Gbit/s TX+RX
 ```
 
+`hostmod/power-model-check.py` re-runs the same integer expression as the driver, so a
+units or overflow slip fails there instead of in `sensors` (`python3 hostmod/power-model-check.py`).
+
 Method: read the wall meter with the host idle, card removed vs. installed (modules
 plugged as you run them) → `p_base_mw`; then run `iperf3` at a known rate and divide the
 increase by the Gbit/s → `p_gbps_mw`.
 
-There is deliberately **no per-port term**: the host `oct0`/`oct1` netdevs are always
-admin-up, and the card does not publish its real `xaui0`/`xaui1` carrier over the ctrl
-page, so a per-link term would bill ports that have no cable. Module and PHY power is part
-of `p_base_mw`.
+There is **no per-port term**: the host `oct0`/`oct1` netdevs are always admin-up and the
+card does not publish its real `xaui0`/`xaui1` carrier over the ctrl page, so a per-link term
+would bill ports that have no cable. Module and PHY power is part of `p_base_mw`.
+
+## Uninstall
+
+Nothing is flashed for the NIC role, so removing the host side is the whole rollback:
+
+```bash
+sudo systemctl disable --now cavium-nic
+sudo rm -f /etc/systemd/system/cavium-nic.service && sudo systemctl daemon-reload
+sudo rmmod octnic
+sudo dkms remove -m octnic -v "$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' hostmod/dkms.conf)" --all
+sudo rm -f /lib/modules/$(uname -r)/extra/octnic.ko && sudo depmod -a   # non-dkms install
+sudo rm -f /etc/modprobe.d/blacklist-liquidio.conf \
+           /etc/NetworkManager/conf.d/99-octnic-unmanaged.conf
+```
+
+The card keeps only the one-time u-boot env; `scripts/restore-bootapp.sh` puts it back on its
+stock OEM autoboot (serial, see [FLASHING](FLASHING.md#3-one-time-u-boot-provisioning-serial-once--scriptscard-prep-hostbootsh)).
+Left as-is, the card sits idle until `octboot` pushes an image again.
 
 ## Troubleshooting
 
@@ -138,11 +143,10 @@ of `p_base_mw`.
 - **One port stops receiving (TX still fine) after heavy load** — the RX ring desynced
   under drop pressure. First-line recovery, no card reboot needed: `sudo rmmod octnic &&
   sudo modprobe octnic ports=2` and re-add the IPs — the card disarms on unload and re-arms
-  with the new pools (validated: full ring resync, RX back to line rate).
-- **Host hard-freeze under heavy load** — this OEM card can *wedge* under sustained
-  traffic; a synchronous BAR read to a wedged card stalls the CPU and freezes the host. It
-  is a defect of this (second-hand) board, not the driver. Recover with a host reboot. To
-  park a suspect card without rebooting: `setpci -s <BDF> COMMAND=0000` then
+  with the new pools — full ring resync, RX back to rate.
+- **Host hard-freeze under heavy load** — the card can *wedge* under sustained traffic, and a
+  synchronous BAR read to a wedged card stalls the CPU and freezes the host. Recover with a
+  host reboot. To park a suspect card without rebooting: `setpci -s <BDF> COMMAND=0000` then
   `echo 1 > /sys/bus/pci/devices/0000:<BDF>/remove` (bring back with
   `echo 1 > /sys/bus/pci/rescan`). Don't leave `octnic` loaded on an idle/wedged card.
 - **Card won't boot after a wedge** — soft resets don't clear card RAM; only a full host

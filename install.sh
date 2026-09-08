@@ -22,6 +22,10 @@ for c in setpci lspci make gcc ip awk python3 depmod modprobe; do
 done
 [ -d "/lib/modules/$(uname -r)/build" ] || miss="$miss kernel-headers(/lib/modules/$(uname -r)/build)"
 [ -z "$miss" ] || die "missing:$miss  (Debian/Ubuntu: apt install pciutils build-essential linux-headers-\$(uname -r))"
+# Secure Boot puts the kernel in lockdown: setpci + the BAR mmaps return EPERM and unsigned
+# out-of-tree modules are refused. Warn early — it is a BIOS setting, nothing to rebuild.
+grep -q '\[integrity\]\|\[confidentiality\]' /sys/kernel/security/lockdown 2>/dev/null \
+  && printf '[ \033[33m!\033[0m ] kernel lockdown is ON (Secure Boot) — setpci/BAR access will fail; disable Secure Boot in the BIOS\n'
 
 # 2) build + install the host module (native, against the running kernel).
 # With dkms present the module is registered so it rebuilds itself on every kernel
@@ -83,7 +87,7 @@ if lspci -d 177d:0092 >/dev/null 2>&1 && [ -n "$(lspci -d 177d:0092)" ]; then
       || die "start failed (see /var/log/cavium-up.log)"
   fi
 else
-  printf '[ \033[33m!\033[0m ] CN6640 (177d:0092) not on the bus — plug the card / enable Above-4G BIOS\n'
+  printf '[ \033[33m!\033[0m ] CN6640 (177d:0092) not on the bus — check the card is seated in a PCIe slot\n'
 fi
 
 echo

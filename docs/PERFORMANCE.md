@@ -1,8 +1,6 @@
 # Performance
 
-Measured with `iperf3 -P8`, MTU 9000, on a fresh card boot, over a DAC to a 10 GbE peer (our
-dev-only test peer here was a second 10 GbE NIC in the same host, each port in its own netns — see
-[USAGE → test rig](USAGE.md#test-rig-netns)); the peer is not part of the deliverable.
+Measured with `iperf3 -P8`, MTU 9000, on a fresh card boot, over a DAC to a 10 GbE peer.
 
 ## Per-port, one port at a time
 
@@ -11,13 +9,13 @@ dev-only test peer here was a second 10 GbE NIC in the same host, each port in i
 | `oct0` (xaui0) | **9.71 Gb/s** | **8.10 Gb/s** |
 | `oct1` (xaui1) | **9.81 Gb/s** | **8.82 Gb/s** |
 
-FWD is **line-rate 10 GbE** and REV is at ~85–90 % of wire. Ping 0% loss. (Shipped `ports=2`
-config, single fresh boot, one measurement pass.)
+FWD is line rate; REV is at ~85–90 % of wire. Ping 0 % loss. Shipped `ports=2` config, one
+measurement pass on a single fresh boot.
 
 > **RX 5.4 → 8.9 Gb/s: the capture cores were the wall.** RX frames die *between* PIP and the
-> driver tap (the POW/NAPI capture layer) when the NAPI cores can't keep up — proven with UDP
-> probes (38 % loss while the card's own counters showed PIP drops = 0, DPI queue ~empty, and
-> deliver cost only 0.6 µs/frame). RX scales with the number of NAPI cores: 2 cores = 5.4 G,
+> driver tap (the POW/NAPI capture layer) when the NAPI cores can't keep up — UDP probes show
+> 38 % loss while the card's counters show PIP drops = 0, DPI queue ~empty, and deliver cost
+> 0.6 µs/frame. RX scales with the number of NAPI cores: 2 cores = 5.4 G,
 > 4 = 8.2, 6 = 8.9, 8 = 7.2 (cross-core contention). Meanwhile the zero-copy TX path needs only
 > **two** worker cores for line rate. The shipped split is therefore `nworkers=2` (cpu0-1) +
 > RX POW IRQs pinned to cpu2-7 (**6 NAPI cores**) — set by `bindcpu=1` + rc.local.
@@ -55,12 +53,12 @@ config, single fresh boot, one measurement pass.)
 Both single-direction aggregates now sit at ~10.5 Gb/s (2-port RX was 5–7 before the NAPI-core
 split — it nearly doubled).
 
-> **2-port TX ~10.5 Gb/s is the host-PIO wall, not a tuning gap.** The host fills the TX rings
+> **2-port TX ~10.5 Gb/s is the host-PIO wall.** The host fills the TX rings
 > with CPU stores through a write-combining BAR2 mapping; x86 WC buffers flush as **64-byte**
 > PCIe TLPs, whose header overhead caps the Gen2 ×4 link at ~73 % efficiency ≈ 11.7 Gb/s
 > theoretical — the measured 10.5 is ~90 % of that, with the host CPUs far from saturated
 > (mpstat ~36 % idle during the blast). Beating it would need ≥ 256 B TLPs, i.e. card-pulled DMA
-> (the `ztx` inbound-DPI path) — which is read-latency-bound at ~6.6 Gb/s and loses. 10.5 stands.
+> (the `ztx` inbound-DPI path), which is read-latency-bound at ~6.6 Gb/s.
 
 ## Full-duplex (TX and RX at once) — the open front
 
@@ -76,13 +74,13 @@ Any substantial *real* TX traffic collapses RX — even across ports (`oct0` TX 
   qdisc lock costs TX 3.5 Gb/s;
 - **L2 thrash via the BAR1 CA bit** — plausible (host PIO writes allocate in the shared 2 MB L2,
   and a TX blast cycles a 1.15 MB window), but `l2ca=0` breaks store/load coherency under load
-  (port wedge) — documented dead end as tried.
+  (port wedge), so it cannot be tested that way.
 
 What the counters *do* show under duplex: the card keeps **delivering** ~130 k frames/s (9.3 Gb/s
 raw) while goodput is ~0 — an out-of-order/retransmit storm seeded by RX-ring-full drops.
 **L2 way-partitioning** (`wpar=0x3`, `L2C_WPAR_IOB`) was tested and is **neutral** — also ruled out.
 
-**The quantified truth (UDP probes, no TCP dynamics):** the card sustains **TX 8.7 + RX 4.8 =
+**Measured with UDP probes (no TCP dynamics):** the card sustains **TX 8.7 + RX 4.8 =
 13.5 Gb/s aggregate full-duplex** — RX halves under any big TX (the card-global step: DRAM/IOB
 bandwidth, ~39 Gb/s of combined window traffic under duplex) but does *not* collapse. What
 collapses is **TCP**: the RX side runs at ~46 % frame loss at that operating point, and TCP
@@ -97,8 +95,8 @@ goodput dies under that loss. Even with both directions app-paced, TCP holds at 
 
 ## Takeaways
 
-- **TX line-rate per port** (9.7–9.8 Gb/s) *and* **RX at 85–90 % of wire** (8.1–8.8 Gb/s), one
-  direction at a time — a genuine 10 GbE dual NIC out of an OEM SmartNIC with no vendor firmware.
+- **TX line-rate per port** (9.7–9.8 Gb/s) and **RX at 85–90 % of wire** (8.1–8.8 Gb/s), one
+  direction at a time.
 - **~10.5 Gb/s aggregate in either single direction** with both ports loaded — the host-PIO
   64 B-TLP wall (TX) and its RX counterpart, ~80 % of the Gen2 ×4 usable budget.
 - **Full-duplex under load is the one open front** (card-global step effect, see above).
@@ -109,16 +107,11 @@ goodput dies under that loss. Even with both directions app-paced, TCP holds at 
 ## Reproduce
 
 ```bash
-sudo systemctl restart cavium-nic     # fresh boot + both ports up
-# with a same-host peer, name its ports so nic-up.sh builds the netns rig
-sudo PEER0_DEV=<dev> PEER0_MAC=<mac> PEER1_DEV=<dev> PEER1_MAC=<mac> bash scripts/nic-up.sh
-# port 0
-sudo ip netns exec peer0 iperf3 -s -B 10.9.9.2 &
-sudo iperf3 -c 10.9.9.2 -B 10.9.9.1 -P8 -t10        # -R for reverse
-# port 1
-sudo ip netns exec peer1 iperf3 -s -B 10.9.10.2 &
-sudo iperf3 -c 10.9.10.2 -B 10.9.10.1 -P8 -t10
+sudo systemctl restart cavium-nic     # fresh boot of the card + both ports up
+# peer: iperf3 -s   (same subnet as oct0/oct1, MTU 9000)
+sudo iperf3 -c <peer0-ip> -B 10.9.9.1  -P8 -t10      # oct0, add -R for the reverse direction
+sudo iperf3 -c <peer1-ip> -B 10.9.10.1 -P8 -t10      # oct1
 ```
 
-With an external peer (switch or another machine) drop the `nic-up.sh` line and the
-`netns exec` prefixes — run `iperf3 -s` on the peer itself.
+`scripts/nic-up.sh` assigns those two addresses (override with `IP0=` / `IP1=`). Duplex and
+two-port numbers are the same commands run concurrently.

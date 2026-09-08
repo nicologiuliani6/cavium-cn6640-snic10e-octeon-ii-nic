@@ -1,18 +1,18 @@
 # Architecture
 
 ```
-        HOST                         PCIe                        CARD (OpenWrt from RAM)
-  ┌───────────────┐                                        ┌───────────────────────────┐
-  │  octnic        │   BAR2 window (64 MiB)                │  octshm_card               │
-  │  oct0 / oct1   │◄────────shared-memory rings──────────►│  per-port rings            │
-  │  (netdevs)     │                                        │  DPI RX engine            │
-  │                │   TX: host PIO into BAR window         │  XAUI tap (packet_type)   │
-  │                │   RX: card DPI DMA into host RAM       │                           │
-  └───────────────┘                                        │  octcarrier               │
-                                                            │  xaui0/xaui1 TX un-gate   │
-                                                            └──────────┬────────────────┘
-                                                                       │ XAUI + DAC
-                                                                       ▼  peer 10 GbE
+        HOST                        PCIe                    CARD (OpenWrt from RAM)
+  ┌────────────────┐                                    ┌───────────────────────────┐
+  │ octnic         │   BAR2 window (64 MiB)             │ octshm_card               │
+  │ oct0 / oct1    │◄───── shared-memory rings ────────►│  per-port rings           │
+  │ (netdevs)      │                                    │  DPI RX engine            │
+  │                │   TX: host PIO into BAR window     │  XAUI tap (packet_type)   │
+  │                │   RX: card DPI DMA into host RAM   │                           │
+  └────────────────┘                                    │ octcarrier                │
+                                                        │  xaui0/xaui1 TX un-gate   │
+                                                        └─────────────┬─────────────┘
+                                                                      │ XAUI + DAC
+                                                                      ▼  peer 10 GbE
 ```
 
 ## The channel: PEM inbound windows
@@ -20,8 +20,8 @@
 The card exposes its DRAM to the host through the Octeon **PEM** inbound BARs. The OEM
 boot-app never programmed them, so both BARs read all-`0xFF` (the "BAR wall"). Programming
 `PEMX_P2N_BARx_START` + `PEMX_BAR1_INDEXx` from the card (u-boot `write64`, or from the
-kernel module) maps card physical memory into the host's BAR2. This is the whole
-foundation — a plain memory window, no NDA firmware.
+kernel module) maps card physical memory into the host's BAR2: a plain memory window, no
+firmware involved.
 
 ## Shared-memory NIC (`octshm`)
 
@@ -42,8 +42,9 @@ ring**, an **RX descriptor ring**, and packet buffers.
 The card's **DPI** (DMA Packet Interface) engine copies received frames into host memory.
 In **`hrx`** mode the card DPI-writes an 8-byte `{len, phase}` header + the frame into a
 host-RAM RX pool; the host reads the header locally (no per-frame MMIO descriptor read
-across PCIe), which is what lifts RX to ~10 G line rate. Eight POW-group RX IRQs are spread
-across cores on the card so RX NAPI runs multi-core. See [DMA-DESIGN](DMA-DESIGN.md).
+across PCIe), which is what lifts RX to **8.1–8.8 Gb/s**. The card's eight POW-group RX IRQs
+are spread over cpu2-7 so RX capture runs on six cores while the two zero-copy TX workers
+keep cpu0-1. See [DMA-DESIGN](DMA-DESIGN.md).
 
 ### TX (host → card) — PIO fill + zero-copy PKO gather
 
@@ -57,7 +58,7 @@ copy. That removes the per-frame CPU wall and takes TX to **line-rate 10 GbE** (
 [PERFORMANCE](PERFORMANCE.md)). Slot reuse needs no completion handshake: PKO drains at wire
 faster than the host fills over PCIe, so ring depth (128) alone guarantees a slot is done
 transmitting before the host wraps to it. (The *inbound-DPI* variant — card DMA-*reads* host
-RAM — is a different path and stays off: it is read-latency-bound and loses to PIO fill.)
+RAM — is a different path and stays off: read-latency-bound, slower than PIO fill.)
 
 ## XAUI uplink (`octcarrier`)
 
@@ -82,11 +83,10 @@ a word-fix pass for write-combining corruption) → the card's `bootcmd` boots i
 for the NIC heartbeat (magic + card_ready). No serial. Provisioning of the persistent
 u-boot env is described in [FLASHING](FLASHING.md).
 
-## What is deliberately not done
+## Not implemented
 
-- **No inbound-DPI TX** — the card-DMA-reads-host-RAM variant is read-latency-bound and loses
-  to PIO fill; TX uses PIO fill + a zero-copy PKO frag gather on the card instead (`zc=1`).
-- **No flashing** — the NIC role runs entirely from RAM; the card is untouched and the host
-  path is out-of-tree.
-- **Serial-free *first* install** — prototyped out of tree (u-boot PCI-console injection) but
-  shelved; provisioning still needs the serial cable once.
+- **Inbound-DPI TX** — the card-DMA-reads-host-RAM variant is read-latency-bound and loses to
+  PIO fill; TX uses PIO fill + a zero-copy PKO frag gather on the card (`zc=1`).
+- **Flashing** — the NIC role runs from RAM only.
+- **Serial-free *first* install** — the one-time u-boot provisioning still needs the serial
+  cable (u-boot PCI-console injection was prototyped and dropped).

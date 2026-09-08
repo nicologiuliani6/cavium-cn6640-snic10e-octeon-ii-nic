@@ -12,7 +12,7 @@
 | **Storage** | 8 MiB NOR flash (u-boot + env) + 1 GiB NAND |
 | **PHY** | Vitesse VSC8488 (dual 10 G) |
 | **Ports** | 2× SFP+ — XAUI interface 0 (`xaui0`) and interface 1 (`xaui1`) |
-| **PCIe** | Gen2 x4, endpoint `177d:0092` (BDF is slot-dependent, e.g. `03:00.0`) |
+| **PCIe** | Gen2 x4, endpoint `177d:0092` (BDF is slot-dependent, e.g. `02:00.0`) |
 
 The card is bus-powered. There is no independent power; the only way to fully power-cycle
 the Octeon is a **host reboot** (a PCIe Secondary Bus Reset resets the PEM link but not the
@@ -20,8 +20,14 @@ SoC).
 
 ## BIOS
 
-- **Enable "Above 4G decoding" / large BAR support.** The card's 64 MiB BAR2 window must be
-  mappable. Without it the BAR may be left unassigned and `octnic` will fail to find it.
+- **Secure Boot must be off.** With Secure Boot on the kernel runs in `lockdown=integrity`:
+  `setpci` and the BAR `mmap`s this stack needs return `EPERM`, and unsigned out-of-tree
+  modules are refused ("Key was rejected by service").
+- **"Above 4G decoding" is *not* required.** Both BARs are 64-bit prefetchable but small
+  enough (16 KiB + 64 MiB) to be assigned below 4 GiB, and that is where this machine's BIOS
+  puts them with the option **off** (`0xc8000000` / `0xc4000000`). Enable it only if the BIOS
+  runs out of 32-bit MMIO space and leaves BAR2 unassigned — `lspci -s <BDF> -v` then shows
+  `[virtual]` or a zero-size Region 2 and `octnic` won't find the card.
 - Leave the card's slot at Gen2; it trains at 5 GT/s x4.
 
 ## PCIe BARs (host view)
@@ -30,19 +36,18 @@ After the card has booted its NIC image and programmed its PEM inbound windows:
 
 | BAR | host phys (example) | size | use |
 |---|---|---|---|
-| BAR0 | `0xf8000000` | 16 KiB | SLI control CSRs (indirect window) |
-| BAR2 | `0xf4000000` | 64 MiB | card DRAM window — the shared-memory NIC rings |
+| BAR0 | `0xc8000000` | 16 KiB | SLI control CSRs (indirect window) |
+| BAR2 | `0xc4000000` | 64 MiB | card DRAM window — the shared-memory NIC rings |
 
-`octnic` auto-discovers BAR2 from the PCI device; you normally never hard-code these.
+`octnic` auto-discovers BAR2 from the PCI device; these addresses are never hard-coded.
 
 > ⚠️ **BAR0 indirect-window freeze hazard.** The SLI window registers (BAR0 `0x00–0x40`) can
-> read/write arbitrary card NCB addresses — but `SLI_WINDOW_CTL` (BAR0 `0x2E0`) defaults to
-> **0 = infinite wait**: a window read to any space that doesn't respond stalls the PCIe bus
-> and **hard-freezes the host** (three confirmed freezes during zero-serial experiments). The
-> vendor driver writes `0x200000` there first ("avoid host hang when reads invalid register").
-> On this OEM board the window answers only for some devices (DPI yes; DRAM, PEM and SLI-self
-> all hang) — do not touch the window without setting `SLI_WINDOW_CTL` first, and ideally not
-> at all.
+> read/write arbitrary card NCB addresses, but `SLI_WINDOW_CTL` (BAR0 `0x2E0`) defaults to
+> **0 = infinite wait**: a window read to a space that doesn't respond stalls the PCIe bus and
+> **hard-freezes the host** (three freezes during the zero-serial experiments). The vendor
+> driver writes `0x200000` there first ("avoid host hang when reads invalid register"). On this
+> board the window answers only for some devices — DPI yes; DRAM, PEM and SLI-self all hang.
+> Set `SLI_WINDOW_CTL` before any window access.
 
 ## Serial console (one-time provisioning only)
 
@@ -73,10 +78,7 @@ card xaui0  <--DAC-->  peer port A   (=> host oct0)
 card xaui1  <--DAC-->  peer port B   (=> host oct1)
 ```
 
-The peer can be any 10 GbE device — a switch or another machine — and is **not part of this
-deliverable**. A second NIC in the *same* host also works for benchmarking, as long as each peer
-port is placed in its own network namespace so traffic actually crosses the wire (see
-[USAGE → test rig](USAGE.md#test-rig-netns)). With an external peer no namespaces are needed.
+Both ports are independent: one cabled port is enough to use the card.
 
 ## XAUI `ipd_port` mapping
 
@@ -87,5 +89,5 @@ port is placed in its own network namespace so traffic actually crosses the wire
 | `xaui0` | 0 | `0` |
 | `xaui1` | 1 | `16` |
 
-(`dev=xaui0,xaui1 ipd_port=0,16`). `16` = interface-1 port-0 on CN66xx XAUI, confirmed on
-hardware (oct1 TX passes traffic only with it un-gated).
+(`dev=xaui0,xaui1 ipd_port=0,16`). `16` = interface-1 port-0 on CN66xx XAUI; `oct1` TX passes
+traffic only with it un-gated.

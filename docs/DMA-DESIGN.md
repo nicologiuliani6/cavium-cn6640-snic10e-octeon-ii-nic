@@ -1,8 +1,7 @@
 # DMA design — why RX is card-mastered and TX is not
 
-[ARCHITECTURE](ARCHITECTURE.md) describes *what* the datapath does. This page is the
-*why*: the two directions ended up asymmetric, and that asymmetry is the whole reason the
-card reaches line rate.
+[ARCHITECTURE](ARCHITECTURE.md) describes *what* the datapath does. This page is the *why*
+behind its asymmetry: RX is card-mastered DMA, TX is host PIO.
 
 ## The constraint: non-posted PCIe reads
 
@@ -55,9 +54,9 @@ The host writes frames straight into the BAR2 TX buffer with write-combining, cl
 slots by CAS so several TX queues (`ntxq`) fill the one ring in parallel; the card drains by
 phase bit and hands PKO a frag pointing at the window slot (`zc=1`) instead of copying.
 
-The obvious-looking alternative — the card DMA-*reads* the frame out of host RAM (`ztx=1`,
-inbound DPI) — is implemented and works, and still loses: it is read-latency-bound at
-~6.6 Gb/s against ~7.75 Gb/s for plain PIO fill, so it stays off.
+The alternative — the card DMA-*reads* the frame out of host RAM (`ztx=1`, inbound DPI) — is
+implemented and works, but is read-latency-bound at ~6.6 Gb/s against ~7.75 Gb/s for plain PIO
+fill, so it stays off.
 
 ## Safety gates for card-mastered DMA
 
