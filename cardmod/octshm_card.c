@@ -662,7 +662,7 @@ static DEFINE_SPINLOCK(rx_lock);	/* guards non-lockfree rx_done + rx_prod publis
  * full, no hole), and instead of publishing a monotonic rx_prod under lock, stamp a
  * PHASE bit into the slot's desc.flags. The host reads the phase to tell ready vs stale
  * (virtio-style), so no completion lock and no cross-core rx_prod serialization. Matched
- * host change required (octshm_host lockfree=1). */
+ * host change required (octnic lockfree=1). */
 static int lockfree;
 module_param(lockfree, int, 0444);
 #define RXF_PHASE  0x1u

@@ -53,7 +53,7 @@ Result is an **initramfs** image, e.g.
 > uncompressed inside the ELF — `grep -a` the `.bin` for a module string to confirm the
 > embed.
 
-## 3. One-time u-boot provisioning (serial, once) — `card-prep-hostboot.sh`
+## 3. One-time u-boot provisioning (serial, once) — `scripts/card-prep-hostboot.sh`
 
 `octboot` relies on a persisted u-boot environment that, on reset, **programs the card's
 PEM inbound window and then boots the pushed image**. Provision it **once** over the serial

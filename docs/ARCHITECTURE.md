@@ -70,9 +70,9 @@ port maps 1:1 to a host netdev, like the OEM 2-port LiquidIO.
 
 `octnic` auto-discovers the card (PCI `177d:0092`), maps the BAR2 window, verifies the
 per-port magic, and registers `oct0`/`oct1`. It carries the port pointer in `netdev_priv`,
-runs `rxthreads` parallel RX drain kthreads per port, and registers an hwmon device for the
-card temperatures. `base=0` (default) means no hard-coded address — `modprobe octnic
-ports=2` just works.
+runs `rxthreads` parallel RX drain kthreads per port, and registers an hwmon device carrying
+the card temperatures and an estimated card power draw. `base=0` (default) means no
+hard-coded address — `modprobe octnic ports=2` just works.
 
 ## Boot (`octboot`)
 
@@ -88,5 +88,5 @@ u-boot env is described in [FLASHING](FLASHING.md).
   to PIO fill; TX uses PIO fill + a zero-copy PKO frag gather on the card instead (`zc=1`).
 - **No flashing** — the NIC role runs entirely from RAM; the card is untouched and the host
   path is out-of-tree.
-- **Serial-free *first* install** — prototyped (`octconsole`, u-boot PCI console injection)
-  but shelved; provisioning still needs the serial cable once.
+- **Serial-free *first* install** — prototyped out of tree (u-boot PCI-console injection) but
+  shelved; provisioning still needs the serial cable once.

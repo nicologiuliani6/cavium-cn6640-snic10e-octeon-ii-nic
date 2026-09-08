@@ -482,7 +482,7 @@ static const struct hwmon_chip_info oct_hwmon_chip = {
 
 static int nregistered;			/* how many netdevs got registered (for cleanup) */
 
-static int __init octshm_host_init(void)
+static int __init octnic_init(void)
 {
 	u32 magic, cr;
 	int ret, i;
@@ -592,7 +592,7 @@ err:
 	return ret;
 }
 
-static void __exit octshm_host_exit(void)
+static void __exit octnic_exit(void)
 {
 	int i;
 
@@ -611,7 +611,7 @@ static void __exit octshm_host_exit(void)
 	iounmap(win);
 	pr_info("octnic: unloaded\n");
 }
-module_init(octshm_host_init);
-module_exit(octshm_host_exit);
+module_init(octnic_init);
+module_exit(octnic_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("octnic: Cavium CN6640 shared-memory NIC (host side, oct0/oct1)");

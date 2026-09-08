@@ -2,7 +2,7 @@
 # octboot — host bootloader for the Cavium CN6640 SNIC10E. Boots the card with NO
 # SERIAL: SBR the card, restore its BARs, push the OpenWrt image into card DRAM over
 # PCIe BAR2, let u-boot boot it, then wait for the card NIC heartbeat.
-# (was boot-nsr.sh; it is the host bootloader, not just a script.) Needs the one-time
+# It is the host bootloader, not just a helper script. Needs the one-time
 # persisted u-boot env:
 #   bootdelay=1
 #   wa/wb/wc/wd  = program the PEM BAR1 window (+ flush_l2c/flush_dcache to activate it)

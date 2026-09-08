@@ -5,8 +5,9 @@
 `system/cavium-nic.service` runs `scripts/cavium-up.sh` at boot: it boots the card with
 `octboot`, then `scripts/nic-up.sh` loads `octnic ports=2` and brings both ports up.
 
-The one-shot installer does all of the below (module build+install, the two host configs,
-and the service) in one go:
+The one-shot installer does all of the below in one go — it registers `octnic` with DKMS
+when that is available (so the module survives kernel upgrades) and otherwise builds it in
+place, drops the two host configs, and installs the service:
 
 ```bash
 sudo ./install.sh            # add --start to also boot the card + bring NICs up now
@@ -55,6 +56,11 @@ sudo ip link set oct0 mtu 9000 up
 | `rxthreads` | `1` | parallel RX drain threads (1/2/4/8) |
 | `ntxq` | `1` | TX queues (multi-core xmit) |
 | `poll_us` | `200` | RX poll interval |
+| `rxbatch` | `1` | deliver each drain batch via `netif_receive_skb_list` |
+| `lockfree` | `0` | read the per-slot phase bit instead of the shared index (match card `lockfree=1`) |
+| `ztx` | `0` | zero-copy TX via inbound DPI — read-latency-bound, loses to PIO fill; off |
+| `p_base_mw` | `18000` | power model baseline, mW (see [below](#card-temperature-and-power)) |
+| `p_gbps_mw` | `700` | power model traffic term, mW per Gbit/s |
 
 The autostart uses `ports=2 dma=1 hrx=1 rxthreads=8 ntxq=8 poll_us=20`.
 

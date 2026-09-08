@@ -1,5 +1,5 @@
 # Cavium SNIC10E auto-bring-up (no serial). Loads xaui0 TX-unlock + octshm NIC +
-# temp feed. Host side (octshm_host/oct0/NC523) is configured by cavium-up.sh.
+# temp feed. Host side (octnic, oct0/oct1) is brought up by scripts/cavium-up.sh.
 echo 0 > /proc/sys/kernel/printk
 /etc/init.d/firewall stop 2>/dev/null
 iptables -F 2>/dev/null; iptables -P INPUT ACCEPT 2>/dev/null

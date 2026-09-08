@@ -6,7 +6,7 @@
 # NO SERIAL by default: octboot boots the card via a persisted self-programming
 # u-boot bootcmd + a host BAR2 image push (no console). The image's baked /etc/rc.local
 # self-loads octcarrier + octshm_card + the temp daemon, so the card side needs no serial.
-# If boot-nsr fails and an FT232 console is present, it falls back to the serial boot-clean.
+# If octboot fails and an FT232 console is present, it falls back to the serial boot-clean.
 #
 # Logs to /var/log/cavium-up.log. Safe to re-run by hand: `sudo bash scripts/cavium-up.sh`.
 DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
