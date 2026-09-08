@@ -51,8 +51,18 @@ Run entirely hands-off by the `system/cavium-nic.service` systemd unit.
 
 ## Quick start
 
-One-shot install (builds + installs the host module, drops the configs, enables autostart).
-With `dkms` present the module is registered so it rebuilds itself on every kernel upgrade:
+Grab the prebuilt card image from the
+[latest release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest)
+and drop it in the repo root — `octboot` picks it up from there, so no OpenWrt build tree is
+needed (building it yourself: [FLASHING](docs/FLASHING.md)):
+
+```bash
+curl -LO https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest/download/openwrt-octeon-generic-snic10e-initramfs-kernel.bin
+```
+
+Then the one-shot install (builds + installs the host module, drops the configs, enables
+autostart). With `dkms` present the module is registered so it rebuilds itself on every
+kernel upgrade:
 
 ```bash
 sudo ./install.sh                     # host side; add --start to also boot the card now
@@ -115,9 +125,11 @@ docs/               see docs/README.md for the index
   blocks the `setpci`/BAR access this stack needs). "Above 4G decoding" is *not* required —
   see [HARDWARE → BIOS](docs/HARDWARE.md#bios).
 - An SFP+ DAC (or optics) per port to whatever the card is cabled to.
-- Host: modern Linux (developed on 6.14) with the matching kernel headers, and an OpenWrt
-  build tree for the card image. `dkms` is optional but recommended — without it the module
-  has to be rebuilt by hand after each kernel upgrade (`NODKMS=1` forces that path).
+- Host: modern Linux (developed on 6.14) with the matching kernel headers. `dkms` is optional
+  but recommended — without it the module has to be rebuilt by hand after each kernel upgrade
+  (`NODKMS=1` forces that path).
+- The card image: prebuilt in the [releases](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases),
+  or an OpenWrt build tree to build it yourself.
 - A USB-serial (FT232) adapter for the **one-time** u-boot provisioning only; normal
   operation is serial-free.
 

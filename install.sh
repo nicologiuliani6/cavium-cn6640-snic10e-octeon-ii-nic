@@ -73,10 +73,11 @@ systemctl daemon-reload
 systemctl enable cavium-nic.service >/dev/null 2>&1 && say "service enabled (starts at boot)"
 
 # 5) card image check (built OpenWrt initramfs; octboot needs it)
-IMG=$(ls "$REPO"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
+IMG=$(ls "$REPO"/*snic10e-initramfs-kernel.bin \
+        "$REPO"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
         /home/*/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin 2>/dev/null | head -1)
 if [ -n "$IMG" ]; then say "card image found: $IMG"
-else printf '[ \033[33m!\033[0m ] card image not built yet -> run ./openwrt/build-openwrt.sh (or set IMG=... for octboot)\n'; fi
+else printf '[ \033[33m!\033[0m ] no card image -> download it from the GitHub release into %s/, or build it with ./openwrt/build-openwrt.sh\n' "$REPO"; fi
 
 # 6) card present?
 if lspci -d 177d:0092 >/dev/null 2>&1 && [ -n "$(lspci -d 177d:0092)" ]; then

@@ -32,7 +32,12 @@ make -C $KDIR M=$PWD ARCH=mips CROSS_COMPILE=mips64-openwrt-linux-musl- \
      octshm_card.ko octcarrier.ko
 ```
 
-## 2. Build the OpenWrt image
+## 2. The OpenWrt image
+
+A prebuilt image is attached to each
+[release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases) —
+drop the `.bin` in the repo root and `octboot` finds it (or point `IMG=` at it anywhere).
+Building it yourself:
 
 The card image is the **[hurricos/openwrt `snic10e-ethernet`](https://git.laboratoryb.org/hurricos/openwrt/src/branch/snic10e-ethernet)**
 port, plus this repo's overlay (`openwrt/files/`) which bakes in the card modules and an

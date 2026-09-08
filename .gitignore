@@ -21,3 +21,6 @@ openwrt/files/root/*.ko
 # runtime bring-up state (written by cavium-up.sh / build-openwrt.sh)
 .bringup-status
 .build-status
+
+# card image downloaded from a release (or copied out of an OpenWrt build tree)
+/*snic10e-initramfs-kernel.bin
