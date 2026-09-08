@@ -53,42 +53,32 @@ Run entirely hands-off by the `system/cavium-nic.service` systemd unit.
 
 ## Quick start
 
-The card needs an OS image; the host needs the `octnic` module. Two ways to get the image:
-
-**A — prebuilt (recommended).** Download it from the
-[latest release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest)
-into the repo root; `octboot` looks there first. No OpenWrt tree needed:
-
 ```bash
+git clone https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic
+cd cavium-cn6640-snic10e-octeon-ii-nic
+
+# 1) the card's OS image, prebuilt — octboot looks for it here in the repo root
 curl -LO https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest/download/openwrt-octeon-generic-snic10e-initramfs-kernel.bin
+
+# 2) the host side: builds + installs octnic (DKMS), drops the configs, enables autostart
+sudo ./install.sh
+
+# 3) first time on this machine only — persist the card's u-boot env (serial cable, once)
+sudo ./scripts/card-prep-hostboot.sh
+
+# 4) every boot, no serial: pushes the image over PCIe, brings up oct0 + oct1
+sudo systemctl start cavium-nic
+ip -br addr show oct0
 ```
 
-**B — from source.** Build the card modules and the OpenWrt image yourself (needed only if you
-change the card side): [FLASHING §1–2](docs/FLASHING.md).
+Step 4 is what the `cavium-nic` service runs at every host boot, so after step 3 the card
+comes up on its own. Steps 1–3 are once per machine.
 
-Either way, the host side is one command — it builds and installs `octnic`, drops the configs
-and enables the autostart. With `dkms` present the module re-builds itself on kernel upgrades:
+**Building the image yourself** instead of step 1 (needed only if you change the card side):
+[FLASHING §1–2](docs/FLASHING.md). `octboot` also takes `IMG=<path>` or finds the image in an
+OpenWrt build tree under `$HOME`.
 
-```bash
-sudo ./install.sh                     # host side; add --start to also boot the card now
-```
-
-First time only — provision the card's u-boot env over serial (one command, see
-[FLASHING](docs/FLASHING.md)); already-provisioned cards skip this:
-
-```bash
-sudo ./scripts/card-prep-hostboot.sh  # serial, once — reads this machine's BARs, saveenv to NAND
-```
-
-Then, every boot, no serial:
-
-```bash
-sudo systemctl start cavium-nic      # boots the card + brings up oct0 and oct1 (no serial)
-ip -br addr show oct0                 # 10 GbE host interface, port 0
-ip -br addr show oct1                 # 10 GbE host interface, port 1
-```
-
-Manual equivalent:
+Manual equivalent of step 4:
 
 ```bash
 sudo ./octboot                        # boot the card (no serial)
