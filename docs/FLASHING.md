@@ -50,9 +50,15 @@ make -C $KDIR M=$PWD ARCH=mips CROSS_COMPILE=mips64-openwrt-linux-musl- \
 The prebuilt image in the releases is this same build; `octboot` takes whichever it finds
 (repo root, an OpenWrt build tree under `$HOME`, or `IMG=<path>`).
 
-The card image is the **[hurricos/openwrt `snic10e-ethernet`](https://git.laboratoryb.org/hurricos/openwrt/src/branch/snic10e-ethernet)**
-port, plus this repo's overlay (`openwrt/files/`) which bakes in the card modules and an
-`rc.local` that auto-loads the datapath at boot.
+The card image is the OpenWrt SNIC10E port —
+[stintel/openwrt](https://codeberg.org/stintel/openwrt.git), branch `snic10e-5.10`, commit
+`7bbf4b7`, which is what the released image was built from — plus `openwrt/patches/` (one
+local change to that tree) and this repo's overlay (`openwrt/files/`), which bakes in the card
+modules and an `rc.local` that auto-loads the datapath at boot.
+
+```bash
+OPENWRT_DIR=~/openwrt CLONE=1 ./openwrt/build-openwrt.sh   # clones the pinned commit, patches, builds
+```
 
 - `openwrt/snic10e.config` — kernel/config fragment for the target.
 - `openwrt/files/` — root overlay: `/etc/rc.local` (loads `octcarrier` + `octshm_card`,
@@ -72,7 +78,10 @@ port, plus this repo's overlay (`openwrt/files/`) which bakes in the card module
 
   Card-side parameters not in that list (`bench`, `blen`, `linrx`, `l2ca`, `wpar`, `ztx`,
   `rxwork`, `es`) are measurement or tuning knobs; the defaults are what ships.
-- `openwrt/build-openwrt.sh` — reference build invocation.
+- `openwrt/patches/` — the local delta against the upstream commit; `build-openwrt.sh` applies it.
+- `openwrt/hostfix/` — host-side build shims (gcc-14 warning downgrades, a `pipes` stub for
+  Python 3.13) that OpenWrt 5.10's host tools need on a current distro.
+- `openwrt/build-openwrt.sh` — the build itself: clone/pin, patch, config, `make`.
 
 Result is an **initramfs** image, e.g.
 `bin/targets/octeon/generic/openwrt-octeon-generic-snic10e-initramfs-kernel.bin` (~21 MiB).

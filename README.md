@@ -108,6 +108,7 @@ scripts/            cavium-up.sh, nic-up.sh      — bring-up orchestration
                     boot-clean.sh, cexec.sh      — serial fallbacks
                     restore-bootapp.sh           — revert the card to its stock OEM boot
 openwrt/            snic10e.config, build-openwrt.sh, files/ — card image build + overlay
+                    patches/, hostfix/ — upstream delta + host build shims (GPL source)
 system/             cavium-nic.service, blacklist-liquidio.conf, 99-octnic-unmanaged.conf
 docs/               see docs/README.md for the index
 ```
@@ -132,16 +133,26 @@ docs/               see docs/README.md for the index
 
 ## Credits
 
-- **[hurricos/openwrt @ `snic10e-ethernet`](https://git.laboratoryb.org/hurricos/openwrt/src/branch/snic10e-ethernet)**
-  — the OpenWrt port that brings up the SNIC10E and its XAUI Ethernet; this project runs
-  that image on the card and builds the host datapath on top of it.
+- **OpenWrt SNIC10E support** — the released card image is built from
+  [stintel/openwrt](https://codeberg.org/stintel/openwrt.git) branch `snic10e-5.10`
+  (commit `7bbf4b7`), which brings up the board and its XAUI Ethernet; earlier work used
+  [hurricos/openwrt @ `snic10e-ethernet`](https://git.laboratoryb.org/hurricos/openwrt/src/branch/snic10e-ethernet).
+  This project runs that image on the card and builds the host datapath on top of it.
 - Cavium/Marvell Octeon SDK (`cvmx_*` helpers) and the in-tree `liquidio` driver, used as
   reverse-engineering references for the SLI/DPI/PEM register layout.
 
 ## License
 
-GPL-2.0 — see [LICENSE](LICENSE). The kernel modules carry SPDX headers; scripts and docs
-are under the same license unless noted.
+GPL-2.0 — see [LICENSE](LICENSE). The kernel modules carry SPDX headers; scripts and docs are
+under the same license unless noted.
+
+The card image attached to the [releases](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases)
+is a GPL-2.0 binary (OpenWrt + Linux). Its complete corresponding source is: upstream
+[stintel/openwrt](https://codeberg.org/stintel/openwrt.git) at commit `7bbf4b7` (branch
+`snic10e-5.10`), plus `openwrt/patches/` (the one local change to that tree),
+`openwrt/snic10e.config` (the build config), `openwrt/files/` (the root overlay),
+`cardmod/` (the card modules baked into it) and `openwrt/build-openwrt.sh` (the script that
+builds it — `CLONE=1` clones and checks out the pinned commit for you).
 
 ## Disclaimer
 

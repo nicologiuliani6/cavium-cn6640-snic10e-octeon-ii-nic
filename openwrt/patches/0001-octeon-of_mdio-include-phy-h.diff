@@ -1,0 +1,13 @@
+diff --git a/target/linux/octeon/patches-5.10/710-netdev-phy-of-Handle-nexus-Ethernet-PHY-devices.patch b/target/linux/octeon/patches-5.10/710-netdev-phy-of-Handle-nexus-Ethernet-PHY-devices.patch
+index 4f7efe2..dec2f37 100644
+--- a/target/linux/octeon/patches-5.10/710-netdev-phy-of-Handle-nexus-Ethernet-PHY-devices.patch
++++ b/target/linux/octeon/patches-5.10/710-netdev-phy-of-Handle-nexus-Ethernet-PHY-devices.patch
+@@ -23,7 +23,7 @@ Signed-off-by: Stijn Tintel <stijn@linux-ipv6.be>
+  #include <linux/of_mdio.h>
+  #include <linux/of_net.h>
+ +#include <linux/of_platform.h>
+- #include <linux/module.h>
++ #include <linux/phy.h>
+  
+  #define DEFAULT_GPIO_RESET_DELAY	10	/* in microseconds */
+ @@ -278,6 +279,11 @@ int of_mdiobus_register(struct mii_bus *

@@ -1,0 +1,15 @@
+#!/bin/sh
+exec gcc-14 "$@" \
+  -Wno-error=implicit-function-declaration \
+  -Wno-error=implicit-int \
+  -Wno-error=int-conversion \
+  -Wno-error=incompatible-pointer-types \
+  -Wno-error=unused-variable \
+  -Wno-error=unused-but-set-variable \
+  -Wno-error=unused-function \
+  -Wno-error=deprecated-declarations \
+  -Wno-error=format-truncation \
+  -Wno-error=stringop-truncation \
+  -Wno-error=stringop-overflow \
+  -Wno-error=array-bounds \
+  -Wno-error=maybe-uninitialized
