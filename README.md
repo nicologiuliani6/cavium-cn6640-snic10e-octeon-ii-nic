@@ -120,7 +120,6 @@ docs/               see docs/README.md for the index
 - The Cavium CN6640-SNIC10E card in a PCIe slot, with **Secure Boot off** (kernel lockdown
   blocks the `setpci`/BAR access this stack needs). "Above 4G decoding" is *not* required —
   see [HARDWARE → BIOS](docs/HARDWARE.md#bios).
-- An SFP+ DAC (or optics) per port to whatever the card is cabled to.
 - Host: modern Linux (developed on 6.14) with the matching kernel headers. `dkms` is optional
   but recommended — without it the module has to be rebuilt by hand after each kernel upgrade
   (`NODKMS=1` forces that path).
