@@ -46,13 +46,14 @@ role), and the host side is out-of-tree modules + scripts.
 | `octcarrier` (`cardmod/`) | card (kmod) | Un-gates `xaui0`/`xaui1` TX on the QLogic DAC (`cvmx_helper_link_set`). |
 | `scripts/cavium-up.sh` / `scripts/nic-up.sh` | host | Orchestrate a full bring-up: boot the card, load `octnic`, bring both ports up. |
 
-Run entirely hands-off by the `cavium-nic.service` systemd unit (see `system/`).
+Run entirely hands-off by the `system/cavium-nic.service` systemd unit.
 
 ---
 
 ## Quick start
 
-One-shot install (builds + installs the host module, drops the configs, enables autostart):
+One-shot install (builds + installs the host module, drops the configs, enables autostart).
+With `dkms` present the module is registered so it rebuilds itself on every kernel upgrade:
 
 ```bash
 sudo ./install.sh                     # host side; add --start to also boot the card now
@@ -118,7 +119,9 @@ lives outside the repo and is not published.
   NIC in the same host works too for benchmarking (see
   [USAGE → test rig](docs/USAGE.md#test-rig-netns)) — that is a dev convenience only, **not
   required** and not part of this deliverable.
-- Host: modern Linux (developed on 6.14), an OpenWrt build tree for the card image.
+- Host: modern Linux (developed on 6.14) with the matching kernel headers, and an OpenWrt
+  build tree for the card image. `dkms` is optional but recommended — without it the module
+  has to be rebuilt by hand after each kernel upgrade (`NODKMS=1` forces that path).
 - A USB-serial (FT232) adapter for the **one-time** u-boot provisioning only; normal
   operation is serial-free.
 
