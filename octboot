@@ -143,7 +143,7 @@ ok "Booting... (u-boot flush -> bootoctlinux)"
 # wait for the card NIC to raise its BAR2 heartbeat (magic 0x4f435348 + card_ready=1).
 # Must exceed the u-boot pre-boot sleep (120s) + Linux boot: the image is pushed into the live
 # window early, but u-boot only bootoctlinux's after its sleep expires, so the card is ready
-# ~140s after SBR. Block here until then so twocard-up finds the card up on its first try.
+# ~140s after SBR. Block here until then so nic-up finds the card up on its first try.
 for _ in $(seq 1 165); do
   v=$(python3 -c "import mmap,os
 fd=os.open('/sys/bus/pci/devices/0000:$CARD/resource2',os.O_RDWR)   # O_RDONLY mmap -> Errno 13

@@ -44,7 +44,7 @@ role), and the host side is out-of-tree modules + scripts.
 | `octnic` (`hostmod/octnic.c`) | host (kmod) | Registers `oct0`/`oct1` over the card's BAR2 window. Auto-discovers the card (`modprobe octnic ports=2`). |
 | `octshm_card` (`cardmod/`) | card (kmod) | Card end of the shared-memory datapath: per-port rings, DPI RX, XAUI uplink tap. |
 | `octcarrier` (`cardmod/`) | card (kmod) | Un-gates `xaui0`/`xaui1` TX on the QLogic DAC (`cvmx_helper_link_set`). |
-| `cavium-up.sh` / `twocard-up.sh` | host | Orchestrate a full bring-up: boot the card, load `octnic`, wire up both ports. |
+| `scripts/cavium-up.sh` / `scripts/nic-up.sh` | host | Orchestrate a full bring-up: boot the card, load `octnic`, bring both ports up. |
 
 Run entirely hands-off by the `cavium-nic.service` systemd unit (see `system/`).
 
@@ -62,7 +62,7 @@ First time only — provision the card's u-boot env over serial (one command, se
 [FLASHING](docs/FLASHING.md)); already-provisioned cards skip this:
 
 ```bash
-sudo ./card-prep-hostboot.sh          # serial, once — reads this machine's BARs, saveenv to NAND
+sudo ./scripts/card-prep-hostboot.sh  # serial, once — reads this machine's BARs, saveenv to NAND
 ```
 
 Then, every boot, no serial:
@@ -81,26 +81,29 @@ sudo modprobe octnic ports=2          # oct0 + oct1 appear
 # assign IPs / bridge / use like any NIC
 ```
 
-Full details: [FLASHING](docs/FLASHING.md) · [USAGE](docs/USAGE.md) ·
-[HARDWARE](docs/HARDWARE.md) · [ARCHITECTURE](docs/ARCHITECTURE.md) ·
-[PERFORMANCE](docs/PERFORMANCE.md).
+Card temperatures and an estimated card power draw show up in plain `sensors` as
+`cavium_card` once `octnic` is loaded — see [USAGE](docs/USAGE.md#card-temperature-and-power).
+
+Full details: **[docs/](docs/README.md)** — [FLASHING](docs/FLASHING.md) ·
+[USAGE](docs/USAGE.md) · [HARDWARE](docs/HARDWARE.md) ·
+[ARCHITECTURE](docs/ARCHITECTURE.md) · [PERFORMANCE](docs/PERFORMANCE.md).
 
 ---
 
 ## Repository layout
 
 ```
-cardmod/     octshm_card.c, octcarrier.c   — card-side kernel modules (cross-built)
-hostmod/     octnic.c                        — host-side kernel module (native build)
-install.sh                                   — one-shot host installer (module + configs + service)
-octboot                                      — host bootloader (no serial)
-cavium-up.sh, twocard-up.sh, cexec.sh        — bring-up orchestration (+ serial fallback)
-card-temp.sh                                 — card temperature feed
-card-prep-hostboot.sh                        — first-time serial u-boot provisioning (once)
-boot-clean.sh, set-hostboot.sh, restore-*.sh — serial fallbacks / legacy / revert
-openwrt/     snic10e.config, build-openwrt.sh, files/  — OpenWrt image build + overlay
-system/      cavium-nic.service, blacklist-liquidio.conf, 99-octnic-unmanaged.conf
-docs/        HARDWARE, FLASHING, USAGE, ARCHITECTURE, PERFORMANCE, DMA-DESIGN
+install.sh          one-shot host installer (module via DKMS + configs + service)
+octboot             host bootloader: boots the card over PCIe, no serial
+hostmod/            octnic.c — host kernel module (native build, DKMS)
+cardmod/            octshm_card.c, octcarrier.c — card kernel modules (cross-built)
+scripts/            cavium-up.sh, nic-up.sh      — bring-up orchestration
+                    card-prep-hostboot.sh        — first-time serial u-boot provisioning (once)
+                    boot-clean.sh, cexec.sh      — serial fallbacks
+                    restore-bootapp.sh           — revert the card to its stock OEM boot
+openwrt/            snic10e.config, build-openwrt.sh, files/ — card image build + overlay
+system/             cavium-nic.service, blacklist-liquidio.conf, 99-octnic-unmanaged.conf
+docs/               see docs/README.md for the index
 ```
 
 The R&D history (experiments, logs, snapshots, the reverse-engineering reference tree)
@@ -111,9 +114,10 @@ lives outside the repo and is not published.
 ## Requirements
 
 - The Cavium CN6640-SNIC10E card in a PCIe slot, **BIOS "Above 4G decoding" enabled**.
-- A second 10 GbE peer for real traffic (a switch or any other 10 GbE NIC + DAC per port).
-  During development we used an HP NC523 in the same host as a loopback peer — that is a dev
-  convenience only, **not required** and not part of this deliverable.
+- A 10 GbE peer for real traffic (a switch or any other 10 GbE NIC + DAC per port). A second
+  NIC in the same host works too for benchmarking (see
+  [USAGE → test rig](docs/USAGE.md#test-rig-netns)) — that is a dev convenience only, **not
+  required** and not part of this deliverable.
 - Host: modern Linux (developed on 6.14), an OpenWrt build tree for the card image.
 - A USB-serial (FT232) adapter for the **one-time** u-boot provisioning only; normal
   operation is serial-free.
@@ -130,8 +134,8 @@ lives outside the repo and is not published.
 
 ## License
 
-GPL-2.0 for the kernel modules (see SPDX headers). Scripts and docs under the same repo
-license unless noted.
+GPL-2.0 — see [LICENSE](LICENSE). The kernel modules carry SPDX headers; scripts and docs
+are under the same license unless noted.
 
 ## Disclaimer
 

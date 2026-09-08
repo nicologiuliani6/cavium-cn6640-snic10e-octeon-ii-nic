@@ -1,5 +1,6 @@
 #!/bin/sh
-# Revert card u-boot to stock autoboot of boot-app (undo set-hostboot.sh).
+# Revert card u-boot to its stock autoboot of boot-app, i.e. undo card-prep-hostboot.sh
+# and hand the card back in its OEM state.
 DIR="$(cd "$(dirname "$0")" && pwd)"
 DEV=${DEV:-/dev/ttyUSB0}
 LOG=${LOG:-$DIR/.cav-restore.log}

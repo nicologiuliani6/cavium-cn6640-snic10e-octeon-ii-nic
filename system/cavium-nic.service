@@ -4,7 +4,7 @@ Description=Cavium SNIC10E — reload card OS over PCIe + bring up octshm NIC
 # octboot fires before the card's u-boot garbage-boots. The card's u-boot jumps to a stale
 # entry ~26s after its own power-on if no image is pushed in time; starting after
 # multi-user.target loses that race on a slow POST. Belt-and-suspenders with the sleep-120
-# u-boot env (see provision-hostboot.sh) and octboot's push-if-window-live fast path.
+# u-boot env (see scripts/card-prep-hostboot.sh) and octboot's push-if-window-live fast path.
 After=basic.target
 Wants=basic.target
 
@@ -12,7 +12,7 @@ Wants=basic.target
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=360
-ExecStart=@REPO@/cavium-up.sh
+ExecStart=@REPO@/scripts/cavium-up.sh
 
 [Install]
 WantedBy=multi-user.target

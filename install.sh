@@ -23,17 +23,34 @@ done
 [ -d "/lib/modules/$(uname -r)/build" ] || miss="$miss kernel-headers(/lib/modules/$(uname -r)/build)"
 [ -z "$miss" ] || die "missing:$miss  (Debian/Ubuntu: apt install pciutils build-essential linux-headers-\$(uname -r))"
 
-# 2) build + install the host module (native, against the running kernel)
-say "building host module (octnic, octoq)"
-# Makefile uses M=$(PWD), so build from inside hostmod (not `make -C`).
-( cd "$REPO/hostmod" && make clean ) >/dev/null 2>&1 || true
-( cd "$REPO/hostmod" && make ) >/tmp/octnic-build.log 2>&1 || { cat /tmp/octnic-build.log; die "hostmod build failed"; }
-DEST="/lib/modules/$(uname -r)/extra"
-install -d "$DEST"
-install -m644 "$REPO/hostmod/octnic.ko" "$DEST/" || die "install octnic.ko"
-[ -f "$REPO/hostmod/octoq.ko" ] && install -m644 "$REPO/hostmod/octoq.ko" "$DEST/"
-depmod -a
-say "installed octnic.ko -> $DEST  (modprobe octnic)"
+# 2) build + install the host module (native, against the running kernel).
+# With dkms present the module is registered so it rebuilds itself on every kernel
+# upgrade; without it we fall back to a plain build into /lib/modules/<ver>/extra,
+# which has to be re-run by hand after a kernel update. NODKMS=1 forces the fallback.
+VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$REPO/hostmod/dkms.conf")
+if command -v dkms >/dev/null 2>&1 && [ "${NODKMS:-0}" != 1 ]; then
+  say "building host module (octnic $VER, dkms)"
+  dkms remove -m octnic -v "$VER" --all >/dev/null 2>&1 || true
+  rm -rf "/usr/src/octnic-$VER"
+  # drop any octnic.ko left by an earlier non-dkms install, else dkms flags the mismatch
+  rm -f "/lib/modules/$(uname -r)/extra/octnic.ko"
+  install -d "/usr/src/octnic-$VER"
+  install -m644 "$REPO/hostmod/octnic.c" "$REPO/hostmod/Makefile" "$REPO/hostmod/dkms.conf" \
+    "/usr/src/octnic-$VER/" || die "stage dkms source"
+  dkms install -m octnic -v "$VER" >/tmp/octnic-build.log 2>&1 \
+    || { tail -20 /tmp/octnic-build.log; die "dkms build failed"; }
+  say "installed octnic.ko via dkms (rebuilds on kernel upgrade)"
+else
+  say "building host module (octnic, no dkms)"
+  # Makefile uses M=$(PWD), so build from inside hostmod (not `make -C`).
+  ( cd "$REPO/hostmod" && make clean ) >/dev/null 2>&1 || true
+  ( cd "$REPO/hostmod" && make ) >/tmp/octnic-build.log 2>&1 || { cat /tmp/octnic-build.log; die "hostmod build failed"; }
+  DEST="/lib/modules/$(uname -r)/extra"
+  install -d "$DEST"
+  install -m644 "$REPO/hostmod/octnic.ko" "$DEST/" || die "install octnic.ko"
+  depmod -a
+  say "installed octnic.ko -> $DEST  (modprobe octnic; re-run after a kernel upgrade)"
+fi
 
 # 3) system configs: keep stock liquidio off, keep NM from flushing oct* IPs
 say "installing system configs"
@@ -45,7 +62,7 @@ if [ -d /etc/NetworkManager/conf.d ]; then
 fi
 
 # 4) autostart service, with ExecStart pinned to THIS repo location
-say "installing cavium-nic.service (ExecStart -> $REPO/cavium-up.sh)"
+say "installing cavium-nic.service (ExecStart -> $REPO/scripts/cavium-up.sh)"
 sed "s|@REPO@|$REPO|g" "$REPO/system/cavium-nic.service" \
   > /etc/systemd/system/cavium-nic.service || die "write service"
 systemctl daemon-reload

@@ -60,7 +60,7 @@ PEM inbound window and then boots the pushed image**. Provision it **once** over
 console ([HARDWARE → serial](HARDWARE.md#serial-console-one-time-provisioning-only)):
 
 ```bash
-sudo ./card-prep-hostboot.sh      # writes + saveenv the self-programming env, then: sudo ./octboot
+sudo ./scripts/card-prep-hostboot.sh   # writes + saveenv the self-programming env, then: sudo ./octboot
 ```
 
 That is the whole first-time step. The script auto-detects the card, the bridge, and the
@@ -77,17 +77,14 @@ environment:
 never hardcoded.** BAR bases move across reseats and differ between machines (this card went
 `f4000000` → `c4000000` after a reseat); a stale hardcode aims the card's decode where the
 host can't reach it. Because provisioning is per-machine anyway, baking in the real BARs makes
-it correct by construction: on a different machine, just run `card-prep-hostboot.sh` once there.
+it correct by construction: on a different machine, just run `scripts/card-prep-hostboot.sh` once there.
 
 `sleep <N>` defaults to **120 s** (race-free: the host always reaches `octboot` while u-boot is
-still waiting). Tighten with `sudo SLEEP=25 ./card-prep-hostboot.sh` for a faster boot with less
-margin — or after the fact with `provision-hostboot.sh` (which only re-tunes the sleep value).
+still waiting). Tighten with `sudo SLEEP=25 ./scripts/card-prep-hostboot.sh` for a faster boot
+with less margin; re-running the script is also how you change it afterwards.
 
-Related helpers: `restore-bootapp.sh` reverts to the stock boot-app autoboot; `set-hostboot.sh`
-is the (legacy) liquidio host-boot prep, not this env.
-
-> The fully serial-**free** first install (injecting these commands over the u-boot PCI
-> console instead of a cable) is prototyped but shelved — see `_lab/hostmod-dead/octconsole.c`.
+To undo everything on the card, `scripts/restore-bootapp.sh` reverts it to the stock boot-app
+autoboot.
 
 ## 4. Boot it (each time, no serial)
 
@@ -101,8 +98,9 @@ sudo ./octboot
 # [ OK ] Heartbeat detected -- card ready. Load NIC: sudo modprobe octnic ports=2
 ```
 
-If a serial cable *is* attached and `octboot` can't complete, `cavium-up.sh` falls back to
-a serial boot via `cexec.sh` / `boot-clean.sh`.
+If a serial cable *is* attached and `octboot` can't complete, `scripts/cavium-up.sh` falls back
+to a serial boot via `scripts/boot-clean.sh` (`scripts/cexec.sh` is the manual equivalent for
+running single commands on the card over the console).
 
 Then bring up the NICs — see [USAGE](USAGE.md).
 

@@ -2,8 +2,8 @@
 
 ## Hands-off (systemd)
 
-`system/cavium-nic.service` runs `cavium-up.sh` at boot: it boots the card with `octboot`,
-loads `octnic ports=2`, and wires up both ports (`twocard-up.sh`).
+`system/cavium-nic.service` runs `scripts/cavium-up.sh` at boot: it boots the card with
+`octboot`, then `scripts/nic-up.sh` loads `octnic ports=2` and brings both ports up.
 
 The one-shot installer does all of the below (module build+install, the two host configs,
 and the service) in one go:
@@ -61,40 +61,73 @@ The autostart uses `ports=2 dma=1 hrx=1 rxthreads=8 ntxq=8 poll_us=20`.
 ## Test rig (netns)
 
 This is a **development-only** convenience for benchmarking on a single host — the peer NIC
-is not part of the deliverable; any 10 GbE peer (switch or another machine) works and needs
-no namespaces. We happened to use an HP NC523 in the same host. When the peer NIC lives in the
-**same** machine, put each peer port in its own network namespace — otherwise the kernel short-circuits the two
-local IPs in RAM and never touches the card. `twocard-up.sh` does this automatically:
+is not part of the deliverable; any 10 GbE peer (switch or another machine) works and needs no
+namespaces. When the peer NIC lives in the **same** machine, put each peer port in its own
+network namespace — otherwise the kernel short-circuits the two local IPs in RAM and never
+touches the card. Name the peer ports and `scripts/nic-up.sh` wires the rig automatically:
+
+```bash
+sudo PEER0_DEV=enp1s0f1 PEER0_MAC=<mac> \
+     PEER1_DEV=enp1s0f0 PEER1_MAC=<mac> bash scripts/nic-up.sh
+```
 
 ```
-oct0 (default ns) 10.9.9.1   <->  card xaui0 <->DAC<-> NC523 f1  (ns nc,  10.9.9.2)
-oct1 (default ns) 10.9.10.1  <->  card xaui1 <->DAC<-> NC523 f0  (ns nc2, 10.9.10.2)
+oct0 (default ns) 10.9.9.1   <->  card xaui0 <->DAC<-> PEER0_DEV  (ns peer0, 10.9.9.2)
+oct1 (default ns) 10.9.10.1  <->  card xaui1 <->DAC<-> PEER1_DEV  (ns peer1, 10.9.10.2)
 ```
 
 ```bash
 # iperf3, port 0
-sudo ip netns exec nc  iperf3 -s -B 10.9.9.2 &
+sudo ip netns exec peer0 iperf3 -s -B 10.9.9.2 &
 sudo iperf3 -c 10.9.9.2 -B 10.9.9.1 -P8 -t10        # add -R for reverse
 # port 1
-sudo ip netns exec nc2 iperf3 -s -B 10.9.10.2 &
+sudo ip netns exec peer1 iperf3 -s -B 10.9.10.2 &
 sudo iperf3 -c 10.9.10.2 -B 10.9.10.1 -P8 -t10
 ```
 
 With a real external peer (switch / another machine) you don't need namespaces — just
 assign IPs to `oct0`/`oct1`.
 
-## Card temperature
+## Card temperature and power
 
 The card feeds its board + die temperature to the host over the BAR2 control page;
-`card-temp.sh` and the baked `rc.local` daemon expose it. Read it host-side via the
-`octnic` hwmon (`sensors` shows `cavium_card`).
+the baked `rc.local` daemon feeds it, and `octnic` exposes it as hwmon, so plain `sensors`
+shows it (no serial cable involved).
+
+```
+cavium_card-pci-0200
+board:            +36.4 C
+octeon-die:       +44.9 C
+card (estimate):   19.50 W
+```
+
+**`power1` is a model, not a measurement.** The card has no power sensor: it is PCIe
+bus-powered and its two i2c buses carry only the tmp421, the SFP/TLV EEPROMs and a
+pca9554 (see `snic10e.dts`) — there is no shunt or PMBus monitor to read. `octnic`
+therefore estimates the draw as `baseline + per-Gbit/s of traffic` from the `oct0`/`oct1`
+counters, and labels the channel `card (estimate)` so it can't be mistaken for a reading.
+Calibrate the two coefficients against a wall meter (writable at runtime, mW):
+
+```bash
+echo 18000 | sudo tee /sys/module/octnic/parameters/p_base_mw   # card as installed, idle
+echo   700 | sudo tee /sys/module/octnic/parameters/p_gbps_mw   # extra per Gbit/s TX+RX
+```
+
+Method: read the wall meter with the host idle, card removed vs. installed (modules
+plugged as you run them) → `p_base_mw`; then run `iperf3` at a known rate and divide the
+increase by the Gbit/s → `p_gbps_mw`.
+
+There is deliberately **no per-port term**: the host `oct0`/`oct1` netdevs are always
+admin-up, and the card does not publish its real `xaui0`/`xaui1` carrier over the ctrl
+page, so a per-link term would bill ports that have no cable. Module and PHY power is part
+of `p_base_mw`.
 
 ## Troubleshooting
 
 - **`octnic: bad magic 0xffffffff`** — the card isn't up yet (still booting) or BAR2 isn't
   enabled. Wait for `octboot`'s heartbeat, or re-run it.
 - **`oct1` has no IPv4 after autostart** — NetworkManager grabbed it; install
-  `99-octnic-unmanaged.conf` (above). `twocard-up.sh` also sets `nmcli device set oct1
+  `99-octnic-unmanaged.conf` (above). `scripts/nic-up.sh` also sets `nmcli device set oct1
   managed no`.
 - **One port stops receiving (TX still fine) after heavy load** — the RX ring desynced
   under drop pressure. First-line recovery, no card reboot needed: `sudo rmmod octnic &&
@@ -106,7 +139,7 @@ The card feeds its board + die temperature to the host over the BAR2 control pag
   park a suspect card without rebooting: `setpci -s <BDF> COMMAND=0000` then
   `echo 1 > /sys/bus/pci/devices/0000:<BDF>/remove` (bring back with
   `echo 1 > /sys/bus/pci/rescan`). Don't leave `octnic` loaded on an idle/wedged card.
-- **Card won't boot after a wedge** — soft resets don't clear card RAM; a full host reboot
-  power-cycles the card. See `restore-1g.sh` for a known-good fallback config.
+- **Card won't boot after a wedge** — soft resets don't clear card RAM; only a full host
+  reboot power-cycles the card.
 - **Fresh boot before each benchmark** — a card that has been hammered gives degraded/zero
   throughput until re-booted with `octboot`.

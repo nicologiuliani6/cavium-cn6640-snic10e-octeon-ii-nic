@@ -74,10 +74,9 @@ card xaui1  <--DAC-->  peer port B   (=> host oct1)
 ```
 
 The peer can be any 10 GbE device — a switch or another machine — and is **not part of this
-deliverable**. During development we used an **HP NC523 (dual SFP+)** in the same host, with each
-port placed in its own network namespace so traffic actually crosses the wire (see
-[USAGE → test rig](USAGE.md#test-rig-netns)); that same-host loopback is a dev convenience only.
-In real use the peer is a switch or another machine and no namespaces are needed.
+deliverable**. A second NIC in the *same* host also works for benchmarking, as long as each peer
+port is placed in its own network namespace so traffic actually crosses the wire (see
+[USAGE → test rig](USAGE.md#test-rig-netns)). With an external peer no namespaces are needed.
 
 ## XAUI `ipd_port` mapping
 

@@ -13,12 +13,13 @@
 # any of CARD/BRIDGE/BAR0/BAR2/DEV/IMG via env if detection is wrong.
 set -u
 DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+REPO="$(dirname "$DIR")"
 DEV=${DEV:-/dev/ttyUSB0}
 if [ -z "${IMG:-}" ]; then
   for c in \
-    "$DIR"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
+    "$REPO"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
     "$HOME"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
-    "$DIR"/*snic10e-initramfs-kernel.bin ; do
+    "$REPO"/*snic10e-initramfs-kernel.bin ; do
     [ -f "$c" ] && IMG="$c" && break
   done
 fi
