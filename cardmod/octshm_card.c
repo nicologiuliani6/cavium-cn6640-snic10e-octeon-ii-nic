@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* octshm_card M3: shared-memory NIC, card side, bridged to a real SFP+ port.
+/* octshm_card: shared-memory NIC, card side, bridged to a real SFP+ port.
  * Allocates a 4MB window in card DRAM, maps it into the PCIe host via the PEM
  * BAR1 window (ES=1 => byte-identical to the LE host; metadata is little-endian).
  * A kthread drains the host->card TX ring and transmits each frame out the
@@ -1294,7 +1294,7 @@ static int __init octshm_init(void)
 		proc_temp = proc_create("temp", 0222, proc_dir, &temp_pops);
 		proc_env  = proc_create("env", 0222, proc_dir, &env_pops);
 	}
-	pr_info("octshm M3: phys=0x%llx ring=%d ports=%d uplink=%s up\n",
+	pr_info("octshm: phys=0x%llx ring=%d ports=%d uplink=%s up\n",
 		(unsigned long long)pv[0].phys, RING_SZ, ports, uplink);
 	return 0;
 }

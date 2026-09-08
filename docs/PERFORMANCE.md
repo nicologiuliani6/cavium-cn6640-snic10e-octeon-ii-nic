@@ -110,10 +110,15 @@ goodput dies under that loss. Even with both directions app-paced, TCP holds at 
 
 ```bash
 sudo systemctl restart cavium-nic     # fresh boot + both ports up
+# with a same-host peer, name its ports so nic-up.sh builds the netns rig
+sudo PEER0_DEV=<dev> PEER0_MAC=<mac> PEER1_DEV=<dev> PEER1_MAC=<mac> bash scripts/nic-up.sh
 # port 0
-sudo ip netns exec nc  iperf3 -s -B 10.9.9.2 &
+sudo ip netns exec peer0 iperf3 -s -B 10.9.9.2 &
 sudo iperf3 -c 10.9.9.2 -B 10.9.9.1 -P8 -t10        # -R for reverse
 # port 1
-sudo ip netns exec nc2 iperf3 -s -B 10.9.10.2 &
+sudo ip netns exec peer1 iperf3 -s -B 10.9.10.2 &
 sudo iperf3 -c 10.9.10.2 -B 10.9.10.1 -P8 -t10
 ```
+
+With an external peer (switch or another machine) drop the `nic-up.sh` line and the
+`netns exec` prefixes — run `iperf3 -s` on the peer itself.

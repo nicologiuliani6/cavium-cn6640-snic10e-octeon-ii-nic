@@ -40,7 +40,22 @@ port, plus this repo's overlay (`openwrt/files/`) which bakes in the card module
 
 - `openwrt/snic10e.config` — kernel/config fragment for the target.
 - `openwrt/files/` — root overlay: `/etc/rc.local` (loads `octcarrier` + `octshm_card`,
-  spreads RX IRQs, starts the temp feed) and `/root/*.ko` (the baked card modules).
+  spreads RX IRQs, starts the temp feed) and `/root/*.ko` (the baked card modules — build
+  them with step 1 and drop them in; the binaries themselves are not tracked).
+
+  The arguments `rc.local` passes are the tuned configuration behind the numbers in
+  [PERFORMANCE](PERFORMANCE.md):
+
+  | module | argument | why |
+  |---|---|---|
+  | `octcarrier` | `dev=xaui0,xaui1 ipd_port=0,16` | un-gate both XAUI TX paths |
+  | `octshm_card` | `ports=2 uplink=xaui0,xaui1` | one shared-memory ring pair per SFP+ port |
+  | | `dma=2 hrx=1 dpiwait=0` | DPI RX into host RAM, async doorbell |
+  | | `zc=1 nworkers=2 bindcpu=1` | zero-copy PKO TX gather on two pinned workers |
+  | | `lockfree=1 rxdrop=1` | phase-bit rings, drop after the host tap |
+
+  Card-side parameters not in that list (`bench`, `blen`, `linrx`, `l2ca`, `wpar`, `ztx`,
+  `rxwork`, `es`) are measurement or tuning knobs; the defaults are what ships.
 - `openwrt/build-openwrt.sh` — reference build invocation.
 
 Result is an **initramfs** image, e.g.
