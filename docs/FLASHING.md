@@ -1,18 +1,31 @@
 # Flashing & booting the card
 
-Nothing is permanently flashed for the NIC role — the card runs OpenWrt **from RAM**. The
-only persistent step is a one-time u-boot environment so the card can be booted from the
-host with no serial cable. After that, every boot is: `octboot` pushes the image over PCIe
-and the card runs it.
+One thing **is** written to the card permanently: the u-boot environment, `saveenv`'d into
+NAND once by `scripts/card-prep-hostboot.sh` (§3), so the card can be booted from the host
+with no serial cable. It replaces the stock boot-app autoboot env;
+`scripts/restore-bootapp.sh` writes the stock one back.
+
+Nothing else is flashed — no bootloader, no firmware, no rootfs. The OS the NIC runs is
+pushed into DRAM on every boot and disappears at power-off: `octboot` pushes the image over
+PCIe and the card runs OpenWrt **from RAM**.
 
 ```
  (once)  serial → persist u-boot env  ─────────────┐
  (each)  octboot → SBR → push image via BAR2 → card runs OpenWrt from RAM → heartbeat
 ```
 
-## 1. Build the modules
+Two ways to get the pieces:
 
-Host module (native, against the running kernel):
+- **Prebuilt** — download the card image from a
+  [release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases)
+  into the repo root and run `sudo ./install.sh` for the host module. Skip to §3.
+- **From source** — build the host module, the card modules and the OpenWrt image yourself:
+  §1 and §2 below. Needed only if you change the card side.
+
+## 1. Build the modules (from source)
+
+Host module — `install.sh` does this for you (with DKMS when available); by hand, against the
+running kernel:
 
 ```bash
 cd hostmod && make            # -> octnic.ko
@@ -32,12 +45,10 @@ make -C $KDIR M=$PWD ARCH=mips CROSS_COMPILE=mips64-openwrt-linux-musl- \
      octshm_card.ko octcarrier.ko
 ```
 
-## 2. The OpenWrt image
+## 2. Build the OpenWrt image (from source)
 
-A prebuilt image is attached to each
-[release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases) —
-drop the `.bin` in the repo root and `octboot` finds it (or point `IMG=` at it anywhere).
-Building it yourself:
+The prebuilt image in the releases is this same build; `octboot` takes whichever it finds
+(repo root, an OpenWrt build tree under `$HOME`, or `IMG=<path>`).
 
 The card image is the **[hurricos/openwrt `snic10e-ethernet`](https://git.laboratoryb.org/hurricos/openwrt/src/branch/snic10e-ethernet)**
 port, plus this repo's overlay (`openwrt/files/`) which bakes in the card modules and an

@@ -30,8 +30,10 @@ On top of that channel this repo builds a real NIC:
 - RX (card→host) is DMA'd by the Octeon **DPI** engine; TX (host→card) is PIO into the
   BAR window. See [ARCHITECTURE](docs/ARCHITECTURE.md).
 
-Nothing is flashed for the NIC role — the card runs entirely from RAM, and the host side is
-out-of-tree modules + scripts, so both ends revert (see [USAGE → uninstall](docs/USAGE.md#uninstall)).
+The card OS is never flashed: it is pushed into DRAM at every boot and gone at power-off. The
+one permanent write is the card's u-boot environment (`saveenv` to NAND, once, so the host can
+boot it without a serial cable) — `scripts/restore-bootapp.sh` puts the stock env back. The
+host side is out-of-tree modules + scripts (see [USAGE → uninstall](docs/USAGE.md#uninstall)).
 
 ---
 
@@ -51,18 +53,21 @@ Run entirely hands-off by the `system/cavium-nic.service` systemd unit.
 
 ## Quick start
 
-Grab the prebuilt card image from the
+The card needs an OS image; the host needs the `octnic` module. Two ways to get the image:
+
+**A — prebuilt (recommended).** Download it from the
 [latest release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest)
-and drop it in the repo root — `octboot` picks it up from there, so no OpenWrt build tree is
-needed (building it yourself: [FLASHING](docs/FLASHING.md)):
+into the repo root; `octboot` looks there first. No OpenWrt tree needed:
 
 ```bash
 curl -LO https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest/download/openwrt-octeon-generic-snic10e-initramfs-kernel.bin
 ```
 
-Then the one-shot install (builds + installs the host module, drops the configs, enables
-autostart). With `dkms` present the module is registered so it rebuilds itself on every
-kernel upgrade:
+**B — from source.** Build the card modules and the OpenWrt image yourself (needed only if you
+change the card side): [FLASHING §1–2](docs/FLASHING.md).
+
+Either way, the host side is one command — it builds and installs `octnic`, drops the configs
+and enables the autostart. With `dkms` present the module re-builds itself on kernel upgrades:
 
 ```bash
 sudo ./install.sh                     # host side; add --start to also boot the card now

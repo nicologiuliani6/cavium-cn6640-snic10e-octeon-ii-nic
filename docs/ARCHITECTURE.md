@@ -87,6 +87,7 @@ u-boot env is described in [FLASHING](FLASHING.md).
 
 - **Inbound-DPI TX** — the card-DMA-reads-host-RAM variant is read-latency-bound and loses to
   PIO fill; TX uses PIO fill + a zero-copy PKO frag gather on the card (`zc=1`).
-- **Flashing** — the NIC role runs from RAM only.
+- **Flashing the card OS** — the NIC image is pushed into DRAM at every boot, never written to
+  the card's flash. The one permanent write is the u-boot env in NAND (see [FLASHING](FLASHING.md)).
 - **Serial-free *first* install** — the one-time u-boot provisioning still needs the serial
   cable (u-boot PCI-console injection was prototyped and dropped).

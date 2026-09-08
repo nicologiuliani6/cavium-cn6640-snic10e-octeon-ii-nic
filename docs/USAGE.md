@@ -117,7 +117,8 @@ would bill ports that have no cable. Module and PHY power is part of `p_base_mw`
 
 ## Uninstall
 
-Nothing is flashed for the NIC role, so removing the host side is the whole rollback:
+The card OS lives in RAM, so removing the host side is the whole rollback (the card's u-boot
+env is the one permanent change — see the end of this section):
 
 ```bash
 sudo systemctl disable --now cavium-nic

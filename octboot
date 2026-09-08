@@ -14,12 +14,13 @@
 # finishes the sleep, flushes and boots the freshly-pushed image.
 set -u
 SELF="$(dirname "$(readlink -f "$0")")"
-# Card image: honour $IMG, else find the built OpenWrt initramfs in a few known spots.
+# Card image: honour $IMG, else search. Repo root first — that is where a user drops the
+# image downloaded from a release, and it must win over a stale OpenWrt build tree.
 if [ -z "${IMG:-}" ]; then
   for c in \
+    "$SELF"/*snic10e-initramfs-kernel.bin \
     "$SELF"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
-    /home/*/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
-    "$SELF"/*snic10e-initramfs-kernel.bin ; do
+    /home/*/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin ; do
     [ -f "$c" ] && IMG="$c" && break
   done
 fi
