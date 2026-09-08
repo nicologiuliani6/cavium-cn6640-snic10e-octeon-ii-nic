@@ -378,10 +378,62 @@ static const struct net_device_ops oct_ops = {
 };
 
 /* hwmon: expose the card's temps (fed by the card into ctrl->resv over BAR2) so
- * host `sensors` shows them as "cavium_card": temp1=board, temp2=Octeon die.
+ * host `sensors` shows them as "cavium_card": temp1=board, temp2=Octeon die, plus
+ * power1 = a modelled card draw (see below -- the board has no power sensor).
  * Read from port0's ctrl page (the card daemon publishes there). */
 static struct device *hwmon_dev;
 static const char * const oct_temp_label[] = { "board", "octeon-die" };
+static const char * const oct_power_label = "card (estimate)";
+
+/* power1: the card has NO power sensor -- it is PCIe bus-powered and its board i2c buses
+ * carry only the tmp421, the SFP/TLV EEPROMs and a pca9554 (see snic10e.dts), so there is
+ * no shunt/PMBus monitor to read. This channel is therefore a MODEL, not a measurement:
+ * a baseline plus a per-Gbps traffic term, derived from the netdev counters. It is
+ * labelled "card (estimate)" in `sensors` so nobody mistakes it for a reading.
+ * Calibrate against a wall meter with the p_*_mw params (writable at runtime).
+ *   ponytail: linear model off counters, no card-side change and no extra BAR2 traffic.
+ *   No per-link term: the host netdevs are always admin-up, and the card's real xaui0/1
+ *   carrier is not published over BAR2 -- counting oct0/oct1 as "links up" charged for
+ *   ports that had no cable. Module/PHY power sits inside p_base_mw; to bill it per port
+ *   the card would first have to feed its carrier state through the ctrl page. */
+static int p_base_mw = 18000;	/* whole-card baseline as installed (SoC + PHY + modules) */
+module_param(p_base_mw, int, 0644);
+static int p_gbps_mw = 700;	/* extra per Gbit/s of aggregate TX+RX traffic */
+module_param(p_gbps_mw, int, 0644);
+
+static u64 pw_bytes;			/* counters at the last rate sample */
+static unsigned long pw_jiffies;	/* 0 = never sampled */
+static long pw_mw;
+
+/* Aggregate TX+RX bytes across ports -> Gbit/s over the interval since the last read,
+ * so the estimate tracks load. Reads closer together than 250 ms reuse the last value
+ * (too short an interval to derive a meaningful rate). */
+static long oct_power_mw(void)
+{
+	unsigned long now = jiffies;
+	u64 bytes = 0;
+	int i;
+
+	for (i = 0; i < ports; i++) {
+		if (!hp[i].ndev)
+			continue;
+		bytes += hp[i].ndev->stats.tx_bytes + hp[i].ndev->stats.rx_bytes;
+	}
+	if (!pw_jiffies) {			/* first read: no interval yet, baseline only */
+		pw_mw = p_base_mw;
+	} else if ((long)(now - pw_jiffies) >= HZ / 4) {
+		u64 dj = (u64)(now - pw_jiffies);
+		u64 rate_mw = div64_u64((bytes - pw_bytes) * 8 * HZ * (u64)p_gbps_mw,
+					dj * 1000000000ULL);
+
+		pw_mw = p_base_mw + (long)rate_mw;
+	} else {
+		return pw_mw;			/* too soon: keep counters for a real interval */
+	}
+	pw_bytes = bytes;
+	pw_jiffies = now;
+	return pw_mw;
+}
 
 static umode_t oct_hwmon_visible(const void *d, enum hwmon_sensor_types type,
 				 u32 attr, int ch)
@@ -391,6 +443,10 @@ static umode_t oct_hwmon_visible(const void *d, enum hwmon_sensor_types type,
 static int oct_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			  u32 attr, int channel, long *val)
 {
+	if (type == hwmon_power && attr == hwmon_power_input) {
+		*val = oct_power_mw() * 1000;			/* hwmon wants microwatts */
+		return 0;
+	}
 	if (type != hwmon_temp || attr != hwmon_temp_input)
 		return -EOPNOTSUPP;
 	*val = (long)(s32)readl(hp[0].w + (channel == 0 ? C_RESV0 : C_RESV1));	/* millidegC */
@@ -399,6 +455,10 @@ static int oct_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 static int oct_hwmon_read_string(struct device *dev, enum hwmon_sensor_types type,
 				 u32 attr, int channel, const char **str)
 {
+	if (type == hwmon_power && attr == hwmon_power_label) {
+		*str = oct_power_label;
+		return 0;
+	}
 	if (type != hwmon_temp || attr != hwmon_temp_label || channel > 1)
 		return -EOPNOTSUPP;
 	*str = oct_temp_label[channel];
@@ -412,6 +472,7 @@ static const struct hwmon_ops oct_hwmon_ops = {
 static const struct hwmon_channel_info *oct_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL,
 				 HWMON_T_INPUT | HWMON_T_LABEL),
+	HWMON_CHANNEL_INFO(power, HWMON_P_INPUT | HWMON_P_LABEL),
 	NULL
 };
 static const struct hwmon_chip_info oct_hwmon_chip = {
