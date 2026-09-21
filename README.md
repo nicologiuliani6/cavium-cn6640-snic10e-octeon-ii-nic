@@ -1,5 +1,19 @@
 # cavium-cn6640-snic10e-octeon-ii-nic
 
+📖 **Full documentation: [nicologiuliani.site/docs/cavium-cn6640-snic10e](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/)** —
+[flashing & booting](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/flashing/) ·
+[usage](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/usage/) ·
+[hardware](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/hardware/) ·
+[performance](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/performance/) ·
+[architecture](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/architecture/) ·
+[DMA design](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/dma-design/)
+
+📝 **How it was built:** [the write-up](https://nicologiuliani.site/blog/cavium-cn6640-bar2-datapath/)
+
+✉️ **Questions, or testing on your own board?** [Open an issue](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/issues)
+or [a discussion](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/discussions), or email
+[nicolo.giuliani6@studio.unibo.it](mailto:nicolo.giuliani6@studio.unibo.it).
+
 Out-of-tree Linux driver stack and boot tooling for the **Cavium CN6640-SNIC10E**
 (Octeon II CN6640, PCI `177d:0092`), exposing the card as **two independent 10 GbE
 host interfaces** (`oct0`, `oct1`) over a reverse-engineered PCIe BAR2 shared-memory
@@ -89,9 +103,13 @@ sudo modprobe octnic ports=2          # oct0 + oct1 appear
 Card temperatures and an estimated card power draw show up in plain `sensors` as
 `cavium_card` once `octnic` is loaded — see [USAGE](docs/USAGE.md#card-temperature-and-power).
 
-Full details: **[docs/](docs/README.md)** — [FLASHING](docs/FLASHING.md) ·
-[USAGE](docs/USAGE.md) · [HARDWARE](docs/HARDWARE.md) ·
-[ARCHITECTURE](docs/ARCHITECTURE.md) · [PERFORMANCE](docs/PERFORMANCE.md).
+Full details: **[nicologiuliani.site/docs/cavium-cn6640-snic10e](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/)** —
+[flashing](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/flashing/) ·
+[usage](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/usage/) ·
+[hardware](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/hardware/) ·
+[architecture](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/architecture/) ·
+[performance](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/performance/).
+The same pages are in [docs/](docs/README.md) as markdown.
 
 ---
 
@@ -139,6 +157,13 @@ docs/               see docs/README.md for the index
   This project runs that image on the card and builds the host datapath on top of it.
 - Cavium/Marvell Octeon SDK (`cvmx_*` helpers) and the in-tree `liquidio` driver, used as
   reverse-engineering references for the SLI/DPI/PEM register layout.
+
+## Contact
+
+Issues and discussions on this repo are the best place for anything technical — bug reports,
+or results from running this on your own board. Otherwise:
+[nicolo.giuliani6@studio.unibo.it](mailto:nicolo.giuliani6@studio.unibo.it) ·
+[nicologiuliani.site](https://nicologiuliani.site/).
 
 ## License
 

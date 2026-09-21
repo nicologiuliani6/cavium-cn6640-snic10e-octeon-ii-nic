@@ -1,5 +1,8 @@
 # Documentation index
 
+> These pages are also published, rendered, at
+> **[nicologiuliani.site/docs/cavium-cn6640-snic10e](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/)**.
+
 Start at the [project README](../README.md) for what this is and a quick start. These pages
 are grouped by what you are trying to do.
 
