@@ -1,12 +1,6 @@
 # cavium-cn6640-snic10e-octeon-ii-nic
 
-📖 **Full documentation: [nicologiuliani.site/docs/cavium-cn6640-snic10e](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/)** —
-[flashing & booting](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/flashing/) ·
-[usage](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/usage/) ·
-[hardware](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/hardware/) ·
-[performance](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/performance/) ·
-[architecture](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/architecture/) ·
-[DMA design](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/dma-design/)
+🔗 **Project page:** [nicologiuliani.site/docs/cavium-cn6640-snic10e](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/) — what it is, quick start, FAQ.
 
 📝 **How it was built:** [the write-up](https://nicologiuliani.site/blog/cavium-cn6640-bar2-datapath/)
 
@@ -103,13 +97,9 @@ sudo modprobe octnic ports=2          # oct0 + oct1 appear
 Card temperatures and an estimated card power draw show up in plain `sensors` as
 `cavium_card` once `octnic` is loaded — see [USAGE](docs/USAGE.md#card-temperature-and-power).
 
-Full details: **[nicologiuliani.site/docs/cavium-cn6640-snic10e](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/)** —
-[flashing](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/flashing/) ·
-[usage](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/usage/) ·
-[hardware](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/hardware/) ·
-[architecture](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/architecture/) ·
-[performance](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/performance/).
-The same pages are in [docs/](docs/README.md) as markdown.
+Full details: **[docs/](docs/README.md)** — [FLASHING](docs/FLASHING.md) ·
+[USAGE](docs/USAGE.md) · [HARDWARE](docs/HARDWARE.md) ·
+[ARCHITECTURE](docs/ARCHITECTURE.md) · [PERFORMANCE](docs/PERFORMANCE.md).
 
 ---
 
