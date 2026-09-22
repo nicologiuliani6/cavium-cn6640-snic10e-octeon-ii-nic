@@ -1,5 +1,13 @@
 # cavium-cn6640-snic10e-octeon-ii-nic
 
+🔗 **Project page:** [nicologiuliani.site/docs/cavium-cn6640-snic10e](https://nicologiuliani.site/docs/cavium-cn6640-snic10e/) — what it is, quick start, FAQ.
+
+📝 **How it was built:** [the write-up](https://nicologiuliani.site/blog/cavium-cn6640-bar2-datapath/)
+
+✉️ **Questions, or testing on your own board?** [Open an issue](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/issues)
+or [a discussion](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/discussions), or email
+[nicolo.giuliani6@studio.unibo.it](mailto:nicolo.giuliani6@studio.unibo.it).
+
 Out-of-tree Linux driver stack and boot tooling for the **Cavium CN6640-SNIC10E**
 (Octeon II CN6640, PCI `177d:0092`), exposing the card as **two independent 10 GbE
 host interfaces** (`oct0`, `oct1`) over a reverse-engineered PCIe BAR2 shared-memory
@@ -177,6 +185,13 @@ page.
   This project runs that image on the card and builds the host datapath on top of it.
 - Cavium/Marvell Octeon SDK (`cvmx_*` helpers) and the in-tree `liquidio` driver, used as
   reverse-engineering references for the SLI/DPI/PEM register layout.
+
+## Contact
+
+Issues and discussions on this repo are the best place for anything technical — bug reports,
+or results from running this on your own board. Otherwise:
+[nicolo.giuliani6@studio.unibo.it](mailto:nicolo.giuliani6@studio.unibo.it) ·
+[nicologiuliani.site](https://nicologiuliani.site/).
 
 ## License
 
