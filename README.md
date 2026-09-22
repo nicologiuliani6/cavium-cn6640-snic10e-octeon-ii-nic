@@ -130,6 +130,44 @@ docs/               see docs/README.md for the index
 
 ---
 
+## Who did what
+
+**Human (owner):** owns the card and the host it sits in; all physical work (seating the
+card in a PCIe slot, wiring the FT232 serial adapter for the one-time u-boot provisioning,
+power-cycling the card); chose the goals (drop vendor LiquidIO firmware, no NDA blobs, both
+ports at line-rate 10G, serial-free boot); authorised every register write and load test the
+AI ran on the card; called the runtime tests that ruled out dead-end theories (L2C
+way-partitioning, MPS tuning) instead of accepting the first plausible explanation. Host
+reboots are off-limits by owner directive — a wedged card is documented and left for a
+non-destructive recovery, never "just reboot the host."
+
+**AI (Claude):** everything else: reverse-engineering the PEM/BAR/DPI/SLI register layout
+from BAR0 reads (no vendor SDK, no NDA firmware), the `octnic`/`octshm_card`/`octcarrier`
+kernel modules, `octboot`, the bring-up and recovery scripts, the throughput tuning (zero-copy
+TX, multi-core RX via POW-group IRQ spreading, the BAR2 profiling counters), and the
+documentation. Ran on the one reference card under the owner's standing permission.
+
+## Code provenance
+
+| | Status |
+|---|---|
+| Unmodified upstream: OpenWrt (`stintel/openwrt` `snic10e-5.10`, board/XAUI bring-up), Linux mainline | widely used and tested by others |
+| Cavium/Marvell Octeon SDK (`cvmx_*`) and the in-tree `liquidio` driver | reverse-engineering *reference* only — no code copied, no NDA firmware run |
+| Written by the AI, run on the one reference card (this is the "working" status above): `hostmod/octnic.c`, `cardmod/octshm_card.c`, `cardmod/octcarrier.c`, `octboot`, `install.sh`, `scripts/*.sh`, `system/cavium-nic.service` | hardware-validated on this card, never in the field |
+| Written by the AI, hardware-validated but fragile: dual-port (`oct0`+`oct1` simultaneous) path | both ports work bidirectionally, but the card wedges under sustained dual-port load — fresh boot per test run |
+| `openwrt/build-openwrt.sh` (from-scratch image build) | compiles; not the path the shipped release image was verified against (that was a direct build, not this pipeline re-run) |
+
+Expect bugs. This stack power-cycles and reprograms an OEM card over PCIe on every boot —
+don't run it on hardware you can't afford to leave wedged until you can safely recover it.
+
+## AI usage
+
+Model: Claude, through Claude Code, across a multi-day, multi-session reverse-engineering and
+driver-development effort plus several helper agents. Token count and cost were not tracked
+precisely: the sessions processed on the order of tens of millions of tokens, mostly cached
+context re-reads (an estimate, not a measurement). Exact figures: the owner's Claude usage
+page.
+
 ## Credits
 
 - **OpenWrt SNIC10E support** — the released card image is built from
