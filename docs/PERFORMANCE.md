@@ -60,6 +60,26 @@ split — it nearly doubled).
 > (mpstat ~36 % idle during the blast). Beating it would need ≥ 256 B TLPs, i.e. card-pulled DMA
 > (the `ztx` inbound-DPI path), which is read-latency-bound at ~6.6 Gb/s.
 
+## Independent second host
+
+Same card, same shipped config, re-measured from a **different machine and peer**: a Dell R720 (2× Xeon E5 v2, kernel 7.0) with an HP NC523 (`qlcnic`, PCIe Gen2 ×8) as the 10 GbE peer, one DAC per port. `iperf3`, MTU 9000, fresh card boot. The card's own host was a separate desktop, so the numbers are not tied to one PC's PCIe topology.
+
+| test | `oct0` | `oct1` | total |
+|---|---|---|---|
+| one port alone, FWD | 9.90 (`-P4`) | 8.77 (`-P8`) | – |
+| one port alone, REV | – | 8.70 (`-P8`) | – |
+| **2-port TX** (both FWD, `-P4` each) | 4.96 | 4.69 | **9.64 Gb/s** |
+| **2-port RX** (both REV, `-P4` each) | 5.60 | 4.33 | **9.93 Gb/s** |
+
+This agrees with the first peer (10.6 / 10.2 Gb/s): the ~10 Gb/s per-direction aggregate is a property of the card's Gen2 ×4 link and datapath, not of the peer or the host. Each port alone reaches line rate, so two ports do not add up.
+
+Notes from this rig:
+
+- **Cabling can cross the ports.** Here NC523 `f0` reached `oct1` and `f1` reached `oct0`; check which peer MAC answers ARP on which `octN` before assigning addresses.
+- **Moving a DAC while the card runs can leave its TX stuck** (link up on the peer, no frames received). `sudo systemctl restart cavium-nic` (a card reload over BAR2, no host reboot) restored both ports.
+- **Host-originated broadcast (ARP requests) did not leave the card after a reload**, while unicast and ARP replies did. Static neighbour entries (`ip neigh replace … nud permanent`) work around it; the cause is not yet understood.
+- **The NC523 peer runs hot** (up to 106 °C, the driver warns above 102 °C). It reports its temperature through `hwmon` (`qlcnic`); give it directed airflow, or throughput measurements taken while it throttles will be low.
+
 ## Full-duplex (TX and RX at once) — the open front
 
 Any substantial *real* TX traffic collapses RX — even across ports (`oct0` TX + `oct1` RX:
