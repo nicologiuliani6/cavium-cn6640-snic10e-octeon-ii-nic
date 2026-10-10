@@ -92,6 +92,12 @@ sudo modprobe octnic ports=2          # oct0 + oct1 appear
 Card temperatures and an estimated card power draw show up in plain `sensors` as
 `cavium_card` once `octnic` is loaded — see [USAGE](docs/USAGE.md#card-temperature-and-power).
 
+`octnic` also watches the card every 2 s. If the card resets/hangs (e.g. it overheated
+because its fan is unplugged) or crosses `temp_crit_mc` (default 100 °C), it logs a
+`KERN_EMERG` alert — broadcast to every terminal by journald/rsyslog on any distro —
+and drops carrier on oct0/oct1. Warning level: `temp_warn_mc` (85 °C). Both are module
+params, writable under `/sys/module/octnic/parameters/`.
+
 ## Not working or untested
 
 - **Dual-port simultaneous load**: both ports work bidirectionally, but the card wedges

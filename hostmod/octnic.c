@@ -20,6 +20,7 @@
 #include <linux/pci.h>
 #include <linux/dma-mapping.h>
 #include <linux/hwmon.h>
+#include <linux/workqueue.h>
 
 #define OCTSHM_MAGIC 0x4f435348
 #define RING_SZ      128
@@ -47,6 +48,7 @@
 #define C_RX_DMA_BASE 0x30
 #define C_RESV0      0x38	/* card board temp, millidegC (fed by card /proc/octshm/temp) */
 #define C_RESV1      0x3c	/* card Octeon die temp, millidegC */
+#define C_HEARTBEAT  0x20	/* card worker0 loop counter, ticks continuously while alive */
 
 static unsigned long base;		/* 0 = auto-discover card BAR2 (177d:0092). override to force */
 module_param(base, ulong, 0444);
@@ -435,6 +437,102 @@ static long oct_power_mw(void)
 	return pw_mw;
 }
 
+/* Card health watchdog. Field failure (2026-10-10, card fan unplugged): the card
+ * chip-reset itself mid-run -- its PCIe config came back with COMMAND=0 and BARs
+ * zeroed, every BAR2 read returned 0xffffffff, yet oct0/oct1 stayed "up" and
+ * `sensors` showed -0.0C. Nothing told the user. Every 2 s check: config MEM bit,
+ * magic, heartbeat advancing, temps vs thresholds. Alerts use KERN_EMERG on purpose:
+ * journald (ForwardToWall, default) and rsyslog/syslog-ng (*.emerg) broadcast those
+ * to every logged-in terminal on any distro, no userspace helper needed. Carrier
+ * goes down so NetworkManager/ip/monitoring see the link as dead too.
+ *   ponytail: thresholds are tmp421/Octeon guesses with margin -- calibration knobs. */
+static int temp_warn_mc = 85000;	/* warn above this (millidegC), board or die */
+module_param(temp_warn_mc, int, 0644);
+static int temp_crit_mc = 100000;	/* EMERG above this: power down and fix cooling */
+module_param(temp_crit_mc, int, 0644);
+static int hb_timeout_s = 10;		/* heartbeat frozen this long = card hung */
+module_param(hb_timeout_s, int, 0644);
+
+static struct delayed_work wd_work;
+static bool card_lost;
+static u32 wd_beat;
+static unsigned long wd_beat_jiffies;
+static int wd_temp_lvl;			/* 0 ok, 1 warn, 2 crit: alert on rise only */
+
+static long oct_temp(int ch)
+{
+	return (long)(s32)readl(hp[0].w + (ch == 0 ? C_RESV0 : C_RESV1));
+}
+
+static void oct_set_carrier(bool on)
+{
+	int i;
+
+	for (i = 0; i < ports; i++) {
+		if (!hp[i].ndev)
+			continue;
+		if (on)
+			netif_carrier_on(hp[i].ndev);
+		else
+			netif_carrier_off(hp[i].ndev);
+	}
+}
+
+static void wd_fn(struct work_struct *w)
+{
+	const char *why = NULL;
+	u16 cmd = PCI_COMMAND_MEMORY;
+	u32 beat;
+	long t, tmax = 0;
+	int ch, lvl;
+
+	if (pdev)
+		pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	if (!(cmd & PCI_COMMAND_MEMORY) || cmd == 0xffff)
+		why = "PCIe config reset (card rebooted/crashed -- overheat? power?)";
+	else if (readl(hp[0].w + C_MAGIC) != OCTSHM_MAGIC)
+		why = "BAR2 magic gone (card OS died)";
+	else {
+		beat = readl(hp[0].w + C_HEARTBEAT);
+		if (beat != wd_beat) {
+			wd_beat = beat;
+			wd_beat_jiffies = jiffies;
+		} else if (time_after(jiffies, wd_beat_jiffies + hb_timeout_s * HZ)) {
+			why = "heartbeat frozen (card hung)";
+		}
+	}
+
+	if (why && !card_lost) {
+		card_lost = true;
+		oct_set_carrier(false);
+		pr_emerg("octnic: CAVIUM CARD LOST: %s. oct0/oct1 down. Check card fan/cooling, then rerun scripts/cavium-up.sh (a wedged card may need a power-cycle).\n",
+			 why);
+	} else if (!why && card_lost) {
+		card_lost = false;
+		oct_set_carrier(true);
+		pr_info("octnic: card back (heartbeat alive), carrier on\n");
+	}
+
+	if (!card_lost) {
+		for (ch = 0; ch < 2; ch++) {
+			t = oct_temp(ch);
+			if (t > tmax)
+				tmax = t;
+		}
+		lvl = tmax >= temp_crit_mc ? 2 : tmax >= temp_warn_mc ? 1 : 0;
+		if (lvl == 2 && wd_temp_lvl < 2)
+			pr_emerg("octnic: CAVIUM CARD OVERHEATING: %ld.%01ld C (crit %d C). Stop traffic and check the card fan NOW.\n",
+				 tmax / 1000, (tmax % 1000) / 100, temp_crit_mc / 1000);
+		else if (lvl == 1 && wd_temp_lvl < 1)
+			pr_warn("octnic: card hot: %ld.%01ld C (warn %d C) -- check card fan\n",
+				tmax / 1000, (tmax % 1000) / 100, temp_warn_mc / 1000);
+		else if (lvl == 0 && wd_temp_lvl > 0)
+			pr_info("octnic: card temp back to normal (%ld C)\n", tmax / 1000);
+		wd_temp_lvl = lvl;
+	}
+	schedule_delayed_work(&wd_work, 2 * HZ);
+}
+
 static umode_t oct_hwmon_visible(const void *d, enum hwmon_sensor_types type,
 				 u32 attr, int ch)
 {
@@ -447,9 +545,21 @@ static int oct_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 		*val = oct_power_mw() * 1000;			/* hwmon wants microwatts */
 		return 0;
 	}
-	if (type != hwmon_temp || attr != hwmon_temp_input)
+	if (type != hwmon_temp)
 		return -EOPNOTSUPP;
-	*val = (long)(s32)readl(hp[0].w + (channel == 0 ? C_RESV0 : C_RESV1));	/* millidegC */
+	if (attr == hwmon_temp_crit) {
+		*val = temp_crit_mc;
+		return 0;
+	}
+	if (card_lost)				/* BAR2 reads all-ones: no fake -0.001C */
+		return -ENODATA;
+	if (attr == hwmon_temp_crit_alarm) {
+		*val = oct_temp(channel) >= temp_crit_mc;
+		return 0;
+	}
+	if (attr != hwmon_temp_input)
+		return -EOPNOTSUPP;
+	*val = oct_temp(channel);		/* millidegC */
 	return 0;
 }
 static int oct_hwmon_read_string(struct device *dev, enum hwmon_sensor_types type,
@@ -470,8 +580,9 @@ static const struct hwmon_ops oct_hwmon_ops = {
 	.read_string = oct_hwmon_read_string,
 };
 static const struct hwmon_channel_info *oct_hwmon_info[] = {
-	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL,
-				 HWMON_T_INPUT | HWMON_T_LABEL),
+	HWMON_CHANNEL_INFO(temp,
+			   HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_CRIT | HWMON_T_CRIT_ALARM,
+			   HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_CRIT | HWMON_T_CRIT_ALARM),
 	HWMON_CHANNEL_INFO(power, HWMON_P_INPUT | HWMON_P_LABEL),
 	NULL
 };
@@ -574,6 +685,10 @@ static int __init octnic_init(void)
 		else
 			hwmon_dev = NULL;
 	}
+	wd_beat = readl(hp[0].w + C_HEARTBEAT);
+	wd_beat_jiffies = jiffies;
+	INIT_DELAYED_WORK(&wd_work, wd_fn);
+	schedule_delayed_work(&wd_work, 2 * HZ);
 	return 0;
 
 err:
@@ -596,6 +711,7 @@ static void __exit octnic_exit(void)
 {
 	int i;
 
+	cancel_delayed_work_sync(&wd_work);
 	if (hwmon_dev)
 		hwmon_device_unregister(hwmon_dev);
 	for (i = 0; i < ports; i++) {
