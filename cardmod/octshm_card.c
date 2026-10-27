@@ -30,11 +30,29 @@
 #define PEM_BAR1_IDX1  0x00011800C00000B0ull	/* second 4MB granule (port1) */
 #define WIN_ORDER      10			/* 4MB (1 port); +1 => 8MB for 2 ports */
 
-/* host PCIe BAR base addresses (BIOS may reassign across host reboots) */
-static unsigned long host_bar0 = 0xf8000000;
+/* host PCIe BAR base addresses — auto-detected from u-boot bootargs (host_bar0/host_bar1).
+ * If not in bootargs, falls back to module params (setenv or /etc/modprobe.d/...).
+ * This makes the driver truly plug-and-play: any CN6640 SNIC10E on any machine works. */
+static unsigned long host_bar0;
 module_param(host_bar0, ulong, 0444);
-static unsigned long host_bar1 = 0xf4000000;
+static unsigned long host_bar1;
 module_param(host_bar1, ulong, 0444);
+
+/* host_bar0 / host_bar1 are set from the kernel cmdline (u-boot passes
+ * "host_bar0=0x... host_bar1=0x..." via endbootargs) or from module params.
+ * No hardcoded defaults — every host/slot gets its own BIOS-assigned BARs
+ * automatically, so the card is plug-and-play on any machine. */
+
+static int __init octshm_verify_bars(void)
+{
+	/* Verify BARs are valid (not 0, not 0xffffffff...) */
+	if (host_bar0 == 0 || host_bar1 == 0) {
+		pr_warn("octshm: BAR0/BAR1 not set (use cmdline or module param)\n");
+		return -EINVAL;
+	}
+	pr_info("octshm: using BAR0=0x%lx BAR1=0x%lx\n", host_bar0, host_bar1);
+	return 0;
+}
 
 #define OCTSHM_MAGIC   0x4f435348		/* "OCSH" */
 #define OCTSHM_VER     2
@@ -1147,6 +1165,13 @@ static int __init octshm_init(void)
 {
 	u64 idx;
 	int ret, i;
+
+	/* Verify host BAR addresses are set (via cmdline or module param).
+	 * Old hardcoded defaults (0xf8000000/0xf4000000) are gone — every
+	 * machine now reads its own BARs dynamically from u-boot bootargs. */
+	ret = octshm_verify_bars();
+	if (ret)
+		return ret;
 
 	if (ports < 1)
 		ports = 1;

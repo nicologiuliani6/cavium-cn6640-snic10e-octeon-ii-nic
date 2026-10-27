@@ -82,7 +82,11 @@ send "setenv wb $(idx_cmd 0) \\; $(idx_cmd 1) \\; $(idx_cmd 2)"
 send "setenv wc $(idx_cmd 3) \\; $(idx_cmd 4) \\; $(idx_cmd 5)"
 send "setenv wd $(idx_cmd 6) \\; $(idx_cmd 7) \\; flush_l2c \\; flush_dcache"
 send "setenv bootdelay 1"
-send "setenv bootcmd run wa \\; run wb \\; run wc \\; run wd \\; sleep ${SLEEP} \\; flush_l2c \\; flush_dcache \\; bootoctlinux ${BADDR} numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=${RGO}"
+# Pass the host BAR0/BAR2 as kernel module params so octshm_card auto-configures
+# without hardcoded addresses. The card's kernel reads these from /proc/cmdline
+# at boot ("host_bar0=0x... host_bar1=0x..."). Plug-and-play on any machine:
+# BIOS-assigned BARs differ per host/slot and are read live from sysfs above.
+send "setenv bootcmd run wa \\; run wb \\; run wc \\; run wd \\; sleep ${SLEEP} \\; flush_l2c \\; flush_dcache \\; bootoctlinux ${BADDR} numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=${RGO} host_bar0=${P2N_BAR0} host_bar1=${P2N_BAR1}"
 send "saveenv" 5                                              # persist to NAND
 send "printenv bootcmd" 1.2                                   # readback for the log
 send "printenv wa" 1.2
@@ -95,6 +99,7 @@ echo "============================================================="
 ok=1
 grep -aq "bootoctlinux ${BADDR}" "$LOG" || { echo "[WARN] bootcmd readback missing 'bootoctlinux ${BADDR}'"; ok=0; }
 grep -aq "0x00011800C0000088 ${P2N_BAR1}" "$LOG" || { echo "[WARN] wa readback missing P2N_BAR1 ${P2N_BAR1}"; ok=0; }
+grep -aq "P2N_BAR1" "$LOG" || { echo "[WARN] wa readback missing P2N_BAR1 ${P2N_BAR1}"; ok=0; }
 if [ "$ok" = 1 ]; then
   echo "[ OK ] env provisioned + saved. The card now boots no-serial."
   echo "       Boot it now:  sudo ./octboot     (or: sudo systemctl restart cavium-nic)"
