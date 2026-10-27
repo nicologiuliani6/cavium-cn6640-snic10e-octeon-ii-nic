@@ -154,3 +154,8 @@ Left as-is, the card sits idle until `octboot` pushes an image again.
   reboot power-cycles the card.
 - **Fresh boot before each benchmark** — a card that has been hammered gives degraded/zero
   throughput until re-booted with `octboot`.
+- **`[FAIL] BAR2 never writable`** — the card's u-boot env still has BAR addresses from the
+  original machine. The env is written once by `scripts/card-prep-hostboot.sh` which reads BARs
+  live from sysfs; moving the card to a different slot changes the BIOS-assigned BARs and
+  invalidates the saved env. Fix: re-run `card-prep-hostboot.sh` on the current machine (requires
+  one-time serial connection via FT232) — it detects the new BARs and rewrites the u-boot env.
