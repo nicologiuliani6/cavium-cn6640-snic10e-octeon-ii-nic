@@ -64,6 +64,10 @@ if [ -d /etc/NetworkManager/conf.d ]; then
   install -m644 "$REPO/system/99-octnic-unmanaged.conf" /etc/NetworkManager/conf.d/ 2>/dev/null \
     && systemctl reload NetworkManager 2>/dev/null; true
 fi
+# lm-sensors config so `sensors` shows the card's temps (cavium_card hwmon driver)
+if [ -d /etc/sensors.d ]; then
+  install -m644 "$REPO/system/cavium-card" /etc/sensors.d/ 2>/dev/null; true
+fi
 
 # 4) autostart service, with ExecStart pinned to THIS repo location
 say "installing cavium-nic.service (ExecStart -> $REPO/scripts/cavium-up.sh)"

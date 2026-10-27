@@ -1,0 +1,9 @@
+# lm-sensors configuration for Cavium CN6640 SNIC10E card hwmon driver
+# Installed by: scripts/install.sh (or copy to /etc/sensors.d/)
+# Chip name: "cavium_card" (registered by octnic kernel module)
+# Exposes: temp1=board, temp2=octeon-die, power1=card estimate (modelled)
+
+chip "cavium_card-*"
+    label temp1 "board-temp"
+    label temp2 "octeon-die-temp"
+    label power1 "card-power-estimate"
