@@ -43,7 +43,7 @@ if [ "$booted" != 1 ]; then
   fi
 fi
 [ "$booted" = 1 ] || { echo "FATAL: card did not boot"; exit 2; }
-sleep 8							# let the card's rc.local self-configure
+sleep 1							# heartbeat already means octshm_card is loaded
 
 # 2) host side: load octnic and bring oct0/oct1 up (the card's baked rc.local has already
 #    configured the card end by now).

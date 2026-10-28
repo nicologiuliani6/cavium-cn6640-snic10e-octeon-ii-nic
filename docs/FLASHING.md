@@ -117,9 +117,13 @@ bases move across reseats and differ between machines (this card went `f4000000`
 after a reseat), and the card's decode has to point where the host can reach it — so
 on another machine (or after a reseat that moves the BARs) run `card-prep-hostboot.sh` again.
 
-`sleep <N>` defaults to **120 s**, which leaves the host time to reach `octboot` while u-boot
-is still waiting. `sudo SLEEP=25 ./scripts/card-prep-hostboot.sh` boots faster with less
-margin; re-running the script is also how you change it afterwards.
+Instead of a fixed `sleep`, u-boot waits (`wg`) for a handshake flag at DRAM `0x20000100`:
+`octboot` writes `GO!!` there once the image is pushed and verified, so the card boots the moment
+the image is in. The script probes this on the live prompt and falls back to
+`sleep ${SLEEP:-120}` if the u-boot cannot do it. Re-run the script to change it.
+
+The card kernel module takes the BARs from the `PEM_P2N_BAR0/1` registers u-boot already
+programmed (no module parameter, no cmdline, no constant in the image).
 
 To undo everything on the card, `scripts/restore-bootapp.sh` reverts it to the stock boot-app
 autoboot.

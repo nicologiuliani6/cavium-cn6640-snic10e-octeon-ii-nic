@@ -30,27 +30,26 @@
 #define PEM_BAR1_IDX1  0x00011800C00000B0ull	/* second 4MB granule (port1) */
 #define WIN_ORDER      10			/* 4MB (1 port); +1 => 8MB for 2 ports */
 
-/* host PCIe BAR base addresses — auto-detected from u-boot bootargs (host_bar0/host_bar1).
- * If not in bootargs, falls back to module params (setenv or /etc/modprobe.d/...).
- * This makes the driver truly plug-and-play: any CN6640 SNIC10E on any machine works. */
+/* Host PCIe BAR bases. Optional override; by default (0) the module keeps what the
+ * bootloader already programmed into PEM_P2N_BAR0/1 -- u-boot's env set them to the BARs the
+ * host BIOS assigned, and the host could only push this image because they match. Nothing
+ * is hardcoded: any machine / slot works as long as the u-boot env was provisioned there. */
 static unsigned long host_bar0;
 module_param(host_bar0, ulong, 0444);
 static unsigned long host_bar1;
 module_param(host_bar1, ulong, 0444);
 
-/* host_bar0 / host_bar1 are set from the kernel cmdline (u-boot passes
- * "host_bar0=0x... host_bar1=0x..." via endbootargs) or from module params.
- * No hardcoded defaults — every host/slot gets its own BIOS-assigned BARs
- * automatically, so the card is plug-and-play on any machine. */
-
-static int __init octshm_verify_bars(void)
+static int octshm_verify_bars(void)
 {
-	/* Verify BARs are valid (not 0, not 0xffffffff...) */
-	if (host_bar0 == 0 || host_bar1 == 0) {
-		pr_warn("octshm: BAR0/BAR1 not set (use cmdline or module param)\n");
+	if (!host_bar0)
+		host_bar0 = cvmx_read_csr(CVMX_ADD_IO_SEG(PEM_P2N_BAR0));
+	if (!host_bar1)
+		host_bar1 = cvmx_read_csr(CVMX_ADD_IO_SEG(PEM_P2N_BAR1));
+	if (!host_bar0 || !host_bar1 || host_bar1 == ~0ul) {
+		pr_err("octshm: PEM_P2N_BAR0/1 not programmed (0x%lx/0x%lx)\n", host_bar0, host_bar1);
 		return -EINVAL;
 	}
-	pr_info("octshm: using BAR0=0x%lx BAR1=0x%lx\n", host_bar0, host_bar1);
+	pr_info("octshm: host BAR0=0x%lx BAR1=0x%lx\n", host_bar0, host_bar1);
 	return 0;
 }
 
@@ -1166,9 +1165,6 @@ static int __init octshm_init(void)
 	u64 idx;
 	int ret, i;
 
-	/* Verify host BAR addresses are set (via cmdline or module param).
-	 * Old hardcoded defaults (0xf8000000/0xf4000000) are gone — every
-	 * machine now reads its own BARs dynamically from u-boot bootargs. */
 	ret = octshm_verify_bars();
 	if (ret)
 		return ret;

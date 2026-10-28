@@ -6,12 +6,13 @@
 # persisted u-boot env:
 #   bootdelay=1
 #   wa/wb/wc/wd  = program the PEM BAR1 window (+ flush_l2c/flush_dcache to activate it)
-#   bootcmd      = run wa wb wc wd ; sleep 25 ; flush_l2c ; flush_dcache ; bootoctlinux 0x20010000 ...
+#   wg           = wait (u-boot while/itest) until the host writes "GO!!" at DRAM 0x20000100
+#   bootcmd      = clear flag ; run wa wb wc wd ; run wg ; flush_l2c ; flush_dcache ; bootoctlinux 0x20010000 ...
 #
 # Host-only flow (no console): SBR reboots the card -> u-boot runs bootcmd -> programs its
-# own window -> sleeps 25s. The host restores its BARs, waits for BAR2 to become writable
-# (window live), pushes the OpenWrt image into card DRAM via BAR2 + wordfix, then u-boot
-# finishes the sleep, flushes and boots the freshly-pushed image.
+# own window -> waits for the host flag. The host restores its BARs, waits for BAR2 to become
+# writable (window live), pushes the OpenWrt image into card DRAM via BAR2 + wordfix, sets the
+# flag, then u-boot flushes and boots the freshly-pushed image immediately.
 set -u
 SELF="$(dirname "$(readlink -f "$0")")"
 # Card image: honour $IMG, else search. Repo root first — that is where a user drops the
@@ -64,8 +65,8 @@ elif [ "$STATE" = dead ]; then
   # on its own -- but this second octboot run catches it mid-Linux-boot (window down, magic not
   # up yet) and used to SBR it, wedging it mid-jump (magic 0xffffffff, only a power cycle
   # recovers). So wait for the NIC heartbeat first; SBR only if it never comes.
-  ok "Window not live -- waiting up to 90s for a mid-boot card to surface (avoid SBR-wedge)"
-  for _ in $(seq 1 90); do
+  ok "Window not live -- waiting up to 40s for a mid-boot card to surface (avoid SBR-wedge)"
+  for _ in $(seq 1 40); do
     up=$(CARD=$CARD python3 - <<'PY'
 import mmap,os
 try:
@@ -79,12 +80,12 @@ PY
     [ "$up" = 1 ] && { ok "Card came up on its own (prior push) -- no SBR, no reload"; exit 0; }
     sleep 1
   done
-  ok "Still not up after 90s -- assume wedged, SBR"
+  ok "Still not up after 40s -- assume wedged, SBR"
 fi   # STATE=os falls through with DOSBR=1 (OpenWrt running -> SBR to reload a fresh image)
 if [ "$DOSBR" = 1 ]; then
   setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
   ok "Secondary Bus Reset"
-  sleep 6					# u-boot boot + bootdelay + window program
+  sleep 2					# window wait below polls; no fixed u-boot delay needed
 fi
 
 if [ "$DOSBR" = 1 ]; then
@@ -136,6 +137,11 @@ for it in range(10):
     m.flush()
 else:
     print("[FAIL] DRAM still",len(bad),"bad"); sys.exit(1)
+# handshake: u-boot (wg) waits for this flag before bootoctlinux -> boots the instant the image
+# is in, no fixed sleep. Harmless on an env that still uses `sleep`. 0x100 < OFF, off the image.
+for _ in range(20):
+    m[0x100:0x104]=b"GO!!"; m.flush()
+    if bytes(m[0x100:0x104])==b"GO!!": break
 m.close(); os.close(fd)
 PY
 [ $? -eq 0 ] || { echo "[FAIL] image push aborted"; exit 1; }

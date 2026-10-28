@@ -82,13 +82,40 @@ send "setenv wb $(idx_cmd 0) \\; $(idx_cmd 1) \\; $(idx_cmd 2)"
 send "setenv wc $(idx_cmd 3) \\; $(idx_cmd 4) \\; $(idx_cmd 5)"
 send "setenv wd $(idx_cmd 6) \\; $(idx_cmd 7) \\; flush_l2c \\; flush_dcache"
 send "setenv bootdelay 1"
-# Pass the host BAR0/BAR2 as kernel module params so octshm_card auto-configures
-# without hardcoded addresses. The card's kernel reads these from /proc/cmdline
-# at boot ("host_bar0=0x... host_bar1=0x..."). Plug-and-play on any machine:
-# BIOS-assigned BARs differ per host/slot and are read live from sysfs above.
-send "setenv bootcmd run wa \\; run wb \\; run wc \\; run wd \\; sleep ${SLEEP} \\; flush_l2c \\; flush_dcache \\; bootoctlinux ${BADDR} numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=${RGO} host_bar0=${P2N_BAR0} host_bar1=${P2N_BAR1}"
+# Handshake instead of a blind `sleep`: this u-boot has NO if/while/for (plain `;` parser), but
+# `run A B` aborts B when A "fails", and itest's result is inverted for that purpose, so
+#   `run e s`  = run s ONLY while  flag != GO   ("sleep 1 until the host says GO")
+#   `run n bo` = run bo ONLY once  flag == GO    (boot only with an image the host finished pushing)
+# octboot writes GO!! at DRAM 0x20000100 after the image is pushed + verified -> the card boots the
+# instant the image is in (no fixed 120 s), and never garbage-boots if the host is late (after
+# ~10 min it just stays at the prompt; the next octboot SBRs it).
+FLAG=0x20000100; GO=0x474f2121            # "GO!!" (big-endian word, host writes the bytes)
+send "setenv e itest.l *${FLAG} == ${GO}"
+send "setenv n itest.l *${FLAG} != ${GO}"
+send "setenv s sleep 1"
+send "setenv w1 run e s"
+rep() { local o="" i; for i in $(seq 1 "$2"); do o+="run $1 \; "; done; printf '%s' "${o% \; }"; }
+send "setenv w10 $(rep w1 10)"
+send "setenv w100 $(rep w10 10)"
+send "setenv wg $(rep w100 6)"
+send "setenv bo flush_l2c \; flush_dcache \; bootoctlinux ${BADDR} numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=${RGO}"
+# probe on the live prompt: semantics must hold on this u-boot, else fall back to plain sleep
+send "setenv pa echo PROBE_HIT"
+send "mw.l ${FLAG} ${GO} 1"
+send "run n pa"                           # flag==GO -> n "fails" -> pa must run   (1 hit)
+send "mw.l ${FLAG} 0 1"
+send "run n pa"                           # flag!=GO -> pa must NOT run             (still 1 hit)
+# the console echoes every output line twice, so exactly one hit = 2 lines
+if [ "$(grep -ac '^PROBE_HIT' "$LOG")" = 2 ]; then
+  BOOT="run wg \; run n bo"; echo "[*] handshake wait OK (flag $FLAG)"
+else
+  BOOT="sleep ${SLEEP} \; run bo"; echo "[WARN] handshake probe failed -> fallback to sleep ${SLEEP}"
+fi
+send "setenv bootcmd mw.l ${FLAG} 0 1 \; run wa \; run wb \; run wc \; run wd \; ${BOOT}"
 send "saveenv" 5                                              # persist to NAND
 send "printenv bootcmd" 1.2                                   # readback for the log
+send "printenv bo" 1.2
+send "printenv wg" 1.2
 send "printenv wa" 1.2
 send "printenv bootdelay" 1.2
 kill $LP 2>/dev/null; wait $LP 2>/dev/null
@@ -99,7 +126,6 @@ echo "============================================================="
 ok=1
 grep -aq "bootoctlinux ${BADDR}" "$LOG" || { echo "[WARN] bootcmd readback missing 'bootoctlinux ${BADDR}'"; ok=0; }
 grep -aq "0x00011800C0000088 ${P2N_BAR1}" "$LOG" || { echo "[WARN] wa readback missing P2N_BAR1 ${P2N_BAR1}"; ok=0; }
-grep -aq "P2N_BAR1" "$LOG" || { echo "[WARN] wa readback missing P2N_BAR1 ${P2N_BAR1}"; ok=0; }
 if [ "$ok" = 1 ]; then
   echo "[ OK ] env provisioned + saved. The card now boots no-serial."
   echo "       Boot it now:  sudo ./octboot     (or: sudo systemctl restart cavium-nic)"
