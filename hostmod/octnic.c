@@ -13,6 +13,7 @@
 #include <linux/io.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
 #include <linux/timer.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
@@ -371,6 +372,32 @@ static int oct_stop(struct net_device *dev)
 	return 0;
 }
 
+/* ethtool: so `ethtool oct0` / `ethtool -i oct0` and GUI tools report a normal 10G NIC */
+static void oct_get_drvinfo(struct net_device *d, struct ethtool_drvinfo *i)
+{
+	strscpy(i->driver, "octnic", sizeof(i->driver));
+	strscpy(i->version, "1.1", sizeof(i->version));
+	strscpy(i->fw_version, "OpenWrt (card)", sizeof(i->fw_version));
+	strscpy(i->bus_info, "Cavium CN6640 SNIC10E", sizeof(i->bus_info));
+}
+
+static int oct_get_ksettings(struct net_device *d, struct ethtool_link_ksettings *k)
+{
+	ethtool_link_ksettings_zero_link_mode(k, supported);
+	ethtool_link_ksettings_zero_link_mode(k, advertising);
+	k->base.port = PORT_DA;
+	k->base.speed = netif_carrier_ok(d) ? SPEED_10000 : SPEED_UNKNOWN;
+	k->base.duplex = netif_carrier_ok(d) ? DUPLEX_FULL : DUPLEX_UNKNOWN;
+	k->base.autoneg = AUTONEG_DISABLE;
+	return 0;
+}
+
+static const struct ethtool_ops oct_ethtool_ops = {
+	.get_drvinfo        = oct_get_drvinfo,
+	.get_link           = ethtool_op_get_link,
+	.get_link_ksettings = oct_get_ksettings,
+};
+
 static const struct net_device_ops oct_ops = {
 	.ndo_open       = oct_open,
 	.ndo_stop       = oct_stop,
@@ -661,6 +688,7 @@ static int __init octnic_init(void)
 		netif_set_real_num_tx_queues(p->ndev, ntxq);	/* N txqs -> N cores xmit in parallel */
 		snprintf(p->ndev->name, IFNAMSIZ, "oct%d", i);
 		p->ndev->netdev_ops = &oct_ops;
+		p->ndev->ethtool_ops = &oct_ethtool_ops;
 		eth_hw_addr_random(p->ndev);
 		p->ndev->mtu = 1500;
 		p->ndev->max_mtu = 9000;		/* allow jumbo (BUF_SZ=9216) */
