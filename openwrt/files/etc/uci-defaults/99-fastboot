@@ -2,4 +2,11 @@
 # Card is a NIC, not a router: skip services that only add boot time. Runs in S10boot, before
 # the S19+ scripts, so their rc.d links are gone before they would start.
 for s in firewall dnsmasq odhcpd sysntpd cron; do /etc/init.d/$s disable 2>/dev/null; done
+# The card is a NIC, not a host on the LAN: no IP of its own (no DHCP client, no br-lan), no SSH.
+# Management stays on the serial console and the BAR2 status channel. root has no password and the
+# firewall is off for the datapath, so an address here would be an open root shell on the LAN.
+for i in lan wan wan6; do uci -q delete network.$i; done
+while uci -q delete network.@device[0]; do :; done
+uci commit network
+/etc/init.d/dropbear disable 2>/dev/null
 exit 0
