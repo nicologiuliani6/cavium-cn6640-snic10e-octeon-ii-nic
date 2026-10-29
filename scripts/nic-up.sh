@@ -50,11 +50,14 @@ setup_port() { # oct cidr-or-empty(=DHCP)
     echo "[$OCT] up ($CIDR, mtu 9000)"
   elif command -v nmcli >/dev/null 2>&1 && systemctl is-active -q NetworkManager; then	# DHCP via NM
     # high route metric: a DHCP gateway on a NIC port must not steal the default route
-    nmcli -t con show "$OCT" >/dev/null 2>&1 || nmcli con add type ethernet ifname $OCT con-name $OCT \
-      ipv4.method auto ipv6.method auto ipv4.route-metric 700 ipv6.route-metric 700 connection.autoconnect-priority -10 802-3-ethernet.mtu ${MTU:-1500} >/dev/null
+    # exactly one profile named $OCT: drop duplicates of OUR profile left by older versions, then (re)create
+    [ "$(nmcli -g NAME con show | grep -cx "$OCT")" = 1 ] || {
+      nmcli -g UUID,NAME con show | awk -F: -v n="$OCT" '$NF==n{print $1}' | xargs -r -n1 nmcli con delete uuid >/dev/null 2>&1
+      nmcli con add type ethernet ifname $OCT con-name $OCT \
+      ipv4.method auto ipv6.method auto ipv4.route-metric 700 ipv6.route-metric 700 connection.autoconnect-priority -10 802-3-ethernet.mtu ${MTU:-1500} >/dev/null; }
     nmcli device set $OCT managed yes 2>/dev/null || true
     ip link set $OCT mtu ${MTU:-1500} up
-    nmcli device connect "$OCT" >/dev/null 2>&1 &	# best profile wins (a user's own has higher priority than ours); don't block boot if no DHCP server/link yet; NM keeps retrying
+    # no `device connect`: with no link it spawns a duplicate auto profile; autoconnect (ifname-bound) does the rest
     echo "[$OCT] up (DHCP via NetworkManager, mtu ${MTU:-1500})"
   else					# no NM: plain dhclient
     ip link set $OCT mtu ${MTU:-1500} up; dhclient -nw $OCT 2>/dev/null
