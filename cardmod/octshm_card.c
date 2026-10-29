@@ -621,6 +621,19 @@ static struct ztx_pend ztx_fifo[MAX_WORKERS][ZTX_FIFO];
 static u32 ztx_h[MAX_WORKERS], ztx_t[MAX_WORKERS];
 
 /* xmit every pipelined frame whose data has landed (head = oldest seq on this queue) */
+/* Host broadcast frames (ARP, DHCP...) must reach BOTH the card's own stack and the wire. The old
+ * code delivered them locally only, so a switch never saw them. Deliver a copy locally, caller
+ * transmits the original. */
+static void oct_bcast_local(struct sk_buff *skb)
+{
+	struct sk_buff *c = skb_copy(skb, GFP_ATOMIC);
+
+	if (c) {
+		c->pkt_type = PACKET_HOST;
+		netif_rx(c);
+	}
+}
+
 static void ztx_drain(int id)
 {
 	while (ztx_h[id] != ztx_t[id]) {
@@ -634,11 +647,12 @@ static void ztx_drain(int id)
 		skb_reset_mac_header(skb);
 		skb->protocol = eth_hdr(skb)->h_proto;
 		eh = eth_hdr(skb);
-		if (ether_addr_equal_unaligned(eh->h_dest, e->dev->dev_addr) ||
-		    is_broadcast_ether_addr(eh->h_dest)) {
+		if (ether_addr_equal_unaligned(eh->h_dest, e->dev->dev_addr)) {
 			skb->pkt_type = PACKET_HOST;
 			netif_rx(skb);
 		} else {
+			if (is_broadcast_ether_addr(eh->h_dest))
+				oct_bcast_local(skb);
 			dev_queue_xmit(skb);
 		}
 		ztx_h[id]++;
@@ -1046,6 +1060,19 @@ static int worker_fn(void *arg)
 							       p->txbuf + ts * BUF_SZ + hdr, len - hdr);
 						skb->pkt_type = PACKET_HOST;
 						netif_rx(skb);
+						if (is_broadcast_ether_addr(eh->h_dest)) {
+							/* ...and the wire: full linear copy of the frame */
+							struct sk_buff *w = netdev_alloc_skb(p->up_dev, len + NET_IP_ALIGN);
+
+							if (w) {
+								skb_reserve(w, NET_IP_ALIGN);
+								memcpy(skb_put(w, len), p->txbuf + ts * BUF_SZ, len);
+								w->dev = p->up_dev;
+								skb_reset_mac_header(w);
+								w->protocol = eth_hdr(w)->h_proto;
+								dev_queue_xmit(w);
+							}
+						}
 					} else if (len > hdr) {		/* jumbo: header copied, payload frag */
 						get_page(p->pages);	/* frag holds a ref on the window */
 						skb_add_rx_frag(skb, 0, p->pages,
@@ -1091,11 +1118,12 @@ static int worker_fn(void *arg)
 				skb_reset_mac_header(skb);
 				skb->protocol = eth_hdr(skb)->h_proto;
 				eh = eth_hdr(skb);
-				if (ether_addr_equal_unaligned(eh->h_dest, p->up_dev->dev_addr) ||
-				    is_broadcast_ether_addr(eh->h_dest)) {
+				if (ether_addr_equal_unaligned(eh->h_dest, p->up_dev->dev_addr)) {
 					skb->pkt_type = PACKET_HOST;
 					netif_rx(skb);
 				} else {
+					if (is_broadcast_ether_addr(eh->h_dest))
+						oct_bcast_local(skb);
 					dev_queue_xmit(skb);
 				}
 			}
@@ -1149,7 +1177,10 @@ static void link_fn(struct work_struct *w)
 	int i;
 
 	for (i = 0; i < ports; i++) {
-		struct net_device *d = pv[i].up_dev;
+		/* SNIC10E: the Vitesse PHY nodes (mdio 0/1) are bound to xaui1/xaui0 crosswise, so
+		 * xaui<i>'s phydev reports the link of the OTHER cage. Measured: cable only in cage 1
+		 * -> xaui0.phydev->link=1, xaui1.phydev->link=0 while frames flow on xaui1. */
+		struct net_device *d = pv[ports > 1 ? i ^ 1 : i].up_dev;
 
 		if (!pv[i].ctrl)
 			continue;
