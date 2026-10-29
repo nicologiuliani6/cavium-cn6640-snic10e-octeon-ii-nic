@@ -28,6 +28,8 @@ rmmod octnic 2>/dev/null || true
 booted=0
 for t in 1 2 3; do
   echo "--- no-serial boot attempt $t ---"
+  # right after host boot reuse a card that is already running; a manual re-run reloads the image
+  [ "$(awk '{print ($1<300)}' /proc/uptime)" = 1 ] && export OCT_REUSE=1 || export OCT_REUSE=0
   if bash "$REPO/octboot"; then booted=1; NOSER=1; echo "card booted no-serial (try $t)"; break; fi
   echo "no-serial boot $t failed"; sleep 3
 done

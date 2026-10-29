@@ -40,6 +40,9 @@ ok "CN6640 detected ($CARD, bridge $BRIDGE)"
 # Fast path: the card is already sitting in u-boot with a live BAR2 window (cold boot — u-boot
 # programmed the window and is in its long pre-boot sleep). Push straight in: no SBR, no race.
 # SBR only if the card runs OpenWrt (reload) or the window is not live (at prompt / wedged).
+# No driver binds the card (liquidio blacklisted), so the kernel leaves COMMAND=0 (memory decode
+# off) and every BAR2 read is 0xffffffff even with a live window -> looked "dead", cost an SBR.
+setpci -s "$CARD" COMMAND=0x06
 STATE=$(CARD=$CARD python3 - <<'PY'
 import mmap,os
 try:
@@ -47,7 +50,7 @@ try:
     m=mmap.mmap(fd,64*1024*1024,mmap.MAP_SHARED)
     import sys; print("[dbg] bar2[0]=0x%08x bar2[0x10000]=0x%08x"%(int.from_bytes(bytes(m[0:4]),"little"),int.from_bytes(bytes(m[0x10000:0x10004]),"little")),file=sys.stderr)
     if int.from_bytes(bytes(m[0:4]),"little")==0x4f435348:
-        print("os")                          # OpenWrt already running -> SBR to reload
+        print("osready" if int.from_bytes(bytes(m[8:12]),"little") else "os")   # OpenWrt up -> SBR to reload (or reuse at boot)
     else:
         m[0x10000:0x10008]=b"NSRLIVE0"; m.flush()
         print("live" if bytes(m[0x10000:0x10008])==b"NSRLIVE0" else "dead")
@@ -57,6 +60,11 @@ except Exception:
 PY
 )
 DOSBR=1
+# Boot-time reuse (cavium-up sets OCT_REUSE=1 right after host boot): a card whose OS is already
+# up and ready (host warm reboot / card kept power) is usable as is -> skip SBR + reload, ~30 s.
+if [ "$STATE" = osready ] && [ "${OCT_REUSE:-0}" = 1 ]; then
+  ok "Card OS already up and ready -- reusing it (no reload)"; exit 0
+fi
 echo "[dbg] state=$STATE cmd=$(setpci -s "$CARD" COMMAND) bar0=$(setpci -s "$CARD" BASE_ADDRESS_0) bar2=$(setpci -s "$CARD" BASE_ADDRESS_2)"
 if [ "$STATE" = live ]; then
   ok "Window already live (u-boot waiting) -- direct push, no SBR"; DOSBR=0
