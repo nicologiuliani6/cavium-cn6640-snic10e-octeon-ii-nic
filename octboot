@@ -65,8 +65,8 @@ elif [ "$STATE" = dead ]; then
   # on its own -- but this second octboot run catches it mid-Linux-boot (window down, magic not
   # up yet) and used to SBR it, wedging it mid-jump (magic 0xffffffff, only a power cycle
   # recovers). So wait for the NIC heartbeat first; SBR only if it never comes.
-  ok "Window not live -- waiting up to 20s for a mid-boot card to surface (avoid SBR-wedge)"
-  for _ in $(seq 1 20); do
+  ok "Window not live -- waiting up to 10s for a mid-boot card to surface (avoid SBR-wedge)"
+  for _ in $(seq 1 10); do
     up=$(CARD=$CARD python3 - <<'PY'
 import mmap,os
 try:
@@ -80,7 +80,7 @@ PY
     [ "$up" = 1 ] && { ok "Card came up on its own (prior push) -- no SBR, no reload"; exit 0; }
     sleep 1
   done
-  ok "Still not up after 20s -- assume wedged, SBR"
+  ok "Still not up after 10s -- assume wedged, SBR"
 fi   # STATE=os falls through with DOSBR=1 (OpenWrt running -> SBR to reload a fresh image)
 if [ "$DOSBR" = 1 ]; then
   setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
