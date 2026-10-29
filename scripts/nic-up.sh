@@ -56,7 +56,7 @@ setup_port() { # oct cidr-or-empty(=DHCP)
       nmcli con add type ethernet ifname $OCT con-name $OCT \
       ipv4.method auto ipv6.method auto ipv4.route-metric 700 ipv6.route-metric 700 connection.autoconnect-priority -10 802-3-ethernet.mtu ${MTU:-1500} >/dev/null; }
     nmcli device set $OCT managed yes 2>/dev/null || true
-    ip link set $OCT mtu ${MTU:-1500} up
+    ip link set $OCT up			# MTU comes from the NM profile (created with ${MTU:-1500}; edit it there, e.g. 9000)
     # no `device connect`: with no link it spawns a duplicate auto profile; autoconnect (ifname-bound) does the rest
     echo "[$OCT] up (DHCP via NetworkManager, mtu ${MTU:-1500})"
   else					# no NM: plain dhclient

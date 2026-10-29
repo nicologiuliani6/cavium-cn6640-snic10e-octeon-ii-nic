@@ -165,3 +165,13 @@ Left as-is, the card sits idle until `octboot` pushes an image again.
 "disconnected", no IP shown). If a foreign DAC makes the PHY report link-down although traffic
 flows, force carrier on: `modprobe octnic follow_link=0` (or `echo 0 > /sys/module/octnic/parameters/follow_link`).
 The MAC is stable per slot and port (locally administered `02:c4:…`), so DHCP leases survive reboots.
+
+## Jumbo frames to one peer, 1500 to the rest of the LAN
+
+`oct0`/`oct1` default to MTU 1500 (DHCP). A 10G peer that supports jumbo gets ~9.9 Gbit/s TX
+(vs ~3 at 1500) with MTU 9000 *only for that peer*, using per-route MTU, no switch change
+(the switch only has to pass jumbo frames). On both hosts: interface MTU 9000, the connected
+subnet route at `mtu 1500`, and a `/32` host route to the peer at `mtu 9000`. With NetworkManager:
+`nmcli con mod oct1 802-3-ethernet.mtu 9000 ipv4.routes "192.168.88.0/24 0.0.0.0 700 mtu=1500, <peer>/32 0.0.0.0 mtu=9000"`.
+If the host also has Wi-Fi on the same subnet, set `net.ipv4.conf.all.arp_ignore=1` and
+`arp_announce=2` so the peer learns the Cavium MAC, not the Wi-Fi one. nic-up.sh leaves the MTU to the NM profile.
