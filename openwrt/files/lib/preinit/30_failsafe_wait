@@ -1,0 +1,2 @@
+#!/bin/sh
+# card is headless: skip the 2 s "press f for failsafe" wait (stock hook lives in base-files)
