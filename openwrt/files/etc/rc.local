@@ -18,5 +18,15 @@ insmod /root/octshm_card.ko uplink=xaui0,xaui1 ports=2 dma=2 dpiwait=0 lockfree=
     [ -n "$t1" ] && echo "$t1 $t2" > /proc/octshm/temp 2>/dev/null
     sleep 5
   done ) &
-( sleep 20; sh /root/envdiag.sh ) &
+# card-side NIC counters -> host (BAR2 ctrl+0x200): lets the host debug the SFP+ link without serial.
+# host: python3 -c "...m[0x200:0x400]" ; one line "xauiN rxpk rxbytes rxerr rxdrop txpk txerr link"
+( sleep 25; while :; do
+    o=""
+    for n in xaui0 xaui1; do
+      d=/sys/class/net/$n/statistics
+      o="$o $n rx=$(cat $d/rx_packets) rxB=$(cat $d/rx_bytes) rxerr=$(cat $d/rx_errors) rxdrop=$(cat $d/rx_dropped) rxcrc=$(cat $d/rx_crc_errors) tx=$(cat $d/tx_packets) txerr=$(cat $d/tx_errors) oper=$(cat /sys/class/net/$n/operstate);"
+    done
+    printf '%s' "$o" > /proc/octshm/env 2>/dev/null
+    sleep 2
+  done ) &
 exit 0
