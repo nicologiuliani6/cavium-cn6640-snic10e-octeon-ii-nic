@@ -45,6 +45,7 @@ import mmap,os
 try:
     fd=os.open("/sys/bus/pci/devices/0000:%s/resource2"%os.environ["CARD"],os.O_RDWR)
     m=mmap.mmap(fd,64*1024*1024,mmap.MAP_SHARED)
+    import sys; print("[dbg] bar2[0]=0x%08x bar2[0x10000]=0x%08x"%(int.from_bytes(bytes(m[0:4]),"little"),int.from_bytes(bytes(m[0x10000:0x10004]),"little")),file=sys.stderr)
     if int.from_bytes(bytes(m[0:4]),"little")==0x4f435348:
         print("os")                          # OpenWrt already running -> SBR to reload
     else:
@@ -56,6 +57,7 @@ except Exception:
 PY
 )
 DOSBR=1
+echo "[dbg] state=$STATE cmd=$(setpci -s "$CARD" COMMAND) bar0=$(setpci -s "$CARD" BASE_ADDRESS_0) bar2=$(setpci -s "$CARD" BASE_ADDRESS_2)"
 if [ "$STATE" = live ]; then
   ok "Window already live (u-boot waiting) -- direct push, no SBR"; DOSBR=0
 elif [ "$STATE" = dead ]; then
