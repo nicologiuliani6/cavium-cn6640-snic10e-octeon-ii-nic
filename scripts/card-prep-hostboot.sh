@@ -92,7 +92,9 @@ send "setenv bootdelay 1"
 FLAG=0x20000100; GO=0x474f2121            # "GO!!" (big-endian word, host writes the bytes)
 send "setenv e itest.l *${FLAG} == ${GO}"
 send "setenv n itest.l *${FLAG} != ${GO}"
-send "setenv s sleep 1"
+# every 1 s tick also re-programs the PEM window: a PCIe reset from the host (BIOS PERST, kernel
+# bus reset) after u-boot's first wa..wd wipes it, and the host would then think the card is dead
+send "setenv s sleep 1 \\; run wa \\; run wb \\; run wc \\; run wd"
 send "setenv w1 run e s"
 rep() { local o="" i; for i in $(seq 1 "$2"); do o+="run $1 \; "; done; printf '%s' "${o% \; }"; }
 send "setenv w10 $(rep w1 10)"
