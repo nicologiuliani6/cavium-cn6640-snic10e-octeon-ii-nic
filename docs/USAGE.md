@@ -158,3 +158,10 @@ Left as-is, the card sits idle until `octboot` pushes an image again.
   live from sysfs; moving the card to a different slot changes the BIOS-assigned BARs and
   invalidates the saved env. Fix: re-run `card-prep-hostboot.sh` on the current machine (requires
   one-time serial connection via FT232) — it detects the new BARs and rewrites the u-boot env.
+
+## Link state and MAC
+
+`oct0`/`oct1` carrier follows the real SFP+ link (the card publishes its PHY link; no cable/peer =
+"disconnected", no IP shown). If a foreign DAC makes the PHY report link-down although traffic
+flows, force carrier on: `modprobe octnic follow_link=0` (or `echo 0 > /sys/module/octnic/parameters/follow_link`).
+The MAC is stable per slot and port (locally administered `02:c4:…`), so DHCP leases survive reboots.

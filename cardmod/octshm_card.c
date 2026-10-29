@@ -13,6 +13,8 @@
 #include <linux/gfp.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
+#include <linux/phy.h>
+#include <linux/workqueue.h>
 #include <linux/string.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -1138,6 +1140,28 @@ static ssize_t temp_write(struct file *f, const char __user *ubuf, size_t n, lof
 }
 static const struct proc_ops temp_pops = { .proc_write = temp_write };
 
+/* Real SFP+ link state per port -> ctrl->resv[2] (bit31 = published, bit0 = up) so the host can
+ * drop oct0/oct1 carrier when no cable/peer. octcarrier forces the *netdev* carrier up, so use the
+ * PHY's own status (phydev->link); no phydev = leave unpublished (host keeps carrier on). */
+static struct delayed_work link_work;
+static void link_fn(struct work_struct *w)
+{
+	int i;
+
+	for (i = 0; i < ports; i++) {
+		struct net_device *d = pv[i].up_dev;
+
+		if (!pv[i].ctrl)
+			continue;
+		if (d && d->phydev)
+			pv[i].ctrl->resv[2] = cpu_to_le32(0x80000000u | (d->phydev->link ? 1 : 0));
+		else
+			pv[i].ctrl->resv[2] = 0;
+	}
+	wmb();
+	schedule_delayed_work(&link_work, HZ / 2);
+}
+
 /* Env discovery return channel: envdiag.sh (card-side NOR scan for the u-boot env
  * location) writes its result string to /proc/octshm/env; we stash it at ctrl+0x200
  * (clean: past RXPROF@0x100, before TXDESC@0x1000, never touched by NIC traffic).
@@ -1310,6 +1334,8 @@ static int __init octshm_init(void)
 	for (i = 0; i < ports; i++)
 		pv[i].ctrl->card_ready = cpu_to_le32(1);
 	wmb();
+	INIT_DELAYED_WORK(&link_work, link_fn);
+	schedule_delayed_work(&link_work, 0);
 	proc_dir = proc_mkdir("octshm", NULL);
 	if (proc_dir) {
 		proc_temp = proc_create("temp", 0222, proc_dir, &temp_pops);
@@ -1323,6 +1349,8 @@ static int __init octshm_init(void)
 static void __exit octshm_exit(void)
 {
 	int i;
+
+	cancel_delayed_work_sync(&link_work);
 
 	if (proc_temp)
 		proc_remove(proc_temp);

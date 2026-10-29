@@ -34,7 +34,10 @@ grep -q '\[integrity\]\|\[confidentiality\]' /sys/kernel/security/lockdown 2>/de
 VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$REPO/hostmod/dkms.conf")
 if command -v dkms >/dev/null 2>&1 && [ "${NODKMS:-0}" != 1 ]; then
   say "building host module (octnic $VER, dkms)"
-  dkms remove -m octnic --all >/dev/null 2>&1 || true	# every version: an older one would clash
+  # drop EVERY registered octnic version (also stale/broken ones), else dkms skips the install
+  for v in $(dkms status 2>/dev/null | awk -F'[/,: ]+' '$1=="octnic"{print $2}' | sort -u); do
+    dkms remove -m octnic -v "$v" --all >/dev/null 2>&1 || true
+  done
   rm -rf /usr/src/octnic-*
   rm -rf "/usr/src/octnic-$VER"
   # drop any octnic.ko left by an earlier non-dkms install, else dkms flags the mismatch

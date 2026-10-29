@@ -14,6 +14,7 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
+#include <linux/crc32.h>
 #include <linux/timer.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
@@ -49,6 +50,7 @@
 #define C_RX_DMA_BASE 0x30
 #define C_RESV0      0x38	/* card board temp, millidegC (fed by card /proc/octshm/temp) */
 #define C_RESV1      0x3c	/* card Octeon die temp, millidegC */
+#define C_LINK       0x40	/* ctrl->resv[2]: bit31 = card publishes link, bit0 = SFP+ link up */
 #define C_HEARTBEAT  0x20	/* card worker0 loop counter, ticks continuously while alive */
 
 static unsigned long base;		/* 0 = auto-discover card BAR2 (177d:0092). override to force */
@@ -491,17 +493,36 @@ static long oct_temp(int ch)
 	return (long)(s32)readl(hp[0].w + (ch == 0 ? C_RESV0 : C_RESV1));
 }
 
-static void oct_set_carrier(bool on)
+static bool follow_link = true;		/* carrier = real SFP+ link (needs a card image that publishes it) */
+module_param(follow_link, bool, 0644);
+
+/* carrier for port i: card lost -> off; else the SFP+ link the card publishes (old images publish
+ * nothing -> stay on, as before) */
+static bool oct_want_carrier(int i)
+{
+	u32 v;
+
+	if (card_lost)
+		return false;
+	v = readl(hp[i].w + C_LINK);
+	if (follow_link && (v & 0x80000000u))
+		return v & 1;
+	return true;
+}
+
+static void oct_set_carrier(bool unused)
 {
 	int i;
 
 	for (i = 0; i < ports; i++) {
 		if (!hp[i].ndev)
 			continue;
-		if (on)
-			netif_carrier_on(hp[i].ndev);
-		else
+		if (oct_want_carrier(i)) {
+			if (!netif_carrier_ok(hp[i].ndev))
+				netif_carrier_on(hp[i].ndev);
+		} else if (netif_carrier_ok(hp[i].ndev)) {
 			netif_carrier_off(hp[i].ndev);
+		}
 	}
 }
 
@@ -557,7 +578,8 @@ static void wd_fn(struct work_struct *w)
 			pr_info("octnic: card temp back to normal (%ld C)\n", tmax / 1000);
 		wd_temp_lvl = lvl;
 	}
-	schedule_delayed_work(&wd_work, 2 * HZ);
+	oct_set_carrier(true);			/* follow the SFP+ link */
+	schedule_delayed_work(&wd_work, HZ);
 }
 
 static umode_t oct_hwmon_visible(const void *d, enum hwmon_sensor_types type,
@@ -689,7 +711,16 @@ static int __init octnic_init(void)
 		snprintf(p->ndev->name, IFNAMSIZ, "oct%d", i);
 		p->ndev->netdev_ops = &oct_ops;
 		p->ndev->ethtool_ops = &oct_ethtool_ops;
-		eth_hw_addr_random(p->ndev);
+		/* stable per slot+port (locally administered): DHCP leases/reservations survive reboots */
+		if (pdev) {
+			u32 h = crc32_le(0, pci_name(pdev), strlen(pci_name(pdev)));
+			u8 a[ETH_ALEN] = { 0x02, 0xc4, h >> 24, h >> 16, h >> 8, (u8)h + i };
+
+			eth_hw_addr_set(p->ndev, a);
+		} else {
+			eth_hw_addr_random(p->ndev);
+		}
+		netif_carrier_off(p->ndev);	/* wd_fn raises it once the card reports link */
 		p->ndev->mtu = 1500;
 		p->ndev->max_mtu = 9000;		/* allow jumbo (BUF_SZ=9216) */
 
@@ -716,7 +747,7 @@ static int __init octnic_init(void)
 	wd_beat = readl(hp[0].w + C_HEARTBEAT);
 	wd_beat_jiffies = jiffies;
 	INIT_DELAYED_WORK(&wd_work, wd_fn);
-	schedule_delayed_work(&wd_work, 2 * HZ);
+	schedule_delayed_work(&wd_work, 0);
 	return 0;
 
 err:
