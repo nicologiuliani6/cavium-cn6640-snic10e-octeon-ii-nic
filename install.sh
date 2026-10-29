@@ -56,14 +56,12 @@ else
   say "installed octnic.ko -> $DEST  (modprobe octnic; re-run after a kernel upgrade)"
 fi
 
-# 3) system configs: keep stock liquidio off, keep NM from flushing oct* IPs
+# 3) system configs: keep stock liquidio off, sensors config
 say "installing system configs"
 install -m644 "$REPO/system/blacklist-liquidio.conf" /etc/modprobe.d/ 2>/dev/null \
   && rmmod liquidio 2>/dev/null; true
-if [ -d /etc/NetworkManager/conf.d ]; then
-  install -m644 "$REPO/system/99-octnic-unmanaged.conf" /etc/NetworkManager/conf.d/ 2>/dev/null \
-    && systemctl reload NetworkManager 2>/dev/null; true
-fi
+# oct0/oct1 are DHCP clients now (nic-up.sh): drop the old "unmanaged" pin from earlier installs
+rm -f /etc/NetworkManager/conf.d/99-octnic-unmanaged.conf
 # lm-sensors config so `sensors` shows the card's temps (cavium_card hwmon driver)
 if [ -d /etc/sensors.d ]; then
   install -m644 "$REPO/system/cavium-card" /etc/sensors.d/ 2>/dev/null; true

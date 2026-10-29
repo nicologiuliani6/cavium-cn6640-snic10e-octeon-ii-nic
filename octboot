@@ -65,8 +65,8 @@ elif [ "$STATE" = dead ]; then
   # on its own -- but this second octboot run catches it mid-Linux-boot (window down, magic not
   # up yet) and used to SBR it, wedging it mid-jump (magic 0xffffffff, only a power cycle
   # recovers). So wait for the NIC heartbeat first; SBR only if it never comes.
-  ok "Window not live -- waiting up to 40s for a mid-boot card to surface (avoid SBR-wedge)"
-  for _ in $(seq 1 40); do
+  ok "Window not live -- waiting up to 20s for a mid-boot card to surface (avoid SBR-wedge)"
+  for _ in $(seq 1 20); do
     up=$(CARD=$CARD python3 - <<'PY'
 import mmap,os
 try:
@@ -80,7 +80,7 @@ PY
     [ "$up" = 1 ] && { ok "Card came up on its own (prior push) -- no SBR, no reload"; exit 0; }
     sleep 1
   done
-  ok "Still not up after 40s -- assume wedged, SBR"
+  ok "Still not up after 20s -- assume wedged, SBR"
 fi   # STATE=os falls through with DOSBR=1 (OpenWrt running -> SBR to reload a fresh image)
 if [ "$DOSBR" = 1 ]; then
   setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
@@ -131,7 +131,9 @@ if not live:
 # push image + wordfix (WC-write corruption correction)
 m[off:off+len(d)]=d; m.flush()
 for it in range(10):
-    rb=bytes(m[off:off+len(d)]); bad=[i for i in range(0,len(d),4) if d[i:i+4]!=rb[i:i+4]]
+    rb=bytes(m[off:off+len(d)])
+    # whole-buffer compare first (C speed); only walk the words when something differs
+    bad=[] if rb==d else [i for i in range(0,len(d),4) if d[i:i+4]!=rb[i:i+4]]
     if not bad: print("[ \033[32mOK\033[0m ] Uploading OpenWrt... (%d bytes, %d fix passes)"%(len(d),it)); break
     for i in bad: m[off+i:off+i+4]=d[i:i+4]
     m.flush()

@@ -29,7 +29,7 @@ sudo cp system/blacklist-liquidio.conf /etc/modprobe.d/
 sudo rmmod liquidio 2>/dev/null
 
 # 2) stop NetworkManager from flushing the oct* IPs
-sudo cp system/99-octnic-unmanaged.conf /etc/NetworkManager/conf.d/
+# (oct0/oct1 get an address by DHCP via NetworkManager; set IP0=/IP1= for static)
 sudo systemctl reload NetworkManager
 ```
 
@@ -67,8 +67,7 @@ The autostart uses `ports=2 dma=1 hrx=1 rxthreads=8 ntxq=8 poll_us=20`.
 ## Benchmarking
 
 Both ports are ordinary netdevs, so `iperf3` over the DAC to whatever the card is cabled to
-is the whole method. `scripts/nic-up.sh` puts `10.9.9.1/24` on `oct0` and `10.9.10.1/24` on
-`oct1` (override with `IP0=` / `IP1=`); give the peer an address in the same subnet and:
+is the whole method. `scripts/nic-up.sh` makes `oct0` and `oct1` DHCP clients (or static with `IP0=10.9.9.1/24 IP1=10.9.10.1/24`); with a static address, give the peer one in the same subnet and:
 
 ```bash
 # on the peer
