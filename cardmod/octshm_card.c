@@ -840,8 +840,8 @@ static int oct_rx_pack(struct sk_buff *skb, struct net_device *dev,
 {
 	struct oct_port *p = container_of(pt, struct oct_port, ptype);
 
-	if (skb->dev != p->up_dev)
-		goto out;
+	if (skb->dev != p->up_dev || skb->pkt_type == PACKET_OUTGOING)
+		goto out;	/* ETH_P_ALL also sees our own TX: never echo it back to the host */
 	if (rxwork && p->dma_ready == 2) {
 		int k = raw_smp_processor_id() % nworkers;
 
