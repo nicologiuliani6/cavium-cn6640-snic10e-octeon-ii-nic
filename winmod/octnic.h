@@ -1,30 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0
  * octnic.h — Windows driver for Cavium CN6640 SNIC10E shared-memory NIC.
- * Translates the Linux octnic driver to NDIS 6.x miniport + kernel-mode DPC polling.
+ * NDIS 6.20 miniport (one adapter) + kernel-mode DPC polling.
  *
  * Architecture: same BAR2 shared-memory layout as Linux.
  *   CTRL page (offset 0x000000): magic, version, card/host ready, ring indices, DMA config
  *   TX descriptor ring (offset 0x001000): 128 entries, 8 bytes each {len, phase}
  *   RX descriptor ring (offset 0x002000): 128 entries, 8 bytes each {len, flags}
- *   TX buffer (offset 0x100000): 4MB per port, where host PIO writes frames
- *   RX buffer (offset 0x280000): 4MB per port, where card DPI DMA writes frames
+ *   TX buffer (offset 0x100000): where host PIO writes frames
+ *   RX buffer (offset 0x280000): where card DPI DMA writes frames
  *   Per-port stride: 4MB (0x400000)
+ *
+ * NDIS_MINIPORT_DRIVER / NDIS620_MINIPORT are defined by the vcxproj.
  */
 
 #pragma once
 
-#include <ntddk.h>
 #include <ndis.h>
+#include <intrin.h>
 
-/* ---- Ethernet constants (not in WDK) ---- */
-#ifndef ETH_ALEN
-#define ETH_ALEN 6
-#endif
+#define ETH_ALEN                  6
 
 /* ---- PCI identifiers ---- */
 #define PCI_VENDOR_ID_CAVIUM      0x177d
 #define PCI_DEVICE_ID_CN6640      0x0092
-#define PCI_BAR_IDX_SHARED_MEM    2   /* BAR2 = card DRAM window */
 
 /* ---- Shared-memory layout (same as Linux) ---- */
 #define OCTSHM_MAGIC              0x4f435348u   /* "OCSH" */
@@ -57,16 +55,20 @@
 #define C_RESV1                   0x3cu       /* card Octeon die temp (millidegC) */
 #define C_LINK                    0x40u       /* bit31=published, bit0=SFP+ link up */
 
-/* ---- Module parameters (registry-configured) ---- */
-#define DEFAULT_PORTS             2
-#define DEFAULT_POLL_US           20          /* busy-poll interval in microseconds */
+/* ---- Driver parameters ---- */
+/* ponytail: one NDIS adapter drives port 0 only; a 2nd adapter needs a bus-style
+ * enumerator (one PCI function = one NDIS adapter). Set 2 to also RX from port 1. */
+#define DEFAULT_PORTS             1
+#define DEFAULT_POLL_MS           1           /* KTIMER period (ms); DPC re-queues itself while busy */
 #define DEFAULT_HRX               1           /* host-RAM RX descriptors */
-#define DEFAULT_RXTHREADS         8           /* parallel RX drain threads per port */
-#define DEFAULT_NTXQ              8           /* multi-queue TX queues */
+#define MAX_RX_THREADS            8
+#define DEFAULT_RXTHREADS         4           /* parallel RX drain DPCs per port */
+#define RX_POOL_TOTAL             512u        /* preallocated RX buffers (NBL+MDL+data) */
+#define OCTNIC_TAG                'cinO'
 
-/* ---- NDIS version ---- */
-#define NDIS_MINIPORT_MAJOR_VERSION   6
-#define NDIS_MINIPORT_MINOR_VERSION   13
+#define OCTNIC_MTU                1500u
+#define OCTNIC_MAX_FRAME          (OCTNIC_MTU + 14u)
+#define OCTNIC_LINK_BPS           10000000000ULL
 
 /* ---- Debug ---- */
 #define DBG_TRACE       0x00000001u
@@ -75,35 +77,13 @@
 #define DBG_RX          0x00000008u
 #define DBG_ERROR       0x00000010u
 
-#define DEBUG_LEVEL     (DBG_TRACE | DBG_INIT | DBG_ERROR)
+#define DEBUG_LEVEL     (DBG_INIT | DBG_ERROR)
 
-#ifdef NDEBUG
 #define DPRINT(level, fmt, ...) do { if ((DEBUG_LEVEL & (level))) \
-    DbgPrint("octnic: " fmt "\n", ##__VA_ARGS__); } while(0)
-#else
-#define DPRINT(level, fmt, ...) do { if ((DEBUG_LEVEL & (level))) \
-    DbgPrintEx(DPFLTR_IHVDRIVER, DPFLTR_INFO_LEVEL, "octnic[%s]: " fmt "\n", \
-               #level, ##__VA_ARGS__); } while(0)
-#endif
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "octnic: " fmt "\n", ##__VA_ARGS__); } while (0)
 
 /* ---- Hardware descriptor structures ---- */
 #pragma pack(push, 1)
-struct octshm_ctrl {
-    ULONG magic;
-    ULONG version;
-    ULONG card_ready;
-    ULONG host_ready;
-    ULONG tx_prod;
-    ULONG tx_cons;
-    ULONG rx_prod;
-    ULONG rx_cons;
-    ULONG heartbeat;
-    ULONG dma_enable;
-    ULONGLONG tx_dma_base;
-    ULONGLONG rx_dma_base;
-    ULONG resv[3];       /* temps, link state */
-};
-
 struct octshm_desc {
     ULONG len;
     ULONG flags;
@@ -115,119 +95,112 @@ static __inline ULONG TX_PHASE(ULONG tp) { return (tp >> 7) & 1u; }
 static __inline ULONG RX_PHASE(ULONG rc) { return (rc >> 7) & 1u; }
 
 /* ---- Forward declarations ---- */
-typedef struct _PORT_DPC_CTX *PPORT_DPC_CTX;
-typedef struct _PORT_CONTEXT *PPORT_CONTEXT;
-typedef struct _DRIVER_CONTEXT *PDRIVER_CONTEXT;
-
-/* ---- WDK type aliases ---- */
-typedef struct _WORK_ITEM *PWORK_ITEM;
-typedef struct _NDIS_MINIPORT_CHARACTERISTICS PNDIS_MINIPORT_CHARACTERISTICS;
+typedef struct _PORT_CONTEXT PORT_CONTEXT, *PPORT_CONTEXT;
 
 /* ---- Per-port DPC polling context ---- */
 typedef struct _PORT_DPC_CTX {
-    KDPC                        dpc;           /* Windows DPC object */
-    ULONG                       tid;           /* thread ID (0..rxThreads-1) */
-    PPORT_CONTEXT               portCtx;       /* back-pointer to port */
+    KDPC            dpc;
+    KTIMER          timer;
+    ULONG           tid;           /* 0..rxThreads-1 */
+    PPORT_CONTEXT   portCtx;
 } PORT_DPC_CTX, *PPORT_DPC_CTX;
 
 /* ---- Per-port state ---- */
-typedef struct _PORT_CONTEXT {
-    PVOID               portBase;        /* BAR2 + idx * PORT_STRIDE */
-    NDIS_HANDLE         miniportHandle;
-    NDIS_HANDLE         netBufferListPool;
-    ULONG               txClaim;         /* host TX producer (CAS) */
-    ULONG               txProdShadow;    /* cached card tx_prod */
-    ULONG               txConsCache;     /* last card tx_cons */
-    ULONG               rxConsShadow;    /* host RX consumer */
-    ULONG               rcPub[8];        /* per-DPC RX consumer */
-    ULONG               idx;             /* port index (0 or 1) */
+struct _PORT_CONTEXT {
+    PUCHAR              portBase;        /* BAR2 + idx * PORT_STRIDE */
+    volatile ULONG      txClaim;         /* host TX producer (CAS) */
+    volatile ULONG      txProdShadow;
+    volatile ULONG      txConsCache;
+    volatile ULONG      rxConsShadow;
+    volatile ULONG      rcPub[MAX_RX_THREADS];
+    ULONG               idx;
     BOOLEAN             initialized;
-    BOOLEAN             dmaEnabled;
-    ULONG               hwQueueId;       /* hardware queue for NDIS multi-queue */
+    PORT_DPC_CTX        dpcCtx[MAX_RX_THREADS];
+    ULONG               dpcCount;
+};
 
-    /* DPC polling: one DPC per consumer thread */
-    PORT_DPC_CTX        dpcCtx[8];       /* up to 8 DPCs per port */
-    ULONG               dpcCount;        /* actual DPC count (= rxThreads) */
-} PORT_CONTEXT, *PPORT_CONTEXT;
+/* ---- Preallocated RX buffer: NBL + MDL + data ---- */
+typedef struct _RX_BUF {
+    LIST_ENTRY          link;
+    PNET_BUFFER_LIST    nbl;
+    PMDL                mdl;
+    PUCHAR              data;
+} RX_BUF, *PRX_BUF;
 
 /* ---- Driver global state ---- */
 typedef struct _DRIVER_CONTEXT {
-    NDIS_HANDLE                     ndisMiniportHandle;
-    PVOID                           bar2Mapping;     /* MmMapIoSpace result */
-    PHYSICAL_ADDRESS                bar2Phys;
-    SIZE_T                          bar2Size;
-    PORT_CONTEXT                    ports[MAX_PORTS];
-    ULONG                           numPorts;
-    BOOLEAN                         hrx;             /* host-RAM RX descriptors */
-    ULONG                           rxThreads;       /* parallel RX DPCs per port */
-    ULONG                           nTxQ;            /* TX queues */
-    ULONG                           pollUs;          /* poll interval (us) */
-    BOOLEAN                         lockfree;
-    BOOLEAN                         ztx;               /* zero-copy TX */
-    BOOLEAN                         dmaMode;           /* DMA vs PIO */
+    NDIS_HANDLE         driverHandle;    /* NdisMRegisterMiniportDriver */
+    NDIS_HANDLE         adapterHandle;   /* MiniportInitializeEx handle (single adapter) */
+    NDIS_HANDLE         nblPool;
+    NDIS_HANDLE         watchdogTimer;
 
-    /* Stop event for DPC threads (used at DISPATCH_LEVEL) */
-    KEVENT                          stopEvent;
+    PUCHAR              bar2Mapping;
+    PHYSICAL_ADDRESS    bar2Phys;
+    SIZE_T              bar2Size;
+    PORT_CONTEXT        ports[MAX_PORTS];
+    ULONG               numPorts;
+    BOOLEAN             hrx;
+    ULONG               rxThreads;
+    ULONG               pollMs;
+    BOOLEAN             lockfree;
 
-    /* Watchdog: uses IoAllocateWorkItem (runs at PASSIVE_LEVEL) */
-    PWORK_ITEM                      watchdogWorkItem;
-    ULONG                           lastHeartbeat;
-    LARGE_INTEGER                   heartbeatJiffies;  /* KeQuerySystemTimePrecise ticks */
-    BOOLEAN                         cardLost;
+    volatile LONG       polling;         /* DPCs armed */
+    volatile LONG       rxOutstanding;   /* NBLs held by NDIS */
+
+    /* RX buffer pool */
+    PRX_BUF             rxBufs;
+    LIST_ENTRY          rxFree;
+    KSPIN_LOCK          rxLock;
+
+    /* adapter settings */
+    UCHAR               mac[ETH_ALEN];
+    ULONG               packetFilter;
+    ULONG               lookahead;
+
+    /* statistics */
+    volatile LONG64     txPkts, txBytes, txErrors;
+    volatile LONG64     rxPkts, rxBytes, rxNoBuf;
+
+    /* watchdog */
+    ULONG               lastHeartbeat;
+    LARGE_INTEGER       heartbeatTime;
+    BOOLEAN             cardLost;
 } DRIVER_CONTEXT, *PDRIVER_CONTEXT;
 
-/* ---- Function prototypes ---- */
+extern DRIVER_CONTEXT g_DriverContext;
 
-/* Initialization / cleanup */
-NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
-VOID OctnicDriverUnload(PDRIVER_OBJECT DriverObject);
-NDIS_STATUS OctnicMiniportInitialize(NDIS_HANDLE miniportContext, NDIS_HANDLE wrapperContext,
-                                     NDIS_MINIPORT_INIT_ATTRIBUTES* attributes);
-VOID OctnicMiniportReset(NDIS_HANDLE miniportContext, BOOLEAN* mediumChanged);
-VOID OctnicMiniportHalt(NDIS_HANDLE miniportContext, NDIS_HALT_ACTION haltAction);
+/* ---- init.c ---- */
+NDIS_STATUS OctnicMiniportInitialize(NDIS_HANDLE adapterHandle, PNDIS_MINIPORT_INIT_PARAMETERS ip);
+VOID        OctnicMiniportHalt(VOID);
+VOID        OctnicMiniportReset(VOID);
+VOID        OctnicDpcStartAll(PDRIVER_CONTEXT drvCtx);
+VOID        OctnicDpcStopAll(PDRIVER_CONTEXT drvCtx);
 
-/* TX */
-VOID OctnicSendPackets(NDIS_HANDLE miniportContext, PNDIS_PACKET_LIST packetList,
-                       NDIS_SEND_PACKETS_FLAGS sendFlags);
-NTSTATUS OctnicTransmitFrame(PPORT_CONTEXT portCtx, PNET_BUFFER netBuffer);
-
-/* RX — DPC-based polling */
-VOID NTAPI OctnicDpcTimer(PKDPC dpc, PVOID deferredContext, PVOID systemArgument1, PVOID systemArgument2);
-VOID OctnicDpcInitialize(PPORT_CONTEXT portCtx);
-VOID OctnicDpcStartAll(PDRIVER_CONTEXT drvCtx);
-VOID OctnicDpcStopAll(PDRIVER_CONTEXT drvCtx);
-
-/* RX — ring drain (called from DPC context) */
-ULONG OctnicDrainRing(PPORT_CONTEXT portCtx, ULONG tid, ULONG budget);
-
-/* RX — cleanup */
-VOID OctnicRxCleanup(PPORT_CONTEXT portCtx);
-
-/* Watchdog */
-VOID OctnicWatchdogWorkItemCallback(PWORK_ITEM workItem);
-VOID OctnicCheckCardHealth(PDRIVER_CONTEXT drvCtx);
-
-/* BAR2 access helpers */
+/* ---- main.c: BAR2 access helpers ---- */
 ULONG OctnicReadCtrl(PPORT_CONTEXT portCtx, ULONG offset);
-VOID OctnicWriteCtrl(PPORT_CONTEXT portCtx, ULONG offset, ULONG value);
-ULONGLONG OctnicReadCtrl64(PPORT_CONTEXT portCtx, ULONG offset);
-VOID OctnicWriteCtrl64(PPORT_CONTEXT portCtx, ULONG offset, ULONGLONG value);
+VOID  OctnicWriteCtrl(PPORT_CONTEXT portCtx, ULONG offset, ULONG value);
 
-/* Memory operations */
-VOID OctnicPioWrite(PVOID barBase, ULONG offset, const VOID* data, ULONG len);
-VOID OctnicPioRead(PVOID barBase, ULONG offset, VOID* data, ULONG len);
+/* ---- tx.c ---- */
+VOID OctnicSendNetBufferLists(NDIS_HANDLE ctx, PNET_BUFFER_LIST nblList, NDIS_PORT_NUMBER port, ULONG sendFlags);
+VOID OctnicTxCleanup(PPORT_CONTEXT portCtx);
 
-/* NDIS helpers */
-NTSTATUS OctnicAllocateNetBufferListPool(PDRIVER_CONTEXT drvCtx);
-VOID OctnicFreeNetBufferListPool(PDRIVER_CONTEXT drvCtx);
+/* ---- rx.c ---- */
+KDEFERRED_ROUTINE OctnicDpcTimer;
+ULONG OctnicDrainRing(PPORT_CONTEXT portCtx, ULONG tid, ULONG budget);
+VOID  OctnicRxCleanup(PPORT_CONTEXT portCtx);
+VOID  OctnicReturnNetBufferLists(NDIS_HANDLE ctx, PNET_BUFFER_LIST nblList, ULONG returnFlags);
 
-/* MAC address / OID handling */
-NDIS_STATUS OctnicQueryInformation(NDIS_HANDLE miniportContext, NDIS_OID oid,
-                                   PVOID buffer, ULONG bufferLength,
-                                   PULONG bytesWritten, PULONG bytesNeeded);
-NDIS_STATUS OctnicSetInformation(NDIS_HANDLE miniportContext, NDIS_OID oid,
-                                 PVOID buffer, ULONG bufferLength,
-                                 PULONG bytesRead, PULONG bytesNeeded);
+/* ---- utils.c: RX pool ---- */
+NDIS_STATUS OctnicRxPoolCreate(PDRIVER_CONTEXT drvCtx);
+VOID        OctnicRxPoolDestroy(PDRIVER_CONTEXT drvCtx);
+PRX_BUF     OctnicRxBufGet(PDRIVER_CONTEXT drvCtx);
+VOID        OctnicRxBufPut(PDRIVER_CONTEXT drvCtx, PRX_BUF rb);
 
-/* Statistics */
-VOID OctnicQueryStatistics(PDRIVER_CONTEXT drvCtx, PNDIS_MINIPORT_STATISTICS stats);
+/* ---- oid.c ---- */
+extern const NDIS_OID g_SupportedOids[];
+extern const ULONG    g_SupportedOidCount;
+NDIS_STATUS OctnicOidRequest(NDIS_HANDLE ctx, PNDIS_OID_REQUEST req);
+
+/* ---- watchdog.c ---- */
+NDIS_STATUS OctnicWatchdogInit(PDRIVER_CONTEXT drvCtx);
+VOID        OctnicWatchdogCleanup(PDRIVER_CONTEXT drvCtx);

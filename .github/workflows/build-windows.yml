@@ -34,22 +34,37 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      - name: Install WDK (if missing)
+        shell: pwsh
+        run: |
+          $sdk = "10.0.26100.0"
+          $ndis = "C:\Program Files (x86)\Windows Kits\10\Include\$sdk\km\ndis.h"
+          Write-Host "Installed SDK includes:"
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -ErrorAction SilentlyContinue | ForEach-Object Name
+          if (!(Test-Path $ndis)) {
+            Write-Host "WDK km headers missing, installing WDK..."
+            Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2272234" -OutFile wdksetup.exe
+            $p = Start-Process -FilePath .\wdksetup.exe -ArgumentList "/features + /q" -Wait -PassThru
+            Write-Host "wdksetup exit code: $($p.ExitCode)"
+          }
+          if (!(Test-Path $ndis)) { Write-Error "ndis.h still missing: $ndis"; exit 1 }
+          # VS integration (WindowsKernelModeDriver10.0 toolset)
+          $toolset = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\*\MSBuild\Microsoft\VC\*\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0" -ErrorAction SilentlyContinue
+          if (!$toolset) {
+            $vsix = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Vsix\VS2022" -Recurse -Filter WDK.vsix -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (!$vsix) { Write-Error "WDK.vsix not found"; exit 1 }
+            $inst = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\*\Common7\IDE\VSIXInstaller.exe" | Select-Object -First 1
+            Write-Host "Installing $($vsix.FullName)"
+            $p = Start-Process -FilePath $inst.FullName -ArgumentList "/q /a `"$($vsix.FullName)`"" -Wait -PassThru
+            Write-Host "VSIXInstaller exit code: $($p.ExitCode)"
+          }
+
       - name: Build with msbuild (vcxproj)
         working-directory: winmod
-        run: |
-          Write-Host "=== Building octnic.sys ==="
-          # Use full path to MSBuild.exe on windows-2022
-          $msbuildPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe"
-          if (!(Test-Path $msbuildPath)) {
-            Write-Error "MSBuild not found at $msbuildPath"
-            exit 1
-          }
-          & $msbuildPath octnic.vcxproj `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /p:WindowsTargetPlatformVersion=10.0.26100.0 `
-            /m /v:minimal /nologo
         shell: pwsh
+        run: |
+          msbuild octnic.vcxproj /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify output
         run: |

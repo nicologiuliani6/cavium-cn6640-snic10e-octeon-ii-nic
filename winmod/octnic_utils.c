@@ -1,76 +1,88 @@
 /* SPDX-License-Identifier: GPL-2.0
- * octnic_utils.c — Windows NDIS miniport driver for Cavium CN6640 SNIC10E.
- * Utility functions: NetBufferList pool allocation, cloning, cleanup.
+ * octnic_utils.c — preallocated RX buffer pool (NBL + MDL + data).
  */
 
 #include "octnic.h"
 
-/* ============================================================
- * NetBufferList pool allocation
- * ============================================================ */
-NTSTATUS OctnicAllocateNetBufferListPool(PDRIVER_CONTEXT drvCtx)
+NDIS_STATUS OctnicRxPoolCreate(PDRIVER_CONTEXT d)
 {
-    NDIS_STATUS status;
-    NDIS_NET_BUFFER_LIST_POOL_CONFIGURATION poolConfig;
-
-    DPRINT(DBG_INIT, "OctnicAllocateNetBufferListPool: allocating");
-
-    /* Initialize pool configuration for NDIS 6.x */
-    NdisZeroMemory(&poolConfig, sizeof(poolConfig));
-    poolConfig.Header.Type = NDIS_OBJECT_TYPE_DEFAULT;
-    poolConfig.Header.Revision = NDIS_NET_BUFFER_LIST_POOL_CONFIGURATION_REVISION_1;
-    poolConfig.Header.Size = sizeof(poolConfig);
-    poolConfig.fAllocateNetBuffer = TRUE;
-    poolConfig.ContextSize = 0;
-    poolConfig.NumNetBufferLists = RING_SZ * drvCtx->numPorts * 4;
-    poolConfig.PoolTag = 'CINo';
-
-    /* Create the pool — first param is the miniport adapter handle */
-    status = NdisMAllocateNetBufferListPool(
-        drvCtx->ndisMiniportHandle,
-        &poolConfig,
-        &drvCtx->ports[0].netBufferListPool
-    );
-
-    if (status != NDIS_STATUS_SUCCESS) {
-        DPRINT(DBG_ERROR, "OctnicAllocateNetBufferListPool: failed %08X", status);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    DPRINT(DBG_INIT, "OctnicAllocateNetBufferListPool: pool created successfully");
-    return STATUS_SUCCESS;
-}
-
-/* ============================================================
- * NetBufferList pool cleanup
- * ============================================================ */
-VOID OctnicFreeNetBufferListPool(PDRIVER_CONTEXT drvCtx)
-{
+    NET_BUFFER_LIST_POOL_PARAMETERS pp;
     ULONG i;
 
-    DPRINT(DBG_INIT, "OctnicFreeNetBufferListPool: freeing");
+    RtlZeroMemory(&pp, sizeof(pp));
+    pp.Header.Type     = NDIS_OBJECT_TYPE_DEFAULT;
+    pp.Header.Revision = NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+    pp.Header.Size     = NDIS_SIZEOF_NET_BUFFER_LIST_POOL_PARAMETERS_REVISION_1;
+    pp.ProtocolId      = NDIS_PROTOCOL_ID_DEFAULT;
+    pp.fAllocateNetBuffer = TRUE;
+    pp.PoolTag         = OCTNIC_TAG;
 
-    for (i = 0; i < drvCtx->numPorts && i < MAX_PORTS; i++) {
-        if (drvCtx->ports[i].netBufferListPool) {
-            NdisMFreeNetBufferListPool(drvCtx->ports[i].netBufferListPool);
-            drvCtx->ports[i].netBufferListPool = NULL;
-        }
+    d->nblPool = NdisAllocateNetBufferListPool(d->adapterHandle, &pp);
+    if (d->nblPool == NULL) return NDIS_STATUS_RESOURCES;
+
+    d->rxBufs = NdisAllocateMemoryWithTagPriority(d->adapterHandle,
+                    RX_POOL_TOTAL * sizeof(RX_BUF), OCTNIC_TAG, NormalPoolPriority);
+    if (d->rxBufs == NULL) {
+        OctnicRxPoolDestroy(d);
+        return NDIS_STATUS_RESOURCES;
     }
+    RtlZeroMemory(d->rxBufs, RX_POOL_TOTAL * sizeof(RX_BUF));
 
-    DPRINT(DBG_INIT, "OctnicFreeNetBufferListPool: freed");
+    for (i = 0; i < RX_POOL_TOTAL; i++) {
+        PRX_BUF rb = &d->rxBufs[i];
+        rb->data = NdisAllocateMemoryWithTagPriority(d->adapterHandle, BUF_SZ,
+                        OCTNIC_TAG, NormalPoolPriority);
+        if (rb->data == NULL) goto fail;
+        rb->mdl = NdisAllocateMdl(d->adapterHandle, rb->data, BUF_SZ);
+        if (rb->mdl == NULL) goto fail;
+        rb->nbl = NdisAllocateNetBufferAndNetBufferList(d->nblPool, 0, 0, rb->mdl, 0, 0);
+        if (rb->nbl == NULL) goto fail;
+        rb->nbl->MiniportReserved[0] = rb;
+        InsertTailList(&d->rxFree, &rb->link);
+    }
+    return NDIS_STATUS_SUCCESS;
+
+fail:
+    OctnicRxPoolDestroy(d);
+    return NDIS_STATUS_RESOURCES;
 }
 
-/* ============================================================
- * MAC address validation
- * ============================================================ */
-BOOLEAN OctnicValidateMacAddress(PVOID macAddress, ULONG length)
+VOID OctnicRxPoolDestroy(PDRIVER_CONTEXT d)
 {
-    if (macAddress == NULL || length != ETH_ALEN) return FALSE;
-
-    PUCHAR mac = (PUCHAR)macAddress;
-    BOOLEAN allZero = TRUE;
-    for (ULONG i = 0; i < ETH_ALEN; i++) {
-        if (mac[i] != 0) { allZero = FALSE; break; }
+    ULONG i;
+    if (d->rxBufs) {
+        for (i = 0; i < RX_POOL_TOTAL; i++) {
+            PRX_BUF rb = &d->rxBufs[i];
+            if (rb->nbl)  NdisFreeNetBufferList(rb->nbl);
+            if (rb->mdl)  NdisFreeMdl(rb->mdl);
+            if (rb->data) NdisFreeMemory(rb->data, 0, 0);
+        }
+        NdisFreeMemory(d->rxBufs, 0, 0);
+        d->rxBufs = NULL;
     }
-    return !allZero;
+    InitializeListHead(&d->rxFree);
+    if (d->nblPool) {
+        NdisFreeNetBufferListPool(d->nblPool);
+        d->nblPool = NULL;
+    }
+}
+
+PRX_BUF OctnicRxBufGet(PDRIVER_CONTEXT d)
+{
+    KIRQL irql;
+    PRX_BUF rb = NULL;
+    KeAcquireSpinLock(&d->rxLock, &irql);
+    if (!IsListEmpty(&d->rxFree)) {
+        rb = CONTAINING_RECORD(RemoveHeadList(&d->rxFree), RX_BUF, link);
+    }
+    KeReleaseSpinLock(&d->rxLock, irql);
+    return rb;
+}
+
+VOID OctnicRxBufPut(PDRIVER_CONTEXT d, PRX_BUF rb)
+{
+    KIRQL irql;
+    KeAcquireSpinLock(&d->rxLock, &irql);
+    InsertTailList(&d->rxFree, &rb->link);
+    KeReleaseSpinLock(&d->rxLock, irql);
 }

@@ -1,154 +1,108 @@
 /* SPDX-License-Identifier: GPL-2.0
- * octnic_tx.c — Windows NDIS miniport driver for Cavium CN6640 SNIC10E.
- * TX path: NDIS SendPackets -> CAS slot claim -> PIO write into BAR2 TX buffer.
+ * octnic_tx.c — TX path: NBL -> CAS slot claim -> PIO write into BAR2 TX buffer.
  */
 
 #include "octnic.h"
 
-/* ============================================================
- * TX transmit — called by NDIS when packets arrive
- *
- * NDIS 6.x signature: SendPackets(MiniportAdapterContext, PacketList, SendFlags)
- * PacketList is a PNDIS_PACKET_LIST (linked list of NBLs).
- * ============================================================ */
-VOID OctnicSendPackets(NDIS_HANDLE miniportContext, PNDIS_PACKET_LIST packetList,
-                        NDIS_SEND_PACKETS_FLAGS sendFlags)
+/* Copy a NET_BUFFER's payload (MDL chain) to dst. */
+static BOOLEAN OctnicCopyNb(PNET_BUFFER nb, PUCHAR dst, ULONG len)
 {
-    PDRIVER_CONTEXT drvCtx = &g_DriverContext;
-    ULONG sent = 0;
-    ULONG dropped = 0;
+    PMDL mdl = NET_BUFFER_CURRENT_MDL(nb);
+    ULONG off = NET_BUFFER_CURRENT_MDL_OFFSET(nb);
 
-    DPRINT(DBG_TX, "OctnicSendPackets: %u packets", packetList->NumberOfPackets);
-    UNREFERENCED_PARAMETER(miniportContext);
-    UNREFERENCED_PARAMETER(sendFlags);
+    while (len > 0 && mdl != NULL) {
+        PVOID va;
+        ULONG mlen, n;
+        NdisQueryMdl(mdl, &va, &mlen, NormalPagePriority | MdlMappingNoExecute);
+        if (va == NULL) return FALSE;
+        if (mlen > off) {
+            n = mlen - off;
+            if (n > len) n = len;
+            RtlCopyMemory(dst, (PUCHAR)va + off, n);
+            dst += n;
+            len -= n;
+        }
+        off = (off > mlen) ? off - mlen : 0;
+        mdl = mdl->Next;
+    }
+    return len == 0;
+}
 
-    /* Iterate over the packet list */
-    PNDIS_PACKET_LIST current = packetList;
-    while (current != NULL) {
-        /* Each entry in the linked list is an NBL */
-        PNET_BUFFER_LIST nbl = current->PacketList;
+static NDIS_STATUS OctnicTransmitFrame(PPORT_CONTEXT p, PNET_BUFFER nb)
+{
+    ULONG len = NET_BUFFER_DATA_LENGTH(nb);
+    ULONG claim, slot;
+    volatile struct octshm_desc* desc;
 
-        /* Process each NetBuffer in this NBL */
-        for (PNET_BUFFER netBuffer = NdisGetFirstNetBuffer(nbl);
-             netBuffer != NULL;
-             netBuffer = NdisGetNextNetBuffer(netBuffer)) {
+    if (len == 0 || len > BUF_SZ) return NDIS_STATUS_INVALID_LENGTH;
 
-            /* Round-robin across ports */
-            PPORT_CONTEXT portCtx = &drvCtx->ports[current->CurrentPacket % drvCtx->numPorts];
+    /* CAS-claim a slot (parallel TX producers) */
+    for (;;) {
+        claim = p->txClaim;
+        if ((claim - p->txConsCache) >= RING_SZ) {
+            ULONG tc = OctnicReadCtrl(p, C_TX_CONS);
+            p->txConsCache = tc;
+            if ((claim - tc) >= RING_SZ) return NDIS_STATUS_RESOURCES;   /* ring full */
+        }
+        if ((ULONG)InterlockedCompareExchange((volatile LONG*)&p->txClaim,
+                                              (LONG)(claim + 1), (LONG)claim) == claim)
+            break;
+    }
 
-            NTSTATUS status = OctnicTransmitFrame(portCtx, netBuffer);
-            if (status == STATUS_SUCCESS) {
-                sent++;
-            } else if (status == STATUS_BUFFER_TOO_SMALL || status == STATUS_TRY_AGAIN) {
-                dropped++;
-                /* Ring full — free this packet */
-                NdisMDiscardNetBufferList(nbl);
-                break;
+    slot = claim & RING_MASK;
+    if (!OctnicCopyNb(nb, p->portBase + TXBUF_OFF + (SIZE_T)slot * BUF_SZ, len)) {
+        /* slot already claimed: publish an empty frame so the card does not stall */
+        len = 0;
+    }
+    _mm_mfence();
+
+    desc = (volatile struct octshm_desc*)(p->portBase + TXDESC_OFF + slot * sizeof(struct octshm_desc));
+    desc->len = len;
+    _mm_mfence();
+    desc->flags = TX_PHASE(claim);       /* last write marks the slot ready */
+    _mm_mfence();
+
+    p->txProdShadow = claim + 1;
+    return len ? NDIS_STATUS_SUCCESS : NDIS_STATUS_FAILURE;
+}
+
+VOID OctnicSendNetBufferLists(NDIS_HANDLE ctx, PNET_BUFFER_LIST nblList,
+                              NDIS_PORT_NUMBER port, ULONG sendFlags)
+{
+    PDRIVER_CONTEXT d = &g_DriverContext;
+    PNET_BUFFER_LIST nbl;
+    ULONG completeFlags = NDIS_TEST_SEND_AT_DISPATCH_LEVEL(sendFlags) ?
+                          NDIS_SEND_COMPLETE_FLAGS_DISPATCH_LEVEL : 0;
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(port);
+
+    for (nbl = nblList; nbl != NULL; nbl = NET_BUFFER_LIST_NEXT_NBL(nbl)) {
+        PNET_BUFFER nb;
+        NDIS_STATUS st = NDIS_STATUS_SUCCESS;
+
+        for (nb = NET_BUFFER_LIST_FIRST_NB(nbl); nb != NULL; nb = NET_BUFFER_NEXT_NB(nb)) {
+            ULONG len = NET_BUFFER_DATA_LENGTH(nb);
+            NDIS_STATUS s = (d->cardLost || !d->ports[0].initialized) ?
+                            NDIS_STATUS_MEDIA_DISCONNECTED :
+                            OctnicTransmitFrame(&d->ports[0], nb);
+            if (s == NDIS_STATUS_SUCCESS) {
+                InterlockedIncrement64(&d->txPkts);
+                InterlockedAdd64(&d->txBytes, len);
             } else {
-                dropped++;
-                NdisMDiscardNetBufferList(nbl);
-                break;
+                InterlockedIncrement64(&d->txErrors);
+                st = s;
             }
         }
-
-        current = current->Next;
+        NET_BUFFER_LIST_STATUS(nbl) = st;
     }
 
-    DPRINT(DBG_TX, "OctnicSendPackets: sent=%u dropped=%u", sent, dropped);
+    NdisMSendNetBufferListsComplete(d->adapterHandle, nblList, completeFlags);
 }
 
-/* ============================================================
- * Transmit a single NetBuffer — CAS slot claim + PIO write
- * ============================================================ */
-NTSTATUS OctnicTransmitFrame(PPORT_CONTEXT portCtx, PNET_BUFFER netBuffer)
+VOID OctnicTxCleanup(PPORT_CONTEXT p)
 {
-    PDRIVER_CONTEXT drvCtx = (PDRIVER_CONTEXT)((CHAR*)portCtx - FIELD_OFFSET(DRIVER_CONTEXT, ports[0]));
-    ULONG len;
-
-    /* Get buffer length */
-    len = NdisGetNetBufferLength(netBuffer);
-    if (len == 0 || len > BUF_SZ) {
-        DPRINT(DBG_ERROR, "OctnicTransmitFrame: invalid len %lu", len);
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-
-    /* CAS-claim a slot — parallel TX producer */
-    ULONG txClaim = portCtx->txClaim;
-    ULONG txConsCache = portCtx->txConsCache;
-
-    /* Check if ring is full */
-    if ((txClaim - txConsCache) >= RING_SZ) {
-        /* Read current card consumer */
-        ULONG tc = OctnicReadCtrl(portCtx, C_TX_CONS);
-        portCtx->txConsCache = tc;
-
-        if ((txClaim - tc) >= RING_SZ) {
-            DPRINT(DBG_TX, "OctnicTransmitFrame: ring full");
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-    }
-
-    /* Atomic CAS to claim slot */
-    LONG oldVal = InterlockedCompareExchange(
-        (LONG volatile*)&portCtx->txClaim,
-        (LONG)(txClaim + 1),
-        (LONG)txClaim
-    );
-
-    if (oldVal != (LONG)txClaim) {
-        /* CAS failed — retry with new value */
-        return STATUS_TRY_AGAIN;
-    }
-
-    /* Calculate slot index and actual length */
-    ULONG slot = txClaim & RING_MASK;
-    ULONG actualLen = (len > BUF_SZ) ? BUF_SZ : len;
-
-    /* PIO write: host writes frame data into BAR2 TX buffer */
-    PVOID txBuf = (PBYTE)portCtx->portBase + TXBUF_OFF + slot * BUF_SZ;
-    ULONG dataLen = 0;
-    UCHAR* data = NdisGetNetBufferContents(netBuffer, &dataLen);
-    if (data != NULL && dataLen >= actualLen) {
-        RtlCopyMemory(txBuf, data, actualLen);
-    }
-
-    /* Memory barrier before writing descriptor */
-    _mm_mfence();
-
-    /* Write descriptor: length */
-    struct octshm_desc* desc = (struct octshm_desc*)((PBYTE)portCtx->portBase + TXDESC_OFF + slot * 8);
-    desc->len = actualLen;
-
-    /* Memory barrier before writing phase */
-    _mm_mfence();
-
-    /* Write descriptor: phase (last write to mark slot as ready) */
-    desc->flags = TX_PHASE(txClaim);
-
-    /* Final memory barrier */
-    _mm_mfence();
-
-    /* Update statistics */
-    portCtx->txProdShadow = txClaim + 1;
-
-    DPRINT(DBG_TX, "OctnicTransmitFrame: slot=%lu len=%lu phase=%u",
-           slot, actualLen, TX_PHASE(txClaim));
-
-    return STATUS_SUCCESS;
-}
-
-/* ============================================================
- * TX cleanup — called during halt or reset
- * ============================================================ */
-VOID OctnicTxCleanup(PPORT_CONTEXT portCtx)
-{
-    DPRINT(DBG_TX, "OctnicTxCleanup: clearing TX state for port%lu", portCtx->idx);
-
-    /* Reset TX producer counter */
-    portCtx->txClaim = 0;
-    portCtx->txProdShadow = 0;
-    portCtx->txConsCache = 0;
-
-    /* Clear host ready to stop TX */
-    OctnicWriteCtrl(portCtx, C_HOST_READY, 0);
+    p->txClaim = 0;
+    p->txProdShadow = 0;
+    p->txConsCache = 0;
+    OctnicWriteCtrl(p, C_HOST_READY, 0);
 }

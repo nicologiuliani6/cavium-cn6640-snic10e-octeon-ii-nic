@@ -1,227 +1,177 @@
 /* SPDX-License-Identifier: GPL-2.0
- * octnic_main.c — Windows NDIS miniport driver for Cavium CN6640 SNIC10E shared-memory NIC.
+ * octnic_main.c — Windows NDIS 6.20 miniport driver for Cavium CN6640 SNIC10E.
+ * DriverEntry, NDIS handler glue, BAR2 register helpers.
  *
- * Translates the Linux host-side octnic driver to Windows NDIS 6.x kernel-mode.
- * Registers two network adapters (oct0, oct1) over the card's BAR2 shared-memory window.
- *
- * Architecture:
- *   - BAR2 maps the card's DRAM (4MB per port) with write-combining (WC) memory type
- *   - Per-port: control page, TX descriptor ring, RX descriptor ring, TX/RX buffers
- *   - TX: host PIO writes frames into the BAR2 TX buffer (write-combining for performance)
- *   - RX: kernel-mode DPC timer drains the card->host RX ring into NDIS indication frames
- *   - DMA mode (optional): card DPI DMA-writes host RAM, descriptors in local host RAM
- *
- * Build with WDK. Tested on Windows 10/11 x64.
+ * Datapath (same as Linux octnic): BAR2 shared-memory rings.
+ *   TX: host PIO-writes frames into the BAR2 TX buffer.
+ *   RX: KTIMER+DPC polling drains the RX ring into preallocated NBLs.
  */
 
 #include "octnic.h"
 
-/* ============================================================
- * Global driver state
- * ============================================================ */
-static DRIVER_CONTEXT g_DriverContext;
+DRIVER_CONTEXT g_DriverContext;
 
-/* ============================================================
- * BAR2 access helpers — WC mapping for TX performance
- * ============================================================ */
-
-/* Read 32-bit control field from port's control page */
+/* ---- BAR2 access helpers ---- */
 ULONG OctnicReadCtrl(PPORT_CONTEXT portCtx, ULONG offset)
 {
-    return *(volatile ULONG*)((PBYTE)portCtx->portBase + offset);
+    return *(volatile ULONG*)(portCtx->portBase + offset);
 }
 
-/* Write 32-bit control field to port's control page */
 VOID OctnicWriteCtrl(PPORT_CONTEXT portCtx, ULONG offset, ULONG value)
 {
-    *(volatile ULONG*)((PBYTE)portCtx->portBase + offset) = value;
-    /* Memory barrier: ensure ordering of BAR2 writes */
+    *(volatile ULONG*)(portCtx->portBase + offset) = value;
     _mm_mfence();
 }
 
-/* Read 64-bit control field from port's control page */
-ULONGLONG OctnicReadCtrl64(PPORT_CONTEXT portCtx, ULONG offset)
+/* ---- NDIS handlers ---- */
+MINIPORT_INITIALIZE             OctnicInitializeEx;
+MINIPORT_HALT                   OctnicHaltEx;
+MINIPORT_UNLOAD                 OctnicUnload;
+MINIPORT_PAUSE                  OctnicPause;
+MINIPORT_RESTART                OctnicRestart;
+MINIPORT_CANCEL_SEND            OctnicCancelSend;
+MINIPORT_CHECK_FOR_HANG         OctnicCheckForHang;
+MINIPORT_RESET                  OctnicResetEx;
+MINIPORT_DEVICE_PNP_EVENT_NOTIFY OctnicPnpEvent;
+MINIPORT_SHUTDOWN               OctnicShutdown;
+MINIPORT_CANCEL_OID_REQUEST     OctnicCancelOidRequest;
+
+NDIS_STATUS OctnicInitializeEx(NDIS_HANDLE adapterHandle, NDIS_HANDLE driverContext,
+                               PNDIS_MINIPORT_INIT_PARAMETERS ip)
 {
-    return *(volatile ULONGLONG*)((PBYTE)portCtx->portBase + offset);
+    UNREFERENCED_PARAMETER(driverContext);
+    return OctnicMiniportInitialize(adapterHandle, ip);
 }
 
-/* Write 64-bit control field to port's control page */
-VOID OctnicWriteCtrl64(PPORT_CONTEXT portCtx, ULONG offset, ULONGLONG value)
+VOID OctnicHaltEx(NDIS_HANDLE ctx, NDIS_HALT_ACTION action)
 {
-    *(volatile ULONGLONG*)((PBYTE)portCtx->portBase + offset) = value;
-    _mm_mfence();
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(action);
+    OctnicMiniportHalt();
 }
 
-/* PIO write: host writes frame data into BAR2 TX buffer */
-VOID OctnicPioWrite(PVOID barBase, ULONG offset, const VOID* data, ULONG len)
+NDIS_STATUS OctnicPause(NDIS_HANDLE ctx, PNDIS_MINIPORT_PAUSE_PARAMETERS pp)
 {
-    RtlCopyMemory((PBYTE)barBase + offset, data, len);
-    /* Write-combining memory is already non-temporal; no extra barrier needed for posted writes */
+    PDRIVER_CONTEXT d = &g_DriverContext;
+    LARGE_INTEGER wait;
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(pp);
+
+    OctnicDpcStopAll(d);
+    /* NDIS has stopped sends; wait until protocols return every indicated NBL. */
+    wait.QuadPart = -10000LL;   /* 1 ms */
+    while (d->rxOutstanding > 0) {
+        KeDelayExecutionThread(KernelMode, FALSE, &wait);
+    }
+    return NDIS_STATUS_SUCCESS;
 }
 
-/* PIO read: host reads frame data from BAR2 RX buffer (or local RAM in DMA mode) */
-VOID OctnicPioRead(PVOID barBase, ULONG offset, VOID* data, ULONG len)
+NDIS_STATUS OctnicRestart(NDIS_HANDLE ctx, PNDIS_MINIPORT_RESTART_PARAMETERS rp)
 {
-    RtlCopyMemory(data, (PBYTE)barBase + offset, len);
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(rp);
+    OctnicDpcStartAll(&g_DriverContext);
+    return NDIS_STATUS_SUCCESS;
 }
 
-/* ============================================================
- * NDIS miniport characteristics — function pointers for NDIS 6.x
- * ============================================================ */
-static NDIS_MINIPORT_CHARACTERISTICS OctnicMiniportChars;
-
-static VOID
-OctnicMiniportCancelSendPackets(
-    IN NDIS_HANDLE MiniportCancelSendPacketsContext,
-    IN PNDIS_PACKET Packet)
+VOID OctnicCancelSend(NDIS_HANDLE ctx, PVOID cancelId)
 {
-    UNREFERENCED_PARAMETER(MiniportCancelSendPacketsContext);
-    UNREFERENCED_PARAMETER(Packet);
+    /* ponytail: sends complete synchronously, nothing to cancel */
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(cancelId);
 }
 
-static NDIS_STATUS
-OctnicMiniportQueryInformationHandler(
-    IN NDIS_HANDLE AdapterHandle,
-    IN NDIS_OID Oid,
-    IN PVOID InformationBuffer,
-    IN ULONG InformationBufferLength,
-    OUT PULONG BytesWritten,
-    OUT PULONG BytesNeeded)
+BOOLEAN OctnicCheckForHang(NDIS_HANDLE ctx)
 {
-    return OctnicQueryInformation(AdapterHandle, Oid, InformationBuffer,
-                                   InformationBufferLength, BytesWritten, BytesNeeded);
+    UNREFERENCED_PARAMETER(ctx);
+    return g_DriverContext.cardLost;
 }
 
-static NDIS_STATUS
-OctnicMiniportSetInformationHandler(
-    IN NDIS_HANDLE AdapterHandle,
-    IN NDIS_OID Oid,
-    IN PVOID InformationBuffer,
-    IN ULONG InformationBufferLength,
-    OUT PULONG BytesRead,
-    OUT PULONG BytesNeeded)
+NDIS_STATUS OctnicResetEx(NDIS_HANDLE ctx, PBOOLEAN addressingReset)
 {
-    return OctnicSetInformation(AdapterHandle, Oid, InformationBuffer,
-                                 InformationBufferLength, BytesRead, BytesNeeded);
+    UNREFERENCED_PARAMETER(ctx);
+    *addressingReset = FALSE;
+    OctnicMiniportReset();
+    return NDIS_STATUS_SUCCESS;
 }
 
-static VOID
-OctnicMiniportResetHandler(
-    IN NDIS_HANDLE MiniportAdapterContext,
-    OUT PBOOLEAN MediumChanged)
+VOID OctnicPnpEvent(NDIS_HANDLE ctx, PNET_DEVICE_PNP_EVENT ev)
 {
-    OctnicMiniportReset(MiniportAdapterContext, MediumChanged);
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(ev);
 }
 
-static VOID
-OctnicMiniportSendPacketsHandler(
-    IN NDIS_HANDLE MiniportAdapterContext,
-    IN PNDIS_PACKET_LIST PacketList,
-    IN NDIS_SEND_PACKETS_FLAGS SendFlags)
+VOID OctnicShutdown(NDIS_HANDLE ctx, NDIS_SHUTDOWN_ACTION action)
 {
-    OctnicSendPackets(MiniportAdapterContext, PacketList, SendFlags);
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(action);
 }
 
-static NDIS_STATUS
-OctnicMiniportTransferData(
-    IN NDIS_HANDLE MiniportAdapterContext,
-    IN PNDIS_PACKET Packet,
-    IN ULONG BytesToTransfer)
+VOID OctnicCancelOidRequest(NDIS_HANDLE ctx, PVOID requestId)
 {
-    UNREFERENCED_PARAMETER(MiniportAdapterContext);
-    UNREFERENCED_PARAMETER(Packet);
-    UNREFERENCED_PARAMETER(BytesToTransfer);
-    return NDIS_STATUS_NOT_SUPPORTED;
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(requestId);
 }
 
-static VOID
-OctnicMiniportHaltHandler(
-    IN NDIS_HANDLE MiniportAdapterContext,
-    IN NDIS_HALT_ACTION HaltAction)
+VOID OctnicUnload(PDRIVER_OBJECT driverObject)
 {
-    OctnicMiniportHalt(MiniportAdapterContext, HaltAction);
+    UNREFERENCED_PARAMETER(driverObject);
+    DPRINT(DBG_INIT, "unload");
+    if (g_DriverContext.driverHandle) {
+        NdisMDeregisterMiniportDriver(g_DriverContext.driverHandle);
+        g_DriverContext.driverHandle = NULL;
+    }
 }
 
-/* ============================================================
- * DriverEntry — NT driver entry point + NDIS registration
- * ============================================================ */
-NTSTATUS
-DriverEntry(
-    IN PDRIVER_OBJECT DriverObject,
-    IN PUNICODE_STRING RegistryPath)
+/* ---- DriverEntry ---- */
+DRIVER_INITIALIZE DriverEntry;
+
+NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
 {
+    NDIS_MINIPORT_DRIVER_CHARACTERISTICS chars;
     NDIS_STATUS status;
-    ULONG regVersion;
 
-    DPRINT(DBG_INIT, "DriverEntry: loading octnic Windows driver");
+    DPRINT(DBG_INIT, "DriverEntry");
 
-    /* Initialize global driver context */
-    RtlZeroMemory(&g_DriverContext, sizeof(DRIVER_CONTEXT));
-    g_DriverContext.ndisMiniportHandle = NULL;
-    g_DriverContext.bar2Mapping = NULL;
-    g_DriverContext.numPorts = DEFAULT_PORTS;
-    g_DriverContext.hrx = DEFAULT_HRX;
-    g_DriverContext.rxThreads = DEFAULT_RXTHREADS;
-    g_DriverContext.nTxQ = DEFAULT_NTXQ;
-    g_DriverContext.pollUs = DEFAULT_POLL_US;
-    g_DriverContext.lockfree = TRUE;
-    g_DriverContext.ztx = FALSE;
-    g_DriverContext.dmaMode = TRUE;
+    RtlZeroMemory(&g_DriverContext, sizeof(g_DriverContext));
+    g_DriverContext.numPorts   = DEFAULT_PORTS;
+    g_DriverContext.hrx        = DEFAULT_HRX;
+    g_DriverContext.rxThreads  = DEFAULT_RXTHREADS;
+    g_DriverContext.pollMs     = DEFAULT_POLL_MS;
+    g_DriverContext.lockfree   = TRUE;
+    KeInitializeSpinLock(&g_DriverContext.rxLock);
+    InitializeListHead(&g_DriverContext.rxFree);
 
-    /* Initialize stop event for DPC shutdown */
-    KeInitializeEvent(&g_DriverContext.stopEvent, SynchronizationEvent, FALSE);
+    RtlZeroMemory(&chars, sizeof(chars));
+    chars.Header.Type     = NDIS_OBJECT_TYPE_MINIPORT_DRIVER_CHARACTERISTICS;
+    chars.Header.Size     = NDIS_SIZEOF_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2;
+    chars.Header.Revision = NDIS_MINIPORT_DRIVER_CHARACTERISTICS_REVISION_2;
+    chars.MajorNdisVersion = NDIS_MINIPORT_MAJOR_VERSION;
+    chars.MinorNdisVersion = NDIS_MINIPORT_MINOR_VERSION;
+    chars.MajorDriverVersion = 1;
+    chars.MinorDriverVersion = 0;
 
-    /* Initialize NDIS miniport characteristics structure */
-    NdisZeroMemory(&OctnicMiniportChars, sizeof(NDIS_MINIPORT_CHARACTERISTICS));
-    OctnicMiniportChars.Header.Type = NDIS_OBJECT_TYPE_MINIPORT_CHARACTERISTICS;
-    OctnicMiniportChars.Header.Size = sizeof(NDIS_MINIPORT_CHARACTERISTICS);
-    OctnicMiniportChars.Header.Revision = NDIS_MINIPORT_CHARACTERISTICS_REVISION_1;
+    chars.InitializeHandlerEx          = OctnicInitializeEx;
+    chars.HaltHandlerEx                = OctnicHaltEx;
+    chars.UnloadHandler                = OctnicUnload;
+    chars.PauseHandler                 = OctnicPause;
+    chars.RestartHandler               = OctnicRestart;
+    chars.OidRequestHandler            = OctnicOidRequest;
+    chars.SendNetBufferListsHandler    = OctnicSendNetBufferLists;
+    chars.ReturnNetBufferListsHandler  = OctnicReturnNetBufferLists;
+    chars.CancelSendHandler            = OctnicCancelSend;
+    chars.CheckForHangHandlerEx        = OctnicCheckForHang;
+    chars.ResetHandlerEx               = OctnicResetEx;
+    chars.DevicePnPEventNotifyHandler  = OctnicPnpEvent;
+    chars.ShutdownHandlerEx            = OctnicShutdown;
+    chars.CancelOidRequestHandler      = OctnicCancelOidRequest;
 
-    /* Required fields */
-    OctnicMiniportChars.MajorNdisVersion = NDIS_MINIPORT_MAJOR_VERSION;
-    OctnicMiniportChars.MinorNdisVersion = NDIS_MINIPORT_MINOR_VERSION;
-    OctnicMiniportChars.MajorDriverVersion = 1;
-    OctnicMiniportChars.MinorDriverVersion = 0;
-    OctnicMiniportChars.Flags = 0;
-
-    /* Function pointers */
-    OctnicMiniportChars.InitializeHandler = (PNDIS_MINIPORT_INIT_HANDLER)OctnicMiniportInitialize;
-    OctnicMiniportChars.HaltHandler = (PNDIS_MINIPORT_HALT_HANDLER)OctnicMiniportHaltHandler;
-    OctnicMiniportChars.QueryInformationHandler = (PNDIS_MINIPORT_QUERY_INFORMATION_HANDLER)OctnicMiniportQueryInformationHandler;
-    OctnicMiniportChars.SetInformationHandler = (PNDIS_MINIPORT_SET_INFORMATION_HANDLER)OctnicMiniportSetInformationHandler;
-    OctnicMiniportChars.ResetHandler = (PNDIS_MINIPORT_RESET_HANDLER)OctnicMiniportResetHandler;
-    OctnicMiniportChars.SendPacketsHandler = (PNDIS_MINIPORT_SEND_PACKETS_HANDLER)OctnicMiniportSendPacketsHandler;
-    OctnicMiniportChars.TransferDataHandler = (PNDIS_MINIPORT_TRANSFER_DATA_HANDLER)OctnicMiniportTransferData;
-    OctnicMiniportChars.CancelSendPacketsHandler = (PNDIS_MINIPORT_CANCEL_SEND_PACKETS_HANDLER)OctnicMiniportCancelSendPackets;
-
-    /* Register with NDIS as a miniport driver */
-    status = NdisMRegisterMiniport(
-        DriverObject,
-        &OctnicMiniportChars,
-        &regVersion,
-        &g_DriverContext.ndisMiniportHandle
-    );
-
+    status = NdisMRegisterMiniportDriver(driverObject, registryPath,
+                                         (NDIS_HANDLE)&g_DriverContext, &chars,
+                                         &g_DriverContext.driverHandle);
     if (status != NDIS_STATUS_SUCCESS) {
-        DPRINT(DBG_ERROR, "DriverEntry: NdisMRegisterMiniport failed with status %08X", status);
+        DPRINT(DBG_ERROR, "NdisMRegisterMiniportDriver failed %08X", status);
         return STATUS_UNSUCCESSFUL;
     }
-
-    /* Register DriverObject callbacks for PnP/power */
-    DriverObject->DriverUnload = OctnicDriverUnload;
-    DriverObject->MajorFunction[IRP_MJ_PNP] = IoDefaultDeviceHandler;
-    DriverObject->MajorFunction[IRP_MJ_POWER] = IoDefaultPowerHandler;
-
-    DPRINT(DBG_INIT, "DriverEntry: successfully registered with NDIS (version %lu)", regVersion);
     return STATUS_SUCCESS;
-}
-
-/* ============================================================
- * Driver unload — cleanup
- * ============================================================ */
-VOID OctnicDriverUnload(IN PDRIVER_OBJECT DriverObject)
-{
-    UNREFERENCED_PARAMETER(DriverObject);
-    DPRINT(DBG_INIT, "OctnicDriverUnload: driver unloading");
-    /* NDIS will call our HaltHandler; nothing extra needed here */
 }

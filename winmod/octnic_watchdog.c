@@ -1,138 +1,91 @@
 /* SPDX-License-Identifier: GPL-2.0
- * octnic_watchdog.c — Windows NDIS miniport driver for Cavium CN6640 SNIC10E.
- * Card health watchdog via IoAllocateWorkItem (runs at PASSIVE_LEVEL).
+ * octnic_watchdog.c — card health watchdog (NDIS timer, DISPATCH_LEVEL, BAR reads only).
  */
 
 #include "octnic.h"
 
-/* ============================================================
- * Card health check — monitors heartbeat, temps, PCIe config
- * ============================================================ */
-VOID OctnicCheckCardHealth(PDRIVER_CONTEXT drvCtx)
+#define WD_PERIOD_MS      2000
+#define WD_DEAD_100NS     (10LL * 10000000LL)    /* 10 s without heartbeat */
+#define TEMP_WARN_MC      85000
+#define TEMP_CRIT_MC      100000
+
+static VOID OctnicCheckCardHealth(PDRIVER_CONTEXT d)
 {
-    if (!drvCtx->bar2Mapping) return;
+    PPORT_CONTEXT p = &d->ports[0];
+    BOOLEAN lost = FALSE;
+    ULONG hb;
+    LARGE_INTEGER now;
+    LONG i, tmax = 0;
 
-    BOOLEAN cardLost = FALSE;
-    ULONG currentHeartbeat;
+    if (!d->bar2Mapping || !p->initialized) return;
 
-    /* Check heartbeat from port 0 */
-    if (drvCtx->numPorts > 0 && drvCtx->ports[0].initialized) {
-        currentHeartbeat = OctnicReadCtrl(&drvCtx->ports[0], C_HEARTBEAT);
+    KeQuerySystemTimePrecise(&now);
+    hb = OctnicReadCtrl(p, C_HEARTBEAT);
+    if (hb != d->lastHeartbeat) {
+        d->lastHeartbeat = hb;
+        d->heartbeatTime = now;
+    } else if (now.QuadPart - d->heartbeatTime.QuadPart > WD_DEAD_100NS) {
+        lost = TRUE;
+    }
+    if (OctnicReadCtrl(p, C_MAGIC) != OCTSHM_MAGIC) lost = TRUE;   /* BARs gone / reset */
 
-        /* Check if heartbeat is advancing */
-        if (currentHeartbeat == drvCtx->lastHeartbeat) {
-            LARGE_INTEGER currentTime;
-            KeQuerySystemTimePrecise(&currentTime);
-
-            /* Check if 10+ seconds have elapsed since last heartbeat change */
-            LONGLONG elapsed = currentTime.QuadPart - drvCtx->heartbeatJiffies.QuadPart;
-            if (elapsed > 100000000LL * 10) { /* 10 seconds in 100ns ticks */
-                cardLost = TRUE;
-                DPRINT(DBG_ERROR, "OctnicCheckCardHealth: heartbeat frozen — card hung!");
-            }
-        } else {
-            drvCtx->lastHeartbeat = currentHeartbeat;
-            KeQuerySystemTimePrecise(&drvCtx->heartbeatJiffies);
+    if (!lost) {
+        for (i = 0; i < 2; i++) {
+            LONG t = (LONG)OctnicReadCtrl(p, i == 0 ? C_RESV0 : C_RESV1);
+            if (t > tmax) tmax = t;
         }
-    } else {
-        cardLost = TRUE;
+        if (tmax >= TEMP_CRIT_MC)
+            DPRINT(DBG_ERROR, "CRITICAL card temperature %ld.%ldC", tmax / 1000, (tmax % 1000) / 100);
+        else if (tmax >= TEMP_WARN_MC)
+            DPRINT(DBG_ERROR, "high card temperature %ld.%ldC", tmax / 1000, (tmax % 1000) / 100);
     }
 
-    /* Check temperatures from port 0 */
-    if (!cardLost && drvCtx->numPorts > 0 && drvCtx->ports[0].initialized) {
-        LONG tempMax = 0;
-        for (ULONG i = 0; i < 2; i++) {
-            ULONG offset = (i == 0) ? C_RESV0 : C_RESV1;
-            LONG temp = (LONG)OctnicReadCtrl(&drvCtx->ports[0], offset);
-            if (temp > tempMax) tempMax = temp;
-        }
-
-        /* Temperature thresholds (millidegC) */
-        const LONG TEMP_WARN_MC = 85000;   /* 85°C */
-        const LONG TEMP_CRIT_MC = 100000;  /* 100°C */
-
-        if (tempMax >= TEMP_CRIT_MC) {
-            DPRINT(DBG_ERROR, "OctnicCheckCardHealth: CRITICAL TEMPERATURE %ld.%01dC",
-                   tempMax / 1000, (tempMax % 1000) / 100);
-        } else if (tempMax >= TEMP_WARN_MC) {
-            DPRINT(DBG_ERROR, "OctnicCheckCardHealth: HIGH TEMPERATURE %ld.%01dC",
-                   tempMax / 1000, (tempMax % 1000) / 100);
-        }
-    }
-
-    /* Update card lost state */
-    if (cardLost && !drvCtx->cardLost) {
-        drvCtx->cardLost = TRUE;
-        DPRINT(DBG_ERROR, "OctnicCheckCardHealth: CARD LOST — disabling all ports");
-        for (ULONG i = 0; i < drvCtx->numPorts && i < MAX_PORTS; i++) {
-            OctnicWriteCtrl(&drvCtx->ports[i], C_HOST_READY, 0);
-        }
-    } else if (!cardLost && drvCtx->cardLost) {
-        drvCtx->cardLost = FALSE;
-        DPRINT(DBG_INIT, "OctnicCheckCardHealth: Card recovered");
-        for (ULONG i = 0; i < drvCtx->numPorts && i < MAX_PORTS; i++) {
-            if (drvCtx->ports[i].initialized) {
-                OctnicWriteCtrl(&drvCtx->ports[i], C_HOST_READY, 1);
-            }
-        }
+    if (lost && !d->cardLost) {
+        d->cardLost = TRUE;
+        DPRINT(DBG_ERROR, "CARD LOST (heartbeat frozen)");
+    } else if (!lost && d->cardLost) {
+        d->cardLost = FALSE;
+        DPRINT(DBG_INIT, "card recovered");
     }
 }
 
-/* ============================================================
- * Watchdog work item callback — runs periodically to check card health
- *
- * Pattern: IoAllocateWorkItem + IoQueueWorkItem.
- * Since IoQueueWorkItem's context pointer is not accessible from within
- * the callback, we use the global g_DriverContext (already initialized
- * at this point) and the globally stored watchdogWorkItem handle.
- * Runs at PASSIVE_LEVEL.
- * ============================================================ */
-static VOID OctnicWatchdogCallback(PWORK_ITEM workItem)
+static VOID OctnicWatchdogTimer(PVOID s1, PVOID ctx, PVOID s2, PVOID s3)
 {
-    UNREFERENCED_PARAMETER(workItem);
-
-    PDRIVER_CONTEXT drvCtx = &g_DriverContext;
-
-    /* Check card health */
-    OctnicCheckCardHealth(drvCtx);
-
-    /* Re-schedule: delay 2 seconds then queue again */
-    LARGE_INTEGER delay;
-    delay.QuadPart = -20000000LL; /* -2 seconds in 100ns units */
-    KeDelayExecutionThread(KernelMode, FALSE, &delay);
-
-    IoQueueWorkItem(drvCtx->watchdogWorkItem, OctnicWatchdogCallback,
-                    DelayedWorkQueue, NULL);
+    UNREFERENCED_PARAMETER(s1);
+    UNREFERENCED_PARAMETER(s2);
+    UNREFERENCED_PARAMETER(s3);
+    OctnicCheckCardHealth((PDRIVER_CONTEXT)ctx);
 }
 
-/* ============================================================
- * Initialize watchdog — called from OctnicMiniportInitialize
- * ============================================================ */
-NTSTATUS OctnicWatchdogInit(PDRIVER_CONTEXT drvCtx)
+NDIS_STATUS OctnicWatchdogInit(PDRIVER_CONTEXT d)
 {
-    drvCtx->watchdogWorkItem = IoAllocateWorkItem(drvCtx, OctnicWatchdogCallback);
-    if (!drvCtx->watchdogWorkItem) {
-        DPRINT(DBG_ERROR, "OctnicWatchdogInit: WorkItem alloc failed");
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    NDIS_TIMER_CHARACTERISTICS tc;
+    LARGE_INTEGER due;
 
-    /* Initial queue */
-    IoQueueWorkItem(drvCtx->watchdogWorkItem, OctnicWatchdogCallback,
-                    DelayedWorkQueue, NULL);
+    RtlZeroMemory(&tc, sizeof(tc));
+    tc.Header.Type     = NDIS_OBJECT_TYPE_TIMER_CHARACTERISTICS;
+    tc.Header.Revision = NDIS_TIMER_CHARACTERISTICS_REVISION_1;
+    tc.Header.Size     = NDIS_SIZEOF_TIMER_CHARACTERISTICS_REVISION_1;
+    tc.AllocationTag   = OCTNIC_TAG;
+    tc.TimerFunction   = OctnicWatchdogTimer;
+    tc.FunctionContext = d;
 
-    DPRINT(DBG_INIT, "OctnicWatchdogInit: watchdog scheduled");
-    return STATUS_SUCCESS;
+    if (NdisAllocateTimerObject(d->adapterHandle, &tc, &d->watchdogTimer) != NDIS_STATUS_SUCCESS)
+        return NDIS_STATUS_RESOURCES;
+
+    d->lastHeartbeat = OctnicReadCtrl(&d->ports[0], C_HEARTBEAT);
+    KeQuerySystemTimePrecise(&d->heartbeatTime);
+
+    due.QuadPart = -(LONGLONG)WD_PERIOD_MS * 10000;
+    NdisSetTimerObject(d->watchdogTimer, due, WD_PERIOD_MS, NULL);
+    return NDIS_STATUS_SUCCESS;
 }
 
-/* ============================================================
- * Cleanup watchdog — called from OctnicMiniportHalt
- * ============================================================ */
-VOID OctnicWatchdogCleanup(PDRIVER_CONTEXT drvCtx)
+VOID OctnicWatchdogCleanup(PDRIVER_CONTEXT d)
 {
-    if (drvCtx->watchdogWorkItem) {
-        IoFreeWorkItem(drvCtx->watchdogWorkItem);
-        drvCtx->watchdogWorkItem = NULL;
+    if (d->watchdogTimer) {
+        NdisCancelTimerObject(d->watchdogTimer);
+        NdisFreeTimerObject(d->watchdogTimer);
+        d->watchdogTimer = NULL;
     }
-
-    DPRINT(DBG_INIT, "OctnicWatchdogCleanup: watchdog freed");
 }

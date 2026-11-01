@@ -1,164 +1,121 @@
 /* SPDX-License-Identifier: GPL-2.0
- * octnic_rx.c — Windows NDIS miniport driver for Cavium CN6640 SNIC10E.
- * RX path: kernel-mode DPC timer drains card->host RX ring into NDIS indication frames.
- *
- * All threading is kernel-mode:
- *   - KDPC timer fires at DISPATCH_LEVEL every pollUs ms to drain RX rings
- *   - No user-mode APIs (no _beginthreadex, SleepEx, WaitForSingleObject)
+ * octnic_rx.c — RX path: KTIMER->KDPC drains the card->host ring into preallocated NBLs.
+ * All kernel-mode, DISPATCH_LEVEL; no threads.
  */
 
 #include "octnic.h"
 
-/* ============================================================
- * DPC timer callback — fires periodically to drain RX ring
- * ============================================================ */
-VOID NTAPI OctnicDpcTimer(PKDPC dpc, PVOID deferredContext, PVOID systemArgument1, PVOID systemArgument2)
+#define RX_BUDGET 256
+
+VOID OctnicDpcTimer(PKDPC dpc, PVOID ctx, PVOID a1, PVOID a2)
 {
-    PPORT_DPC_CTX dpcCtx = (PPORT_DPC_CTX)deferredContext;
-    PPORT_CONTEXT portCtx = dpcCtx->portCtx;
-    ULONG tid = dpcCtx->tid;
+    PPORT_DPC_CTX c = (PPORT_DPC_CTX)ctx;
+    UNREFERENCED_PARAMETER(a1);
+    UNREFERENCED_PARAMETER(a2);
 
-    UNREFERENCED_PARAMETER(systemArgument1);
-    UNREFERENCED_PARAMETER(systemArgument2);
-
-    /* Drain the ring */
-    ULONG drained = OctnicDrainRing(portCtx, tid, 64);
-    (void)drained;
+    if (!g_DriverContext.polling || g_DriverContext.cardLost) return;
+    /* still busy: run again immediately instead of waiting for the next timer tick */
+    if (OctnicDrainRing(c->portCtx, c->tid, RX_BUDGET) >= RX_BUDGET)
+        KeInsertQueueDpc(dpc, NULL, NULL);
 }
 
-/* ============================================================
- * RX drain — called from DPC context to drain RX ring
- * ============================================================ */
-ULONG OctnicDrainRing(PPORT_CONTEXT portCtx, ULONG tid, ULONG budget)
+ULONG OctnicDrainRing(PPORT_CONTEXT p, ULONG tid, ULONG budget)
 {
-    PDRIVER_CONTEXT drvCtx = (PDRIVER_CONTEXT)((CHAR*)portCtx - FIELD_OFFSET(DRIVER_CONTEXT, ports[0]));
-    ULONG stride = drvCtx->rxThreads;
-    ULONG rc = portCtx->rcPub[tid];
-    ULONG n = 0;
-
-    DPRINT(DBG_RX, "OctnicDrainRing: port%lu tid%u budget%lu", portCtx->idx, tid, budget);
+    PDRIVER_CONTEXT d = &g_DriverContext;
+    ULONG stride = d->rxThreads;
+    ULONG rc = p->rcPub[tid];
+    ULONG n = 0, i, minC;
 
     while (n < budget) {
         ULONG slot = rc & RING_MASK;
-        ULONG len;
-        BOOLEAN ready;
+        ULONG len = 0;
+        BOOLEAN ready = FALSE;
+        PUCHAR src = p->portBase + RXBUF_OFF + (SIZE_T)slot * BUF_SZ;
 
-        if (drvCtx->hrx) {
-            /* hrx mode: descriptor in local host RAM (card DPI'd it) */
-            UCHAR* h = (UCHAR*)portCtx->portBase + slot * BUF_SZ;
-            ULONG phase = *(volatile ULONG*)(h + 4);
-
-            if (phase != RX_PHASE(rc)) {
-                ready = FALSE;
-            } else {
+        if (d->hrx) {
+            PUCHAR h = p->portBase + (SIZE_T)slot * BUF_SZ;
+            if (*(volatile ULONG*)(h + 4) == RX_PHASE(rc)) {
                 _mm_lfence();
                 len = *(volatile ULONG*)h;
                 ready = TRUE;
             }
-        } else if (drvCtx->lockfree) {
-            /* Lockfree mode: check phase bit in descriptor */
-            struct octshm_desc* desc = (struct octshm_desc*)((PBYTE)portCtx->portBase + RXDESC_OFF + slot * 8);
-            ULONG descFlags = desc->flags;
-
-            if ((descFlags & 1u) != RX_PHASE(rc)) {
-                ready = FALSE;
-            } else {
+        } else if (d->lockfree) {
+            volatile struct octshm_desc* desc =
+                (volatile struct octshm_desc*)(p->portBase + RXDESC_OFF + slot * sizeof(struct octshm_desc));
+            if ((desc->flags & 1u) == RX_PHASE(rc)) {
                 len = desc->len;
                 ready = TRUE;
             }
-        } else {
-            /* Traditional mode: compare rx_cons with rx_prod */
-            ULONG rp = OctnicReadCtrl(portCtx, C_RX_PROD);
-            if (rc == rp) {
-                ready = FALSE;
-            } else {
-                struct octshm_desc* desc = (struct octshm_desc*)((PBYTE)portCtx->portBase + RXDESC_OFF + slot * 8);
-                len = desc->len;
-                ready = TRUE;
-            }
+        } else if (rc != OctnicReadCtrl(p, C_RX_PROD)) {
+            volatile struct octshm_desc* desc =
+                (volatile struct octshm_desc*)(p->portBase + RXDESC_OFF + slot * sizeof(struct octshm_desc));
+            len = desc->len;
+            ready = TRUE;
         }
 
         if (!ready) break;
 
         if (len > 0 && len <= BUF_SZ) {
-            /* Allocate NetBufferList from pool — NDIS 6.x returns PNET_BUFFER_LIST directly */
-            PNET_BUFFER_LIST nbl = NdisMAllocateNetBufferList(
-                portCtx->netBufferListPool,
-                (NDIS_POOL_INDEX)0,   /* PoolIndex */
-                0,                    /* NetBufferContextOffset */
-                0,                    /* NetBufferContextSize */
-                0                     /* NetBufferListContextSize */
-            );
+            PRX_BUF rb = OctnicRxBufGet(d);
+            if (rb != NULL) {
+                PNET_BUFFER nb = NET_BUFFER_LIST_FIRST_NB(rb->nbl);
+                RtlCopyMemory(rb->data, src, len);
+                NET_BUFFER_CURRENT_MDL(nb) = rb->mdl;
+                NET_BUFFER_CURRENT_MDL_OFFSET(nb) = 0;
+                NET_BUFFER_DATA_OFFSET(nb) = 0;
+                NET_BUFFER_DATA_LENGTH(nb) = len;
+                NET_BUFFER_LIST_NEXT_NBL(rb->nbl) = NULL;
+                NET_BUFFER_LIST_STATUS(rb->nbl) = NDIS_STATUS_SUCCESS;
 
-            if (nbl != NULL) {
-                PNET_BUFFER netBuffer = NdisGetNetBufferListNetBuffer(nbl);
-                if (netBuffer != NULL) {
-                    /* Copy frame data from BAR2 RX buffer */
-                    PVOID rxData = (PBYTE)portCtx->portBase + RXBUF_OFF + slot * BUF_SZ;
-                    ULONG dataLen = 0;
-                    UCHAR* dest = NdisGetNetBufferContents(netBuffer, &dataLen);
-                    if (dest != NULL && dataLen >= len) {
-                        RtlCopyMemory(dest, rxData, len);
-                    }
-
-                    /* Indicate received packet to protocol drivers */
-                    NdisMIndicateReceiveNetBufferLists(
-                        portCtx->miniportHandle,
-                        0, nbl, 1, 0, NDIS_INDICATION_PRIORITY_HIGH
-                    );
-                } else {
-                    /* No NetBuffer in the NBL — free it */
-                    NdisMDereferenceNetBufferList(nbl);
-                }
+                InterlockedIncrement(&d->rxOutstanding);
+                InterlockedIncrement64(&d->rxPkts);
+                InterlockedAdd64(&d->rxBytes, len);
+                NdisMIndicateReceiveNetBufferLists(d->adapterHandle, rb->nbl,
+                        NDIS_DEFAULT_PORT_NUMBER, 1, NDIS_RECEIVE_FLAGS_DISPATCH_LEVEL);
             } else {
-                DPRINT(DBG_ERROR, "OctnicDrainRing: NetBufferList alloc failed");
+                InterlockedIncrement64(&d->rxNoBuf);
             }
         }
 
-        /* Advance to next slot owned by this DPC */
         rc += stride;
         n++;
     }
 
-    /* Update per-DPC consumer */
-    portCtx->rcPub[tid] = rc;
+    p->rcPub[tid] = rc;
 
-    /* Publish minimum consumer across all DPCs */
-    ULONG minConsumer = portCtx->rcPub[0];
-    for (ULONG i = 1; i < stride; i++) {
-        if ((LONG)(portCtx->rcPub[i] - minConsumer) < 0) {
-            minConsumer = portCtx->rcPub[i];
-        }
+    /* publish the minimum consumer across all DPCs */
+    minC = p->rcPub[0];
+    for (i = 1; i < stride; i++) {
+        if ((LONG)(p->rcPub[i] - minC) < 0) minC = p->rcPub[i];
     }
-
-    if (minConsumer != portCtx->rxConsShadow) {
-        portCtx->rxConsShadow = minConsumer;
-        OctnicWriteCtrl(portCtx, C_RX_CONS, minConsumer);
+    if (minC != p->rxConsShadow) {
+        p->rxConsShadow = minC;
+        OctnicWriteCtrl(p, C_RX_CONS, minC);
     }
-
-    DPRINT(DBG_RX, "OctnicDrainRing: port%lu tid%u drained %u frames",
-           portCtx->idx, tid, n);
     return n;
 }
 
-/* ============================================================
- * RX cleanup — called during halt or reset
- * ============================================================ */
-VOID OctnicRxCleanup(PPORT_CONTEXT portCtx)
+/* NDIS hands NBLs back when the stack is done with them */
+VOID OctnicReturnNetBufferLists(NDIS_HANDLE ctx, PNET_BUFFER_LIST nblList, ULONG returnFlags)
 {
-    PDRIVER_CONTEXT drvCtx = (PDRIVER_CONTEXT)((CHAR*)portCtx - FIELD_OFFSET(DRIVER_CONTEXT, ports[0]));
+    PDRIVER_CONTEXT d = &g_DriverContext;
+    UNREFERENCED_PARAMETER(ctx);
+    UNREFERENCED_PARAMETER(returnFlags);
 
-    DPRINT(DBG_RX, "OctnicRxCleanup: clearing RX state for port%lu", portCtx->idx);
-
-    /* Reset RX consumer */
-    portCtx->rxConsShadow = OctnicReadCtrl(portCtx, C_RX_PROD);
-    if (drvCtx->hrx) {
-        portCtx->rxConsShadow = 0;
+    while (nblList != NULL) {
+        PNET_BUFFER_LIST next = NET_BUFFER_LIST_NEXT_NBL(nblList);
+        OctnicRxBufPut(d, (PRX_BUF)nblList->MiniportReserved[0]);
+        InterlockedDecrement(&d->rxOutstanding);
+        nblList = next;
     }
-    OctnicWriteCtrl(portCtx, C_RX_CONS, portCtx->rxConsShadow);
+}
 
-    /* Reset per-DPC consumers */
-    for (ULONG i = 0; i < drvCtx->rxThreads && i < 8; i++) {
-        portCtx->rcPub[i] = portCtx->rxConsShadow + i;
-    }
+VOID OctnicRxCleanup(PPORT_CONTEXT p)
+{
+    PDRIVER_CONTEXT d = &g_DriverContext;
+    ULONG i;
+
+    p->rxConsShadow = d->hrx ? 0 : OctnicReadCtrl(p, C_RX_PROD);
+    OctnicWriteCtrl(p, C_RX_CONS, p->rxConsShadow);
+    for (i = 0; i < MAX_RX_THREADS; i++) p->rcPub[i] = p->rxConsShadow + i;
 }
