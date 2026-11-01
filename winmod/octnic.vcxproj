@@ -35,7 +35,6 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <EnablePREfast>false</EnablePREfast>
       <AdditionalIncludeDirectories>$(WindowsSdkDir_Include);$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <CompileAs>CompileC</CompileAs>
     </ClCompile>
 
     <Link>
