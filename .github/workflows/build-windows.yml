@@ -31,40 +31,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Detect WDK SDK version
-        id: wdk
-        run: |
-          $wdk = "C:\Program Files (x86)\Windows Kits\10"
-          if (!(Test-Path "$wdk")) {
-            Write-Error "WDK not found at $wdk"
-            exit 1
-          }
-          $ver = (Get-ChildItem "$wdk\Include" -Directory |
-                  Sort-Object Name -Descending | Select-Object -First 1).Name
-          echo "sdk=$ver" >> $env:GITHUB_OUTPUT
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
 
-      - name: Build driver with nmake (WDK)
+      - name: Build Windows driver (msbuild)
         working-directory: winmod
         run: |
-          $wdk = "C:\Program Files (x86)\Windows Kits\10"
-          $sdk = "${{ steps.wdk.outputs.sdk }}"
+          echo "Building octnic Windows NDIS driver..."
 
-          # Set WDK env vars (equivalent to Setenv.cmd - release x64)
-          $env:SDK_LIB_PATH   = "$wdk\Lib\$sdk\km\x64"
-          $env:DDK_LIB_PATH   = "$wdk\Lib\$sdk\km\x64"
-          $env:INT_DIR        = "x64\Release"
-          $env:SRC_DIR        = "."
+          # Find msbuild on windows-2022 runner
+          $msbuild = Get-Command msbuild -ErrorAction SilentlyContinue
+          if (!$msbuild) {
+            # Try common VS 2022 paths
+            $paths = @(
+              "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe",
+              "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe",
+              "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+            )
+            foreach ($p in $paths) {
+              if (Test-Path $p) { $msbuild = $p; break }
+            }
+          }
 
-          # Prepend WDK paths to INCLUDE and LIB
-          $env:INCLUDE = "$wdk\Include\$sdk;`$wdk\Include\$sdk\km;`$wdk\Include\$sdk\ucrt;`$env:INCLUDE"
-          $env:LIB     = "$wdk\Lib\$sdk\km\x64;`$wdk\Lib\$sdk\ucrt\x64;`$env:LIB"
+          if (!$msbuild) {
+            Write-Error "msbuild not found — check runner MSBuild setup"
+            exit 1
+          }
 
-          Write-Host "=== WDK Environment ==="
-          Write-Host "SDK_LIB_PATH=$env:SDK_LIB_PATH"
-          Write-Host "DDK_LIB_PATH=$env:DDK_LIB_PATH"
-
-          nmake /f Makefile clean 2>$null; $LASTEXITCODE = 0
-          nmake /f Makefile
+          Write-Host "Using msbuild: $($msbuild.Source)"
+          & $msbuild octnic.vcxproj /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
         shell: pwsh
 
       - name: Verify output
