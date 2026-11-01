@@ -26,6 +26,15 @@ if not exist octnic.sys (
     cd /d "%TEMP%\octnic-pkg"
 )
 
+REM Preflight: is the card on the PCI bus at all?
+powershell -NoProfile -Command "if (Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'PCI\VEN_177D&DEV_0092*' }) { exit 0 } else { exit 1 }"
+if errorlevel 1 (
+    echo [FAIL] Cavium CN6640 card not found on the PCI bus ^(VEN_177D DEV_0092^).
+    echo        Check it is seated and the PC saw it at boot, then run this file again.
+    pause & exit /b 1
+)
+echo [OK] Card found on PCI bus
+
 echo [..] Trusting test certificate
 certutil -addstore -f Root octnic-test.cer >nul
 certutil -addstore -f TrustedPublisher octnic-test.cer >nul
@@ -50,8 +59,15 @@ echo [..] Installing driver
 pnputil /add-driver octnic.inf /install
 if errorlevel 1 (echo [FAIL] pnputil failed & pause & exit /b 1)
 
-echo.
-echo [OK] Installed. Make sure the card is powered and booted (octboot), then check:
-powershell -NoProfile -Command "Get-NetAdapter | Format-Table Name,InterfaceDescription,Status -AutoSize"
+echo [..] Waiting for the NIC ^(the driver only starts if the card is already booted^)...
+powershell -NoProfile -Command "$ok=$false; 1..15 | ForEach-Object { if (Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object InterfaceDescription -like '*CN6640*') { $ok=$true; return }; Start-Sleep 1 }; if ($ok) { exit 0 } else { exit 1 }"
+if errorlevel 1 (
+    echo [WARN] Driver installed but no NIC appeared: the card is probably not booted yet.
+    echo        Boot it with octboot.ps1, then run:  pnputil /restart-device "PCI\VEN_177D&DEV_0092*"
+    echo        ^(or Device Manager: disable/enable the Cavium device^)
+) else (
+    echo [OK] NIC is up:
+    powershell -NoProfile -Command "Get-NetAdapter | Where-Object InterfaceDescription -like '*CN6640*' | Format-Table Name,Status,LinkSpeed -AutoSize"
+)
 echo Uninstall: pnputil /enum-drivers  then  pnputil /delete-driver oemNN.inf /uninstall
 pause
