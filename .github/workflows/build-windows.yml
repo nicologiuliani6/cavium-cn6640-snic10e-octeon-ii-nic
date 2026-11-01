@@ -19,42 +19,59 @@ permissions:
 
 jobs:
   build:
-    name: Build octnic.sys (${{ matrix.windows-version }})
-    runs-on: ${{ matrix.windows-version }}
+    name: Build octnic.sys (Windows ${{ matrix.os-version }})
+    runs-on: ${{ matrix.os-version }}
 
     strategy:
       fail-fast: false
       matrix:
-        windows-version: [windows-2022]
+        os-version: [windows-2022]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+      - name: Detect WDK SDK version
+        id: wdk
+        run: |
+          $wdk = "C:\Program Files (x86)\Windows Kits\10"
+          if (!(Test-Path "$wdk")) {
+            Write-Error "WDK not found at $wdk"
+            exit 1
+          }
+          $ver = (Get-ChildItem "$wdk\Include" -Directory |
+                  Sort-Object Name -Descending | Select-Object -First 1).Name
+          echo "sdk=$ver" >> $env:GITHUB_OUTPUT
 
-      - name: Restore cache (WDK headers)
-        id: wdk-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:/Program Files (x86)/Windows Kits/10/Include
-            C:/Program Files (x86)/Windows Kits/10/Lib
-          key: wdk-${{ runner.os }}-${{ hashFiles('winmod/*.h', 'winmod/*.c') }}
-
-      - name: Build Windows driver
+      - name: Build driver with nmake (WDK)
         working-directory: winmod
         run: |
-          echo "Building octnic Windows NDIS driver..."
-          msbuild octnic.vcxproj /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
-        shell: bash
+          $wdk = "C:\Program Files (x86)\Windows Kits\10"
+          $sdk = "${{ steps.wdk.outputs.sdk }}"
+
+          # Set WDK env vars (equivalent to Setenv.cmd - release x64)
+          $env:SDK_LIB_PATH   = "$wdk\Lib\$sdk\km\x64"
+          $env:DDK_LIB_PATH   = "$wdk\Lib\$sdk\km\x64"
+          $env:INT_DIR        = "x64\Release"
+          $env:SRC_DIR        = "."
+
+          # Prepend WDK paths to INCLUDE and LIB
+          $env:INCLUDE = "$wdk\Include\$sdk;`$wdk\Include\$sdk\km;`$wdk\Include\$sdk\ucrt;`$env:INCLUDE"
+          $env:LIB     = "$wdk\Lib\$sdk\km\x64;`$wdk\Lib\$sdk\ucrt\x64;`$env:LIB"
+
+          Write-Host "=== WDK Environment ==="
+          Write-Host "SDK_LIB_PATH=$env:SDK_LIB_PATH"
+          Write-Host "DDK_LIB_PATH=$env:DDK_LIB_PATH"
+
+          nmake /f Makefile clean 2>$null; $LASTEXITCODE = 0
+          nmake /f Makefile
+        shell: pwsh
 
       - name: Verify output
         run: |
-          echo "=== Build output ==="
-          find winmod -name "*.sys" -o -name "*.pdb" 2>/dev/null || true
-          ls -la winmod/x64/Release/ 2>/dev/null || ls -la winmod/Release/ 2>/dev/null || true
+          Write-Host "=== Build artifacts ==="
+          Get-ChildItem -Recurse -Path winmod -Include "*.sys","*.pdb" -ErrorAction SilentlyContinue
+          Get-ChildItem -Path winmod\x64\Release -ErrorAction SilentlyContinue
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

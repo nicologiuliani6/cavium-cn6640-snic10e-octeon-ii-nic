@@ -1,14 +1,52 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <ItemDefinitionGroup>
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectName>octnic</ProjectName>
+    <RootNamespace>octnic</RootNamespace>
+    <ProjectGuid>{a1b2c3d4-e5f6-7890-abcd-ef1234567890}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ConfigurationType>Driver</ConfigurationType>
+    <CharacterSet>NotSet</CharacterSet>
+    <DriverType>WDM</DriverType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <SupportsPackage>true</SupportsPackage>
+    <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <PreprocessorDefinitions>_KERNEL_MODE;NDIS60;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
       <EnablePREfast>false</EnablePREfast>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir_Include);$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpplatest</LanguageStandard>
     </ClCompile>
+
+    <Link>
+      <AdditionalDependencies>ndis.lib;ntoskrnl.lib;hal.lib;wdmsec.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+
+    <DriverSign>
+      <FileDigestAlgorithm>SHA256</FileDigestAlgorithm>
+    </DriverSign>
   </ItemDefinitionGroup>
+
   <ItemGroup>
     <ClCompile Include="octnic_main.c" />
     <ClCompile Include="octnic_init.c" />
@@ -18,10 +56,14 @@
     <ClCompile Include="octnic_watchdog.c" />
     <ClCompile Include="octnic_utils.c" />
   </ItemGroup>
+
   <ItemGroup>
     <ClInclude Include="octnic.h" />
   </ItemGroup>
+
   <ItemGroup>
     <ResourceCompile Include="octnic.rc" />
   </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
