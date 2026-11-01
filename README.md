@@ -44,7 +44,7 @@ back.
 | Name | Side | Role |
 |---|---|---|
 | `octnic` (`linuxmod/octnic.c`) | Linux (kmod) | Registers `oct0`/`oct1` over the card's BAR2 window. Auto-discovers the card (`modprobe octnic ports=2`). |
-| `octnic` (`winmod/octnic.sys`) | Windows (NDIS) | NDIS 6.x miniport, same BAR2 shared-memory protocol. Registers `oct0`/`oct1`. |
+| `octnic` (`winmod/octnic.sys`) | Windows (NDIS) | NDIS 6.20 miniport, same BAR2 shared-memory protocol. One adapter (port 0). Prebuilt in releases, see `winmod/README.md`. |
 | `octnic` (`bsdmod/`) | BSD (planned) | Placeholder for FreeBSD/OpenBSD/DragonFly ifnet driver. |
 
 ### Card Modules (shared across all hosts)
@@ -154,7 +154,7 @@ documentation. Ran on the one reference card under the owner's standing permissi
 | Unmodified upstream: OpenWrt ([stintel/openwrt](https://codeberg.org/stintel/openwrt.git) `snic10e-5.10`, commit `7bbf4b7`; earlier work [hurricos/openwrt @ `snic10e-ethernet`](https://git.laboratoryb.org/hurricos/openwrt/src/branch/snic10e-ethernet)), Linux mainline | widely used and tested by others |
 | Cavium/Marvell Octeon SDK (`cvmx_*`) and the in-tree `liquidio` driver | reverse-engineering *reference* only — no code copied, no NDA firmware run |
 | Written by the AI, run on the one reference card (the "working" status above): `linuxmod/octnic.c`, `cardmod/octshm_card.c`, `cardmod/octcarrier.c`, `octboot`, `install.sh`, `scripts/*.sh`, `system/cavium-nic.service` | hardware-validated on this card, never in the field |
-| Windows driver: `winmod/octnic.*` — translated to NDIS 6.x + KMDF, same BAR2 protocol | source-only, needs Windows test host with WDK to compile |
+| Windows driver: `winmod/octnic.*` — translated to NDIS 6.x + KMDF, same BAR2 protocol | builds in CI (NDIS 6.20), prebuilt in every release + one-click `install_windows.bat`; not yet tested on hardware, port 0 only |
 
 GPL-2.0 — see [LICENSE](LICENSE). The card image in the [releases](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases)
 is a GPL-2.0 binary (OpenWrt + Linux); its complete corresponding source is upstream

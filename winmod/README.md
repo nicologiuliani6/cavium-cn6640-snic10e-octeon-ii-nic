@@ -70,28 +70,36 @@ msbuild octnic.vcxproj /p:Configuration=Release /p:Platform=x64
 
 ## Installation
 
-### Sign the Driver
-```powershell
-signtool sign /fd SHA256 /a .\bin\x64\Release\octnic.sys
-```
+> Status: builds in CI (NDIS 6.20), **not yet tested on real Windows hardware**. One NDIS adapter drives port 0 only.
 
-### Install Service
-```powershell
-# Create service
-sc create octnic binPath= "C:\path\to\octnic.sys" type= kernel
+### Easy install (prebuilt, test-signed)
 
-# Start service
-sc start octnic
-```
+Every [release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest) ships `install_windows.bat` and `octnic-windows-x64.zip` (`octnic.sys`, `octnic.inf`, `octnic.cat`, `octnic-test.cer`).
 
-### Verify Installation
-```powershell
-# Check adapter status
-Get-NetAdapter -Name 'oct*'
+1. Make sure the card is seated and **booted** (see *Usage → Boot the Card*).
+2. Download `install_windows.bat` and double-click it. It asks for Administrator rights and then:
+   - checks the card is on the PCI bus (`VEN_177D&DEV_0092`),
+   - downloads the latest zip if `octnic.sys` is not next to it,
+   - trusts the bundled test certificate,
+   - enables test-signing if off (`bcdedit /set testsigning on`), asks to reboot and **resumes by itself after login**,
+   - installs the driver with `pnputil /add-driver octnic.inf /install`,
+   - waits for the NIC to appear (it only starts if the card is already booted).
+3. Verify: `Get-NetAdapter` — look for "Cavium CN6640 SNIC10E Shared-Memory NIC".
 
-# Check driver in Device Manager
-# Look for "Cavium CN6640 SNIC10E Shared-Memory NIC"
-```
+If the driver is installed but no NIC appears, the card is not booted: boot it, then `pnputil /restart-device "PCI\VEN_177D&DEV_0092*"`.
+
+Requirements: Windows 10/11 x64, **Secure Boot off** (test-signing cannot be enabled otherwise).
+
+Uninstall: `pnputil /enum-drivers`, then `pnputil /delete-driver oemNN.inf /uninstall`.
+
+### Production signing (no test-signing)
+
+Needs a Microsoft-signed driver: EV code-signing certificate + Windows Hardware Dev Center (Partner Center) account, attestation signing.
+`.\make-submission.ps1 -Zip octnic-windows-x64.zip -Thumbprint <EV cert sha1>` builds and signs `out\octnic.cab` for upload. Untested.
+
+### Releases / CI
+
+`.github/workflows/build-windows.yml` builds on every push touching `winmod/`, and on every published release it attaches `octnic-windows-x64.zip` and `install_windows.bat`.
 
 ## Usage
 
