@@ -5,6 +5,11 @@
 
 #include "octnic.h"
 
+/* Ethernet MAC address length (Linux constant, not in WDK) */
+#ifndef ETH_ALEN
+#define ETH_ALEN 6
+#endif
+
 /* ============================================================
  * Default MAC address generation
  * ============================================================ */

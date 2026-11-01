@@ -109,6 +109,10 @@ struct octshm_desc {
 static inline ULONG TX_PHASE(ULONG tp) { return (tp >> 7) & 1u; }
 static inline ULONG RX_PHASE(ULONG rc) { return (rc >> 7) & 1u; }
 
+/* ---- Forward declaration for back-pointers (used in PORT_DPC_CTX) ---- */
+struct _PORT_CONTEXT;
+typedef struct _PORT_CONTEXT* PPORT_CONTEXT;
+
 /* ---- Per-port DPC polling context ---- */
 typedef struct _PORT_DPC_CTX {
     KDPC                        dpc;           /* Windows DPC object */
