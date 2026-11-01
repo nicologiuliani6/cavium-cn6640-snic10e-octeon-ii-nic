@@ -16,6 +16,11 @@
 #include <ntddk.h>
 #include <ndis.h>
 
+/* ---- Ethernet constants (not in WDK) ---- */
+#ifndef ETH_ALEN
+#define ETH_ALEN 6
+#endif
+
 /* ---- PCI identifiers ---- */
 #define PCI_VENDOR_ID_CAVIUM      0x177d
 #define PCI_DEVICE_ID_CN6640      0x0092
@@ -58,11 +63,6 @@
 #define DEFAULT_HRX               1           /* host-RAM RX descriptors */
 #define DEFAULT_RXTHREADS         8           /* parallel RX drain threads per port */
 #define DEFAULT_NTXQ              8           /* multi-queue TX queues */
-
-/* ---- Ethernet constants (not in WDK) ---- */
-#ifndef ETH_ALEN
-#define ETH_ALEN 6
-#endif
 
 /* ---- NDIS version ---- */
 #define NDIS_MINIPORT_MAJOR_VERSION   6
@@ -111,12 +111,17 @@ struct octshm_desc {
 #pragma pack(pop)
 
 /* ---- Phase bit helpers (log2(RING_SZ)=7) ---- */
-static inline ULONG TX_PHASE(ULONG tp) { return (tp >> 7) & 1u; }
-static inline ULONG RX_PHASE(ULONG rc) { return (rc >> 7) & 1u; }
+static __inline ULONG TX_PHASE(ULONG tp) { return (tp >> 7) & 1u; }
+static __inline ULONG RX_PHASE(ULONG rc) { return (rc >> 7) & 1u; }
 
-/* ---- Forward declaration for back-pointers (used in PORT_DPC_CTX) ---- */
-struct _PORT_CONTEXT;
-typedef struct _PORT_CONTEXT* PPORT_CONTEXT;
+/* ---- Forward declarations ---- */
+typedef struct _PORT_DPC_CTX *PPORT_DPC_CTX;
+typedef struct _PORT_CONTEXT *PPORT_CONTEXT;
+typedef struct _DRIVER_CONTEXT *PDRIVER_CONTEXT;
+
+/* ---- WDK type aliases ---- */
+typedef struct _WORK_ITEM *PWORK_ITEM;
+typedef struct _NDIS_MINIPORT_CHARACTERISTICS PNDIS_MINIPORT_CHARACTERISTICS;
 
 /* ---- Per-port DPC polling context ---- */
 typedef struct _PORT_DPC_CTX {
@@ -183,7 +188,7 @@ VOID OctnicMiniportHalt(NDIS_HANDLE miniportContext, NDIS_HALT_ACTION haltAction
 
 /* TX */
 VOID OctnicSendPackets(NDIS_HANDLE miniportContext, PNDIS_PACKET_LIST packetList,
-                        NDIS_SEND_PACKETS_FLAGS sendFlags);
+                       NDIS_SEND_PACKETS_FLAGS sendFlags);
 NTSTATUS OctnicTransmitFrame(PPORT_CONTEXT portCtx, PNET_BUFFER netBuffer);
 
 /* RX — DPC-based polling */
