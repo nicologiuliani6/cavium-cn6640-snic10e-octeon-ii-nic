@@ -1,0 +1,50 @@
+; octnic.inf — Cavium CN6640 SNIC10E shared-memory NIC (NDIS miniport)
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Net
+ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider    = %Mfg%
+CatalogFile = octnic.cat
+DriverVer   = 11/01/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%Mfg% = Octnic, NTamd64
+
+[Octnic.NTamd64]
+%Octnic.DeviceDesc% = Octnic.ndi, PCI\VEN_177D&DEV_0092
+
+[Octnic.ndi]
+Characteristics = 0x4          ; NCF_PHYSICAL
+BusType         = 5            ; PCI
+AddReg          = Octnic.Reg
+
+[Octnic.Reg]
+HKR, Ndi, Service, 0, "octnic"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "ethernet"
+HKR, , *IfType, 0x00010001, 6
+HKR, , *MediaType, 0x00010001, 0
+HKR, , *PhysicalMediaType, 0x00010001, 14
+
+[Octnic.ndi.Services]
+AddService = octnic, 2, Octnic.Service
+
+[Octnic.Service]
+DisplayName   = %Octnic.Service.DispName%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\octnic.sys
+
+[SourceDisksNames]
+1 = %DiskId%,,,
+
+[SourceDisksFiles]
+octnic.sys = 1
+
+[Strings]
+Mfg                    = "Cavium CN6640 SNIC10E Project"
+Octnic.DeviceDesc      = "Cavium CN6640 SNIC10E Shared-Memory NIC"
+Octnic.Service.DispName = "Cavium CN6640 SNIC10E NIC Driver"
+DiskId                 = "octnic install disk"

@@ -66,30 +66,40 @@ jobs:
           msbuild octnic.vcxproj /p:Configuration=Release /p:Platform=x64 /p:WindowsTargetPlatformVersion=10.0.26100.0 /m /v:minimal /nologo
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Verify output
-        run: |
-          Write-Host "=== Artifacts ==="
-          Get-ChildItem -Recurse -Path winmod -Include "*.sys","*.pdb" -ErrorAction SilentlyContinue
+      - name: Package (inf + catalog + test signature)
         shell: pwsh
+        run: |
+          $bin = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0"
+          $sys = (Get-ChildItem winmod -Recurse -Filter octnic.sys | Select-Object -First 1).FullName
+          if (!$sys) { Write-Error "octnic.sys not built"; exit 1 }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $sys dist\octnic.sys
+          Copy-Item winmod\octnic.inf, winmod\install_windows.bat dist\
+          # self-signed test cert, shipped in the zip (install script trusts it)
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=octnic test signing" `
+                    -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(5)
+          Export-Certificate -Cert $cert -FilePath dist\octnic-test.cer | Out-Null
+          & "$bin\x86\Inf2Cat.exe" /driver:dist /os:10_X64 /uselocaltime
+          if ($LASTEXITCODE -ne 0) { Write-Error "Inf2Cat failed"; exit 1 }
+          foreach ($f in "dist\octnic.sys","dist\octnic.cat") {
+            & "$bin\x64\signtool.exe" sign /sha1 $cert.Thumbprint /fd SHA256 $f
+            if ($LASTEXITCODE -ne 0) { Write-Error "signtool failed on $f"; exit 1 }
+          }
+          Compress-Archive -Path dist\* -DestinationPath octnic-windows-x64.zip -Force
+          Get-ChildItem dist, octnic-windows-x64.zip
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: octnic-sys-${{ github.sha }}
-          path: |
-            winmod/x64/Release/octnic.sys
-            winmod/x64/Release/octnic.pdb
-            winmod/Release/octnic.sys
-            winmod/Release/octnic.pdb
+          name: octnic-windows-x64-${{ github.sha }}
+          path: octnic-windows-x64.zip
           retention-days: 30
-          if-no-files-found: warn
+          if-no-files-found: error
 
-      - name: Create release asset (on release)
+      - name: Attach to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            winmod/x64/Release/octnic.sys
-            winmod/Release/octnic.sys
+          files: octnic-windows-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
