@@ -1,0 +1,28 @@
+; SPDX-License-Identifier: GPL-2.0
+; octnic.rc — Resource script for Cavium CN6640 SNIC10E Windows driver
+
+#include <windows.h>
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Cavium CN6640 SNIC10E Project\0"
+            VALUE "FileDescription", "Cavium CN6640 SNIC10E Shared-Memory NIC Driver\0"
+            VALUE "FileVersion", "1.0.0\0"
+            VALUE "InternalName", "octnic\0"
+            VALUE "LegalCopyright", "GPL-2.0\0"
+            VALUE "OriginalFilename", "octnic.sys\0"
+            VALUE "ProductName", "Cavium CN6640 SNIC10E Driver\0"
+            VALUE "ProductVersion", "1.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

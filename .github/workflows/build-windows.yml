@@ -1,0 +1,79 @@
+name: Build Windows Driver
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'winmod/**'
+      - '.github/workflows/build-windows.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'winmod/**'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build octnic.sys (${{ matrix.windows-version }})
+    runs-on: ${{ matrix.windows-version }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        windows-version: [windows-2022]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore cache (WDK headers)
+        id: wdk-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:/Program Files (x86)/Windows Kits/10/Include
+            C:/Program Files (x86)/Windows Kits/10/Lib
+          key: wdk-${{ runner.os }}-${{ hashFiles('winmod/*.h', 'winmod/*.c') }}
+
+      - name: Build Windows driver
+        working-directory: winmod
+        run: |
+          echo "Building octnic Windows NDIS driver..."
+          msbuild octnic.vcxproj /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
+        shell: bash
+
+      - name: Verify output
+        run: |
+          echo "=== Build output ==="
+          find winmod -name "*.sys" -o -name "*.pdb" 2>/dev/null || true
+          ls -la winmod/x64/Release/ 2>/dev/null || ls -la winmod/Release/ 2>/dev/null || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: octnic-sys-${{ github.sha }}
+          path: |
+            winmod/x64/Release/octnic.sys
+            winmod/x64/Release/octnic.pdb
+            winmod/Release/octnic.sys
+            winmod/Release/octnic.pdb
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Create release asset (on release)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            winmod/x64/Release/octnic.sys
+            winmod/Release/octnic.sys
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

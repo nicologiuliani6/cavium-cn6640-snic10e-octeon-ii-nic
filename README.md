@@ -10,7 +10,7 @@ or [a discussion](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeo
 
 **Sponsor:** [github.com/sponsors/nicologiuliani6](https://github.com/sponsors/nicologiuliani6)
 
-Out-of-tree Linux driver stack and boot tooling for the **Cavium CN6640-SNIC10E**
+Multi-OS driver stack and boot tooling for the **Cavium CN6640-SNIC10E** (Linux, Windows, BSD planned)
 (Octeon II CN6640, PCI `177d:0092`), exposing the card as **two independent 10 GbE
 host interfaces** (`oct0`, `oct1`) over a reverse-engineered PCIe BAR2 shared-memory
 datapath. No vendor NDA firmware.
@@ -39,15 +39,30 @@ back.
 
 ## Components
 
+### Host Drivers (per OS)
+
 | Name | Side | Role |
 |---|---|---|
-| `octboot` | host (bash) | Host **bootloader**: SBR the card, restore BARs, push the OpenWrt image into card DRAM over BAR2, wait for the NIC heartbeat. No serial. |
-| `octnic` (`hostmod/octnic.c`) | host (kmod) | Registers `oct0`/`oct1` over the card's BAR2 window. Auto-discovers the card (`modprobe octnic ports=2`). |
-| `octshm_card` (`cardmod/`) | card (kmod) | Card end of the shared-memory datapath: per-port rings, DPI RX, XAUI uplink tap. |
-| `octcarrier` (`cardmod/`) | card (kmod) | Un-gates `xaui0`/`xaui1` TX on the QLogic DAC (`cvmx_helper_link_set`). |
-| `scripts/cavium-up.sh` / `scripts/nic-up.sh` | host | Orchestrate a full bring-up: boot the card, load `octnic`, bring both ports up. |
+| `octnic` (`linuxmod/octnic.c`) | Linux (kmod) | Registers `oct0`/`oct1` over the card's BAR2 window. Auto-discovers the card (`modprobe octnic ports=2`). |
+| `octnic` (`winmod/octnic.sys`) | Windows (NDIS) | NDIS 6.x miniport, same BAR2 shared-memory protocol. Registers `oct0`/`oct1`. |
+| `octnic` (`bsdmod/`) | BSD (planned) | Placeholder for FreeBSD/OpenBSD/DragonFly ifnet driver. |
 
-Run entirely hands-off by the `system/cavium-nic.service` systemd unit.
+### Card Modules (shared across all hosts)
+
+| Name | Side | Role |
+|---|---|---|
+| `octshm_card` (`cardmod/octshm_card.c`) | card (kmod) | Card end of the shared-memory datapath: per-port rings, DPI RX, XAUI uplink tap. |
+| `octcarrier` (`cardmod/octcarrier.c`) | card (kmod) | Un-gates `xaui0`/`xaui1` TX on the QLogic DAC (`cvmx_helper_link_set`). |
+
+### Boot & Orchestration
+
+| Name | Side | Role |
+|---|---|---|
+| `octboot` | Linux host (bash) | Host **bootloader**: SBR the card, restore BARs, push OpenWrt image into card DRAM over BAR2. No serial. |
+| `octboot.ps1` | Windows host (PowerShell) | Windows equivalent: pushes image via driver IOCTL, waits for heartbeat. |
+| `scripts/cavium-up.sh` / `scripts/nic-up.sh` | Linux | Orchestrate full bring-up: boot card, load `octnic`, bring ports up. |
+
+Linux runs entirely hands-off via `system/cavium-nic.service`. Windows uses a service + PowerShell scripts (planned).
 
 ## Quick start
 
@@ -138,7 +153,8 @@ documentation. Ran on the one reference card under the owner's standing permissi
 |---|---|
 | Unmodified upstream: OpenWrt ([stintel/openwrt](https://codeberg.org/stintel/openwrt.git) `snic10e-5.10`, commit `7bbf4b7`; earlier work [hurricos/openwrt @ `snic10e-ethernet`](https://git.laboratoryb.org/hurricos/openwrt/src/branch/snic10e-ethernet)), Linux mainline | widely used and tested by others |
 | Cavium/Marvell Octeon SDK (`cvmx_*`) and the in-tree `liquidio` driver | reverse-engineering *reference* only — no code copied, no NDA firmware run |
-| Written by the AI, run on the one reference card (the "working" status above): `hostmod/octnic.c`, `cardmod/octshm_card.c`, `cardmod/octcarrier.c`, `octboot`, `install.sh`, `scripts/*.sh`, `system/cavium-nic.service` | hardware-validated on this card, never in the field |
+| Written by the AI, run on the one reference card (the "working" status above): `linuxmod/octnic.c`, `cardmod/octshm_card.c`, `cardmod/octcarrier.c`, `octboot`, `install.sh`, `scripts/*.sh`, `system/cavium-nic.service` | hardware-validated on this card, never in the field |
+| Windows driver: `winmod/octnic.*` — translated to NDIS 6.x + KMDF, same BAR2 protocol | source-only, needs Windows test host with WDK to compile |
 
 GPL-2.0 — see [LICENSE](LICENSE). The card image in the [releases](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases)
 is a GPL-2.0 binary (OpenWrt + Linux); its complete corresponding source is upstream

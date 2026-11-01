@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>_KERNEL_MODE;NDIS60;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <EnablePREfast>false</EnablePREfast>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="octnic_main.c" />
+    <ClCompile Include="octnic_init.c" />
+    <ClCompile Include="octnic_tx.c" />
+    <ClCompile Include="octnic_rx.c" />
+    <ClCompile Include="octnic_oid.c" />
+    <ClCompile Include="octnic_watchdog.c" />
+    <ClCompile Include="octnic_utils.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="octnic.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="octnic.rc" />
+  </ItemGroup>
+</Project>

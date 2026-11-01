@@ -28,10 +28,12 @@ Host module — `install.sh` does this for you (with DKMS when available); by ha
 running kernel:
 
 ```bash
-cd hostmod && make            # -> octnic.ko
+cd linuxmod && make            # -> octnic.ko
 sudo install -D -m0644 octnic.ko /lib/modules/$(uname -r)/extra/octnic.ko
-sudo depmod -a                # enables `modprobe octnic`
+sudo depmod -a                 # enables `modprobe octnic`
 ```
+
+For Windows, see [winmod/README.md](../winmod/README.md) — build with WDK + Visual Studio.
 
 Card modules (cross-built against the OpenWrt Octeon kernel). Point `KDIR`/toolchain at
 your OpenWrt build tree:

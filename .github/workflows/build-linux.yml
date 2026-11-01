@@ -1,0 +1,56 @@
+name: Build Linux Driver (DKMS)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'linuxmod/**'
+      - '.github/workflows/build-linux.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'linuxmod/**'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build octnic.ko (Ubuntu ${{ matrix.ubuntu }})
+    runs-on: ubuntu-${{ matrix.ubuntu }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: [22.04, 24.04]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential kmod linux-headers-$(uname -r)
+
+      - name: Build kernel module
+        working-directory: linuxmod
+        run: |
+          echo "Building octnic Linux kernel module..."
+          make clean 2>/dev/null || true
+          make
+        shell: bash
+
+      - name: Verify output
+        run: |
+          echo "=== Build output ==="
+          ls -la linuxmod/octnic.ko
+          modinfo linuxmod/octnic.ko 2>/dev/null || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: octnic-ko-ubuntu${{ matrix.ubuntu }}-${{ github.sha }}
+          path: linuxmod/octnic.ko
+          retention-days: 30
+          if-no-files-found: error

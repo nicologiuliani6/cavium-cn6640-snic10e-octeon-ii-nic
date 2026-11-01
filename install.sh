@@ -31,7 +31,7 @@ grep -q '\[integrity\]\|\[confidentiality\]' /sys/kernel/security/lockdown 2>/de
 # With dkms present the module is registered so it rebuilds itself on every kernel
 # upgrade; without it we fall back to a plain build into /lib/modules/<ver>/extra,
 # which has to be re-run by hand after a kernel update. NODKMS=1 forces the fallback.
-VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$REPO/hostmod/dkms.conf")
+VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$REPO/linuxmod/dkms.conf")
 if command -v dkms >/dev/null 2>&1 && [ "${NODKMS:-0}" != 1 ]; then
   say "building host module (octnic $VER, dkms)"
   # drop EVERY registered octnic version (also stale/broken ones), else dkms skips the install
@@ -43,19 +43,19 @@ if command -v dkms >/dev/null 2>&1 && [ "${NODKMS:-0}" != 1 ]; then
   # drop any octnic.ko left by an earlier non-dkms install, else dkms flags the mismatch
   rm -f "/lib/modules/$(uname -r)/extra/octnic.ko"
   install -d "/usr/src/octnic-$VER"
-  install -m644 "$REPO/hostmod/octnic.c" "$REPO/hostmod/Makefile" "$REPO/hostmod/dkms.conf" \
+  install -m644 "$REPO/linuxmod/octnic.c" "$REPO/linuxmod/Makefile" "$REPO/linuxmod/dkms.conf" \
     "/usr/src/octnic-$VER/" || die "stage dkms source"
   dkms install -m octnic -v "$VER" >/tmp/octnic-build.log 2>&1 \
     || { tail -20 /tmp/octnic-build.log; die "dkms build failed"; }
   say "installed octnic.ko via dkms (rebuilds on kernel upgrade)"
 else
   say "building host module (octnic, no dkms)"
-  # Makefile uses M=$(PWD), so build from inside hostmod (not `make -C`).
-  ( cd "$REPO/hostmod" && make clean ) >/dev/null 2>&1 || true
-  ( cd "$REPO/hostmod" && make ) >/tmp/octnic-build.log 2>&1 || { cat /tmp/octnic-build.log; die "hostmod build failed"; }
+  # Makefile uses M=$(PWD), so build from inside linuxmod (not `make -C`).
+  ( cd "$REPO/linuxmod" && make clean ) >/dev/null 2>&1 || true
+  ( cd "$REPO/linuxmod" && make ) >/tmp/octnic-build.log 2>&1 || { cat /tmp/octnic-build.log; die "linuxmod build failed"; }
   DEST="/lib/modules/$(uname -r)/extra"
   install -d "$DEST"
-  install -m644 "$REPO/hostmod/octnic.ko" "$DEST/" || die "install octnic.ko"
+  install -m644 "$REPO/linuxmod/octnic.ko" "$DEST/" || die "install octnic.ko"
   depmod -a
   say "installed octnic.ko -> $DEST  (modprobe octnic; re-run after a kernel upgrade)"
 fi

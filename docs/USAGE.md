@@ -103,8 +103,8 @@ echo 18000 | sudo tee /sys/module/octnic/parameters/p_base_mw   # card as instal
 echo   700 | sudo tee /sys/module/octnic/parameters/p_gbps_mw   # extra per Gbit/s TX+RX
 ```
 
-`hostmod/power-model-check.py` re-runs the same integer expression as the driver, so a
-units or overflow slip fails there instead of in `sensors` (`python3 hostmod/power-model-check.py`).
+`linuxmod/power-model-check.py` re-runs the same integer expression as the driver, so a
+units or overflow slip fails there instead of in `sensors` (`python3 linuxmod/power-model-check.py`).
 
 Method: read the wall meter with the host idle, card removed vs. installed (modules
 plugged as you run them) → `p_base_mw`; then run `iperf3` at a known rate and divide the
@@ -123,7 +123,7 @@ env is the one permanent change — see the end of this section):
 sudo systemctl disable --now cavium-nic
 sudo rm -f /etc/systemd/system/cavium-nic.service && sudo systemctl daemon-reload
 sudo rmmod octnic
-sudo dkms remove -m octnic -v "$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' hostmod/dkms.conf)" --all
+sudo dkms remove -m octnic -v "$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' linuxmod/dkms.conf)" --all
 sudo rm -f /lib/modules/$(uname -r)/extra/octnic.ko && sudo depmod -a   # non-dkms install
 sudo rm -f /etc/modprobe.d/blacklist-liquidio.conf \
            /etc/NetworkManager/conf.d/99-octnic-unmanaged.conf

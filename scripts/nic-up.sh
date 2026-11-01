@@ -37,7 +37,7 @@ DC=$(setpci -s $BDF CAP_EXP+8.w 2>/dev/null)
 rmmod octnic 2>/dev/null || true
 # octnic auto-discovers BAR2 (base=0) -> `modprobe octnic` if installed, else insmod by path.
 OPTS="ports=$PORTS dma=1 poll_us=${POLLUS:-20} ${HRX:+hrx=1} ${RXTH:+rxthreads=$RXTH} ${ZTX:+ztx=1} ${NTXQ:+ntxq=$NTXQ}"
-modprobe octnic $OPTS 2>/dev/null || insmod "$REPO/hostmod/octnic.ko" $OPTS
+modprobe octnic $OPTS 2>/dev/null || insmod "$REPO/linuxmod/octnic.ko" $OPTS
 
 setup_port() { # oct cidr-or-empty(=DHCP)
   local OCT=$1 CIDR=$2
