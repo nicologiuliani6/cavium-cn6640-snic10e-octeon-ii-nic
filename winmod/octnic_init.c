@@ -11,10 +11,10 @@ static NDIS_STATUS OctnicMapBar2(PDRIVER_CONTEXT d, PNDIS_MINIPORT_INIT_PARAMETE
     SIZE_T need = (SIZE_T)PORT_STRIDE * d->numPorts;
     ULONG i;
 
-    if (ip->AllocatedResources == NULL || ip->AllocatedResources->Count < 1)
+    if (ip->AllocatedResources == NULL)
         return NDIS_STATUS_RESOURCES;
 
-    list = &ip->AllocatedResources->List[0].PartialResourceList;
+    list = ip->AllocatedResources;   /* PCM_PARTIAL_RESOURCE_LIST */
     for (i = 0; i < list->Count; i++) {
         PCM_PARTIAL_RESOURCE_DESCRIPTOR r = &list->PartialDescriptors[i];
         PUCHAR va;
