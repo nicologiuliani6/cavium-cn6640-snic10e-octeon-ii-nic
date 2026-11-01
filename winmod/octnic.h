@@ -59,6 +59,11 @@
 #define DEFAULT_RXTHREADS         8           /* parallel RX drain threads per port */
 #define DEFAULT_NTXQ              8           /* multi-queue TX queues */
 
+/* ---- Ethernet constants (not in WDK) ---- */
+#ifndef ETH_ALEN
+#define ETH_ALEN 6
+#endif
+
 /* ---- NDIS version ---- */
 #define NDIS_MINIPORT_MAJOR_VERSION   6
 #define NDIS_MINIPORT_MINOR_VERSION   13
