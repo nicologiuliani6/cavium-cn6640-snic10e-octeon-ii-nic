@@ -40,6 +40,7 @@ static NDIS_STATUS OctnicMapBar2(PDRIVER_CONTEXT d, PNDIS_MINIPORT_INIT_PARAMETE
 static NTSTATUS OctnicInitPort(PDRIVER_CONTEXT d, PPORT_CONTEXT p, ULONG idx)
 {
     ULONG i;
+    ULONG retries = 100;  /* ~10s wait for card to boot */
 
     p->portBase = d->bar2Mapping + (SIZE_T)idx * PORT_STRIDE;
     p->idx = idx;
@@ -50,12 +51,30 @@ static NTSTATUS OctnicInitPort(PDRIVER_CONTEXT d, PPORT_CONTEXT p, ULONG idx)
     p->rxConsShadow = 0;
     p->dpcCount = 0;
 
+    /* Wait for card to boot: magic + card_ready must be present.
+     * This handles the case where the driver loads before the card OS is up.
+     * The Linux driver does the same (reads magic, then card_ready). */
+    for (i = 0; i < retries; i++) {
+        ULONG magic = OctnicReadCtrl(p, C_MAGIC);
+        if (magic == OCTSHM_MAGIC) {
+            if (OctnicReadCtrl(p, C_CARD_READY)) {
+                break;  /* card is ready */
+            }
+            /* Magic present but not ready — card is booting, keep waiting */
+        }
+        if (i < retries - 1) {
+            LARGE_INTEGER delay;
+            delay.QuadPart = -100000LL;  /* 10ms */
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+    }
+
     if (OctnicReadCtrl(p, C_MAGIC) != OCTSHM_MAGIC) {
         DPRINT(DBG_ERROR, "port%lu bad magic", idx);
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
     if (!OctnicReadCtrl(p, C_CARD_READY)) {
-        DPRINT(DBG_ERROR, "port%lu card not ready", idx);
+        DPRINT(DBG_ERROR, "port%lu card not ready after %lu retries", idx, retries);
         return STATUS_TIMEOUT;
     }
 
@@ -129,12 +148,13 @@ static NDIS_STATUS OctnicSetAttributes(PDRIVER_CONTEXT d)
     status = NdisMSetMiniportAttributes(d->adapterHandle, (PNDIS_MINIPORT_ADAPTER_ATTRIBUTES)&reg);
     if (status != NDIS_STATUS_SUCCESS) return status;
 
-    /* locally-administered MAC derived from BAR2 phys + port */
+    /* locally-administered MAC derived from BAR2 phys + port (matches Linux crc32 approach) */
     d->mac[0] = 0x02; d->mac[1] = 0xC4;
-    d->mac[2] = (UCHAR)(d->bar2Phys.LowPart >> 24);
-    d->mac[3] = (UCHAR)(d->bar2Phys.LowPart >> 16);
-    d->mac[4] = (UCHAR)(d->bar2Phys.LowPart >> 8);
-    d->mac[5] = 0;
+    ULONG bar2Hash = RtlComputeCrc32(0, (PCHAR)&d->bar2Phys.LowPart, sizeof(d->bar2Phys.LowPart));
+    d->mac[2] = (UCHAR)(bar2Hash >> 24);
+    d->mac[3] = (UCHAR)(bar2Hash >> 16);
+    d->mac[4] = (UCHAR)(bar2Hash >> 8);
+    d->mac[5] = 0;  /* port 0 base; per-port offset added in OctnicInitPort */
 
     RtlZeroMemory(&gen, sizeof(gen));
     gen.Header.Type     = NDIS_OBJECT_TYPE_MINIPORT_ADAPTER_GENERAL_ATTRIBUTES;

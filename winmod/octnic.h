@@ -79,6 +79,10 @@
 
 #define DEBUG_LEVEL     (DBG_INIT | DBG_ERROR)
 
+#ifndef DPFLTR_IHVDRIVER_ID
+#define DPFLTR_IHVDRIVER_ID 71u   /* custom ID — visible in WinDbg: "octnic" */
+#endif
+
 #define DPRINT(level, fmt, ...) do { if ((DEBUG_LEVEL & (level))) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "octnic: " fmt "\n", ##__VA_ARGS__); } while (0)
 

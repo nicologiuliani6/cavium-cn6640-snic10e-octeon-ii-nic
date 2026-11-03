@@ -1,0 +1,1 @@
+cmd_/home/nico/Desktop/cavium/cardmod/Module.symvers := sed 's/ko$$/o/' /home/nico/Desktop/cavium/cardmod/modules.order | scripts/mod/modpost     -o /home/nico/Desktop/cavium/cardmod/Module.symvers -e -i Module.symvers   -n -T -

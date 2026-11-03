@@ -1,0 +1,1 @@
+cmd_/home/nico/Desktop/cavium/cardmod/modules.order := {   echo /home/nico/Desktop/cavium/cardmod/octshm_card.ko;   echo /home/nico/Desktop/cavium/cardmod/octcarrier.ko; :; } | awk '!x[$$0]++' - > /home/nico/Desktop/cavium/cardmod/modules.order

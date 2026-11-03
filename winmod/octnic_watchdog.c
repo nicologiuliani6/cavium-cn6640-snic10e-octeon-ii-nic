@@ -27,7 +27,7 @@ static VOID OctnicCheckCardHealth(PDRIVER_CONTEXT d)
     } else if (now.QuadPart - d->heartbeatTime.QuadPart > WD_DEAD_100NS) {
         lost = TRUE;
     }
-    if (OctnicReadCtrl(p, C_MAGIC) != OCTSHM_MAGIC) lost = TRUE;   /* BARs gone / reset */
+    if (!d->bar2Mapping || OctnicReadCtrl(p, C_MAGIC) != OCTSHM_MAGIC) lost = TRUE;   /* BARs gone / reset */
 
     if (!lost) {
         for (i = 0; i < 2; i++) {

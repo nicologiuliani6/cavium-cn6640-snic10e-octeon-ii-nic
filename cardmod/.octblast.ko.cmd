@@ -1,0 +1,1 @@
+cmd_/home/nico/Desktop/cavium/cardmod/octblast.ko := mips64-openwrt-linux-musl-ld -r -m elf64btsmip -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/nico/Desktop/cavium/cardmod/octblast.ko /home/nico/Desktop/cavium/cardmod/octblast.o /home/nico/Desktop/cavium/cardmod/octblast.mod.o;  make -f ./arch/mips/Makefile.postlink /home/nico/Desktop/cavium/cardmod/octblast.ko
