@@ -26,7 +26,7 @@ if not exist octnic.sys (
     cd /d "%TEMP%\octnic-pkg"
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\install_windows.ps1" -PackageDir "%CD%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\install_windows.ps1" -PackageDir "%CD%" %*
 if "%errorlevel%"=="3010" (
     reg add HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce /v octnic /d "\"%SELF%\"" /f >nul
     echo [OK] Test-signing enabled. Reboot required; installation continues automatically after login.

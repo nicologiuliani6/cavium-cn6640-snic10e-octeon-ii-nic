@@ -86,10 +86,11 @@ One PCI function can bind only one NDIS adapter. So **port 0** is the PCI device
 
 Requirements: Windows 10/11 x64, **Secure Boot off** (test-signing cannot be enabled otherwise).
 
+The installer (`install.bat` at the repo root, or `install_windows.bat`) is the global guided flow described in the [main README](../README.md#install-all-operating-systems): card present? → install driver → card already flashed? (`octboot.ps1 -Probe`) → if not: find the USB-serial adapter (`octnic-provision.ps1 -Detect`), test it (`-Check`), and after confirmation flash the u-boot env (`octnic-provision.ps1`, a port of `card-prep-hostboot.sh`; untested on Windows hardware) → boot task. `-Yes` answers yes to every question.
 ### Card boot from Windows (automatic)
 The card's OpenWrt runs from RAM and must be pushed by the host after power-on. `octboot.ps1` does what Linux `octboot` does, through the driver's control device `\\.\octnic` (Administrators/SYSTEM only): wait for the BAR2 window, push the image at `+0x10000` with verify + word-fix, write `GO!!` at `+0x100`, wait for the heartbeat; it falls back to a secondary bus reset (SBR) + retry. **It is a no-op when the card OS is already up**, so it never fights Linux (dual boot / warm reboot). The task `octnic-boot` runs `octnic-start.ps1` at boot: waits for the adapters, names them, runs `octboot.ps1 -Download` (image is fetched once from the release into `C:\ProgramData\octnic`). Logs: `C:\ProgramData\octnic\start.log`, `octboot.log`; driver log: `C:\Windows\octnic.log`.
 
-Manual: `.\octboot.ps1 [-ImagePath file.bin] [-Force]` (as Administrator).
+Manual: `.\octboot.ps1 [-ImagePath file.bin] [-Force] [-Download]` (as Administrator); `-Probe` prints `STATE=osready|os|live|dead`; `-SbrOnly` resets the card.
 
 ### Build from source
 `build_local.bat` (VS Build Tools + WDK 10.0.26100, plain `cl`/`link`, no MSBuild WDK integration) → `out\octnic.sys`; `package.ps1` → test-signed `dist\` (INF + catalog + scripts). `octnic.vcxproj` is used by CI.

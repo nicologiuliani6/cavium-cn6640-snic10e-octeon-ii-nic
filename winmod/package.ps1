@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $bin = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0'
 Remove-Item $Out -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $Out | Out-Null
-Copy-Item "$PSScriptRoot\out\octnic.sys","$PSScriptRoot\octnic.inf","$PSScriptRoot\octnic-addport.ps1","$PSScriptRoot\octnic-start.ps1","$PSScriptRoot\octboot.ps1","$PSScriptRoot\install_windows.ps1","$PSScriptRoot\install_windows.bat" $Out
+Copy-Item "$PSScriptRoot\out\octnic.sys","$PSScriptRoot\octnic.inf","$PSScriptRoot\octnic-addport.ps1","$PSScriptRoot\octnic-start.ps1","$PSScriptRoot\octboot.ps1","$PSScriptRoot\octnic-provision.ps1","$PSScriptRoot\install_windows.ps1","$PSScriptRoot\install_windows.bat" $Out
 # unique, monotonically increasing DriverVer per build so Windows always prefers the new package
 $build = [int]((Get-Date) - [datetime]'2026-11-01').TotalMinutes
 $txt = (Get-Content "$Out\octnic.inf" -Raw) -replace 'DriverVer\s*=\s*[^\r\n]+', ("DriverVer   = {0},1.1.{1}.{2}" -f (Get-Date -Format 'MM/dd/yyyy'), [int][math]::Floor($build / 65535), ($build % 65535))

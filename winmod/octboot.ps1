@@ -14,6 +14,8 @@ param(
     [string]$ImagePath = '',
     [switch]$Force,                 # reload even if the card OS is already up
     [switch]$Download,              # fetch the image from the latest GitHub release if missing
+    [switch]$Probe,                 # print STATE=osready|os|live|dead and exit (no image needed)
+    [switch]$SbrOnly,               # secondary bus reset + restore card config, then exit
     [int]$WindowTimeoutSeconds = 90,
     [int]$BootTimeoutSeconds = 240,
     [string]$Repo = 'nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic'
@@ -68,9 +70,10 @@ $s = [OctCtl]::Status()
 if (-not $s) { Fail "status ioctl failed (win32 error $([OctCtl]::LastErr); 21=device not ready: PCI device not started / BAR2 not mapped)" }
 function CardUp($s) { return ($s[3] -eq $Magic -and $s[4] -ne 0) }
 
-if ((CardUp $s) -and -not $Force) { Log '[ OK ] card OS already up and ready - nothing to do' Green; exit 0 }
+if ((CardUp $s) -and -not $Force -and -not $Probe -and -not $SbrOnly) { Log '[ OK ] card OS already up and ready - nothing to do' Green; exit 0 }
 
 # ---- find / fetch the card image ----
+if (-not ($Probe -or $SbrOnly)) {
 if (-not $ImagePath) {
     $cands = @("$PSScriptRoot\$ImgName", "$PSScriptRoot\*snic10e-initramfs-kernel.bin", "$PSScriptRoot\..\$ImgName", "$DataDir\$ImgName")
     foreach ($c in $cands) { $f = Get-ChildItem $c -ErrorAction SilentlyContinue | Select-Object -First 1; if ($f) { $ImagePath = $f.FullName; break } }
@@ -87,6 +90,7 @@ if ((-not $ImagePath -or -not (Test-Path $ImagePath)) -and $Download) {
 if (-not $ImagePath -or -not (Test-Path $ImagePath)) { Fail "card image not found (use -ImagePath or -Download)" }
 $img = [IO.File]::ReadAllBytes($ImagePath)
 Log "[ OK ] image $ImagePath ($($img.Length) bytes)" Green
+}
 
 # ---- PCI location of the card + upstream bridge (for the secondary bus reset) ----
 function PciLoc($id) {
@@ -147,6 +151,12 @@ function Wait-Card([int]$secs) {
     return $false
 }
 
+if ($SbrOnly) { Invoke-Sbr; exit 0 }
+if ($Probe) {
+    $WindowTimeoutSeconds = 3
+    $st = if (CardUp $s) { 'osready' } elseif ($s[3] -eq $Magic) { 'os' } elseif (Wait-Window) { 'live' } else { 'dead' }
+    Write-Output "STATE=$st"; exit 0
+}
 # attempt 1: fast path (u-boot waiting with a live window); attempt 2: after a secondary bus reset
 if ($Force -and (CardUp $s)) { Invoke-Sbr }
 if (-not (Wait-Window)) { Log 'window not live -> SBR' Yellow; Invoke-Sbr; if (-not (Wait-Window)) { Fail 'BAR2 window never writable even after SBR. Power-cycle the PC, then run again.' } }
