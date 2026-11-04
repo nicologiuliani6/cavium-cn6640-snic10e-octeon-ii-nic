@@ -70,27 +70,31 @@ msbuild octnic.vcxproj /p:Configuration=Release /p:Platform=x64
 
 ## Installation
 
-> Status: builds in CI (NDIS 6.20), **not yet tested on real Windows hardware**. One NDIS adapter drives port 0 only.
+> Status: **tested on real hardware** (Windows 11 24H2, test-signed). Two NDIS adapters `oct0` / `oct1`, DHCP, ping and internet verified through the card. Port link follows the card's SFP+ link bit, so a port with no peer stays "Disconnected".
+
+### How two NICs come from one PCI function
+One PCI function can bind only one NDIS adapter. So **port 0** is the PCI device (`PCI\VEN_177D&DEV_0092`, owns the BAR2 mapping and the host DMA memory) and **port 1** is a root-enumerated companion device (`ROOT\OCTNIC_PORT1`, created by `octnic-addport.ps1`) that shares them. Both are served by the same `octnic.sys`; the INF writes `OctPort` per device section. Both show up in Device Manager and under *Network Connections*.
 
 ### Easy install (prebuilt, test-signed)
 
-Every [release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest) ships `install_windows.bat` and `octnic-windows-x64.zip` (`octnic.sys`, `octnic.inf`, `octnic.cat`, `octnic-test.cer`).
-
-1. Make sure the card is seated and **booted** (see *Usage → Boot the Card*).
-2. Download `install_windows.bat` and double-click it. It asks for Administrator rights and then:
-   - checks the card is on the PCI bus (`VEN_177D&DEV_0092`),
-   - downloads the latest zip if `octnic.sys` is not next to it,
-   - trusts the bundled test certificate,
-   - enables test-signing if off (`bcdedit /set testsigning on`), asks to reboot and **resumes by itself after login**,
-   - installs the driver with `pnputil /add-driver octnic.inf /install`,
-   - waits for the NIC to appear (it only starts if the card is already booted).
-3. Verify: `Get-NetAdapter` — look for "Cavium CN6640 SNIC10E Shared-Memory NIC".
-
-If the driver is installed but no NIC appears, the card is not booted: boot it, then `pnputil /restart-device "PCI\VEN_177D&DEV_0092*"`.
+1. Download `install_windows.bat` (and `octnic-windows-x64.zip`) from the [latest release](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeon-ii-nic/releases/latest) and double-click it. It asks for Administrator rights and then:
+   - trusts the bundled test certificate (no "install this driver?" popup),
+   - enables test-signing if off (`bcdedit /set testsigning on`; reboots once and **resumes by itself**),
+   - installs the driver, creates the second port, names the NICs `oct0` / `oct1`,
+   - registers the boot task **`octnic-boot`** (SYSTEM, at every Windows start) that boots the card — see below.
+2. Verify: `Get-NetAdapter oct0, oct1`.
 
 Requirements: Windows 10/11 x64, **Secure Boot off** (test-signing cannot be enabled otherwise).
 
-Uninstall: `pnputil /enum-drivers`, then `pnputil /delete-driver oemNN.inf /uninstall`.
+### Card boot from Windows (automatic)
+The card's OpenWrt runs from RAM and must be pushed by the host after power-on. `octboot.ps1` does what Linux `octboot` does, through the driver's control device `\\.\octnic` (Administrators/SYSTEM only): wait for the BAR2 window, push the image at `+0x10000` with verify + word-fix, write `GO!!` at `+0x100`, wait for the heartbeat; it falls back to a secondary bus reset (SBR) + retry. **It is a no-op when the card OS is already up**, so it never fights Linux (dual boot / warm reboot). The task `octnic-boot` runs `octnic-start.ps1` at boot: waits for the adapters, names them, runs `octboot.ps1 -Download` (image is fetched once from the release into `C:\ProgramData\octnic`). Logs: `C:\ProgramData\octnic\start.log`, `octboot.log`; driver log: `C:\Windows\octnic.log`.
+
+Manual: `.\octboot.ps1 [-ImagePath file.bin] [-Force]` (as Administrator).
+
+### Build from source
+`build_local.bat` (VS Build Tools + WDK 10.0.26100, plain `cl`/`link`, no MSBuild WDK integration) → `out\octnic.sys`; `package.ps1` → test-signed `dist\` (INF + catalog + scripts). `octnic.vcxproj` is used by CI.
+
+Uninstall: `pnputil /enum-drivers`, `pnputil /delete-driver oemNN.inf /uninstall`, `Unregister-ScheduledTask octnic-boot`.
 
 ### Production signing (no test-signing)
 
@@ -103,30 +107,11 @@ Needs a Microsoft-signed driver: EV code-signing certificate + Windows Hardware 
 
 ## Usage
 
-### Boot the Card (First Time)
-The card requires one-time u-boot environment provisioning via serial cable (same as Linux). See [docs/FLASHING.md](../docs/FLASHING.md) §3.
-
-### Boot and Bring Up NICs
 ```powershell
-# As Administrator
-.\octboot.ps1
-
-# Or with custom image path
-.\octboot.ps1 -ImagePath "C:\path\to\openwrt-snic10e-initramfs-kernel.bin"
-
-# Verify adapters
-Get-NetAdapter -Name 'oct*'
+Get-NetAdapter oct0, oct1                    # both NICs
+New-NetIPAddress -InterfaceAlias oct0 -IPAddress 10.9.9.1 -PrefixLength 24
+Set-NetIPInterface -InterfaceAlias oct1 -Dhcp Enabled
 ```
-
-### Configure Network
-```powershell
-# Set static IP on oct0
-New-NetIPAddress -InterfaceAlias 'oct0' -IPAddress '192.168.1.10' -PrefixLength 24
-
-# Enable DHCP on oct1
-Set-NetIPInterface -InterfaceAlias 'oct1' -Dhcp Enabled
-```
-
 ## Module Parameters (Registry)
 
 Parameters are configured via Windows Registry under:
@@ -134,7 +119,7 @@ Parameters are configured via Windows Registry under:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `Ports` | DWORD | 2 | Number of NICs (1 or 2) |
+| `RxThreads` | DWORD | 2 | RX drain threads per port (power of 2, 1..8) |
 | `PollUs` | DWORD | 20 | RX poll interval in microseconds |
 | `Hrx` | DWORD | 1 | Host-RAM RX descriptors |
 | `RxThreads` | DWORD | 8 | Parallel RX drain threads |

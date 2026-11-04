@@ -38,3 +38,8 @@ openwrt/files/root/*.ko
 /SHA256SUMS
 winmod/submission/
 winmod/out/
+
+winmod/out/
+winmod/dist/
+winmod/*.pdb
+winmod/*.res

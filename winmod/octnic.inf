@@ -1,23 +1,42 @@
-; octnic.inf — Cavium CN6640 SNIC10E shared-memory NIC (NDIS miniport)
+; octnic.inf --- Cavium CN6640 SNIC10E shared-memory NIC (NDIS miniport, 2 ports)
+;
+; Port 0 binds the PCI function; port 1 is a root-enumerated companion device
+; (ROOT\OCTNIC_PORT1) created by install_windows.bat / pnputil /add-device.
+; Both are served by the same octnic.sys.
 [Version]
 Signature   = "$WINDOWS NT$"
 Class       = Net
 ClassGUID   = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider    = %Mfg%
 CatalogFile = octnic.cat
-DriverVer   = 11/01/2026,1.0.0.0
+DriverVer   = 11/04/2026,1.1.0.0
 PnpLockdown = 1
 
 [Manufacturer]
 %Mfg% = Octnic, NTamd64
 
 [Octnic.NTamd64]
-%Octnic.DeviceDesc% = Octnic.ndi, PCI\VEN_177D&DEV_0092
+%Octnic.Port0.DeviceDesc% = Octnic.ndi,       PCI\VEN_177D&DEV_0092
+%Octnic.Port1.DeviceDesc% = Octnic.port1.ndi, ROOT\OCTNIC_PORT1
 
+[DestinationDirs]
+Octnic.CopyFiles = 13
+
+[Octnic.CopyFiles]
+octnic.sys
+
+; ---------------- port 0 (PCI) ----------------
 [Octnic.ndi]
 Characteristics = 0x4          ; NCF_PHYSICAL
 BusType         = 5            ; PCI
-AddReg          = Octnic.Reg
+CopyFiles       = Octnic.CopyFiles
+AddReg          = Octnic.Reg, Octnic.Port0.Reg
+
+; ---------------- port 1 (root-enumerated) ----------------
+[Octnic.port1.ndi]
+Characteristics = 0x84         ; NCF_PHYSICAL | NCF_HAS_UI
+CopyFiles       = Octnic.CopyFiles
+AddReg          = Octnic.Reg, Octnic.Port1.Reg
 
 [Octnic.Reg]
 HKR, Ndi, Service, 0, "octnic"
@@ -27,7 +46,16 @@ HKR, , *IfType, 0x00010001, 6
 HKR, , *MediaType, 0x00010001, 0
 HKR, , *PhysicalMediaType, 0x00010001, 14
 
+[Octnic.Port0.Reg]
+HKR, , OctPort, 0x00010001, 0
+
+[Octnic.Port1.Reg]
+HKR, , OctPort, 0x00010001, 1
+
 [Octnic.ndi.Services]
+AddService = octnic, 2, Octnic.Service
+
+[Octnic.port1.ndi.Services]
 AddService = octnic, 2, Octnic.Service
 
 [Octnic.Service]
@@ -44,7 +72,8 @@ ServiceBinary = %13%\octnic.sys
 octnic.sys = 1
 
 [Strings]
-Mfg                    = "Cavium CN6640 SNIC10E Project"
-Octnic.DeviceDesc      = "Cavium CN6640 SNIC10E Shared-Memory NIC"
-Octnic.Service.DispName = "Cavium CN6640 SNIC10E NIC Driver"
-DiskId                 = "octnic install disk"
+Mfg                      = "Cavium CN6640 SNIC10E Project"
+Octnic.Port0.DeviceDesc  = "Cavium CN6640 SNIC10E 10GbE Port 0"
+Octnic.Port1.DeviceDesc  = "Cavium CN6640 SNIC10E 10GbE Port 1"
+Octnic.Service.DispName  = "Cavium CN6640 SNIC10E NIC Driver"
+DiskId                   = "octnic install disk"

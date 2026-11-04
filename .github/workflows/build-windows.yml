@@ -74,7 +74,7 @@ jobs:
           if (!$sys) { Write-Error "octnic.sys not built"; exit 1 }
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $sys dist\octnic.sys
-          Copy-Item winmod\octnic.inf, winmod\install_windows.bat dist\
+          Copy-Item winmod\octnic.inf, winmod\install_windows.bat, winmod\install_windows.ps1, winmod\octnic-addport.ps1, winmod\octnic-start.ps1, winmod\octboot.ps1 dist\
           # self-signed test cert, shipped in the zip (install script trusts it)
           $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=octnic test signing" `
                     -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(5)
