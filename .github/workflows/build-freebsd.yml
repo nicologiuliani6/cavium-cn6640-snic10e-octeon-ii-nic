@@ -25,20 +25,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        freebsd-version: [14.5-RELEASE]
+        freebsd-version: [14.5]
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Build FreeBSD kernel module in VM
+        id: build-vm
         uses: vmactions/freebsd-vm@v1
         with:
-          version: ${{ matrix.freebsd-version }}
-          usesh: true
+          release: ${{ matrix.freebsd-version }}
+          sync: rsync
           prepare: |
             pkg install -y llvm18 git
-          copy-in: bsdmod/
           run: |
             cd bsdmod
             make clean 2>/dev/null || true
@@ -52,13 +52,13 @@ jobs:
           cp bsdmod/if_octnic.ko freebsd-build/
           cp bsdmod/README.md freebsd-build/
           echo "FreeBSD ${{ matrix.freebsd-version }}" > freebsd-build/BUILD-INFO
-          tar czf if_octnic-freebsd${{ matrix.freebsd-version//./ }}.tar.gz -C freebsd-build .
+          tar czf if_octnic-freebsd${{ matrix.freebsd-version }}.tar.gz -C freebsd-build .
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: if_octnic-freebsd${{ matrix.freebsd-version//./ }}-${{ github.sha }}
-          path: if_octnic-freebsd${{ matrix.freebsd-version//./ }}.tar.gz
+          name: if_octnic-freebsd${{ matrix.freebsd-version }}-${{ github.sha }}
+          path: if_octnic-freebsd${{ matrix.freebsd-version }}.tar.gz
           retention-days: 30
           if-no-files-found: error
 
@@ -67,6 +67,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            if_octnic-freebsd${{ matrix.freebsd-version//./ }}.tar.gz
+            if_octnic-freebsd${{ matrix.freebsd-version }}.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
