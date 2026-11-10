@@ -21,13 +21,13 @@
 #include <sys/errno.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
-#include <sys/crc32.h>
+#include <sys/gsb_crc32.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/ethernet.h>
 #include <net/if_types.h>
-#include <net/ifq_var.h>
+
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
