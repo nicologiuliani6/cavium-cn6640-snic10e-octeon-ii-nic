@@ -210,7 +210,7 @@ octnic_start(struct ifnet *ifp, struct mbuf *m0)
 	if ((ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
 		m_freem(m0);
 		if_inc_counter(ifp, IFCOUNTER_OQDROPS, 1);
-		return;
+		return (0);
 	}
 
 	/* CAS-claim a slot — parallel across txqs */
@@ -222,7 +222,7 @@ octnic_start(struct ifnet *ifp, struct mbuf *m0)
 			if ((tp - tc) >= OCTNIC_RING_SIZE) {
 				m_freem(m0);
 				if_inc_counter(ifp, IFCOUNTER_OQDROPS, 1);
-				return;
+				return (0);
 			}
 		}
 
@@ -262,6 +262,7 @@ octnic_start(struct ifnet *ifp, struct mbuf *m0)
 
 	m_freem(m0);
 	if_inc_counter(ifp, IFCOUNTER_OBYTES, len);
+	return (0);
 }
 
 /* ----------------------------------------------------------------
@@ -441,7 +442,6 @@ octnic_qflush(struct ifnet *ifp)
 {
 
 	IFQ_PURGE(&ifp->if_snd);
-	ifq_clr_len(&ifp->if_snd, ifp->if_snd.ifq_len);
 }
 
 /* ----------------------------------------------------------------
