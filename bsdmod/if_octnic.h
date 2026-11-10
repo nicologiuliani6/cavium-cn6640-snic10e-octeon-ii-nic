@@ -1,5 +1,5 @@
 /*-
- * SPDX-License-Identifier: BSD-2-Clause
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 2026 Cavium CN6640 SNIC10E FreeBSD Driver Project
  */
@@ -14,7 +14,6 @@
 #include <sys/bus.h>
 #include <machine/bus.h>
 #include <sys/rman.h>
-#include <sys/ctype.h>
 #include <sys/sysctl.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
@@ -22,11 +21,14 @@
 #include <sys/errno.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
+#include <sys/crc32.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/ethernet.h>
 #include <net/if_types.h>
+#include <net/ifq_var.h>
+
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
@@ -38,23 +40,20 @@
 struct octnic_port {
 	struct octnic_softc	*op_sc;
 	int			 op_port_id;
-	if_t			 op_ifp;
+	struct ifnet		*op_ifp;
 
 	/* Shadow counters (host owns, kept in RAM) */
 	uint32_t		 op_tx_prod;	/* TX producer shadow */
 	uint32_t		 op_rx_cons;	/* RX consumer shadow */
 
-	/* Parallel TX CAS counter */
-	atomic_int		 op_tx_claim;
+	/* Parallel TX CAS counter — FreeBSD uses atomic_fetchadd_int */
+	int			 op_tx_claim;
 
 	/* Last observed card TX consumer (cache) */
 	uint32_t		 op_tc_cache;
 
 	/* Multi-thread RX consumer per thread */
 	uint32_t		 op_rc_pub[8];
-
-	/* Poll threads */
-	struct thread		*op_poll_threads[8];
 
 	/* MAC address */
 	uint8_t			 op_macaddr[6];
@@ -65,6 +64,7 @@ struct octnic_port {
 	/* DMA pools (hrx mode) */
 	void			*op_rx_dma_va;
 	bus_addr_t		 op_rx_dma_bus;
+	bus_dmamap_t		 op_rx_dmamap;
 };
 
 /* ----------------------------------------------------------------
@@ -111,12 +111,12 @@ static int octnic_detach(device_t dev);
 
 static void octnic_init(void *arg);
 static void octnic_stop(struct octnic_port *port);
-static int  octnic_ioctl(if_t ifp, u_long cmd, caddr_t data);
-static void octnic_transmit(if_t ifp, struct mbuf *m);
-static void octnic_qflush(if_t ifp);
+static int  octnic_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data);
+static void octnic_start(struct ifnet *ifp, struct mbuf *m0);
+static void octnic_qflush(struct ifnet *ifp);
 
-/* Per-port RX drain thread */
-static int  octnic_poll_fn(void *arg);
+/* Per-port RX drain */
+static void octnic_drain(void *arg, int pending);
 
 /* Watchdog */
 static void octnic_watchdog(void *arg, int pending);
@@ -125,7 +125,5 @@ static void octnic_timer_tick(void *arg);
 /* DMA helpers */
 static int  octnic_dma_alloc(struct octnic_port *port);
 static void octnic_dma_free(struct octnic_port *port);
-
-/* MMIO helpers (inline in .c) */
 
 #endif /* _IF_OCTNIC_H_ */
