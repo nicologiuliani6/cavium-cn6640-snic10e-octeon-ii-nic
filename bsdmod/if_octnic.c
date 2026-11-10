@@ -200,7 +200,7 @@ octnic_dma_free(struct octnic_port *port)
 /* ----------------------------------------------------------------
  * TX — oct_xmit equivalent
  * ---------------------------------------------------------------- */
-static void
+static int
 octnic_start(struct ifnet *ifp, struct mbuf *m0)
 {
 	struct octnic_port *port = ifp->if_softc;
@@ -422,7 +422,7 @@ octnic_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		break;
 	case SIOCSIFMTU: {
 		struct ifreq *ifr = (struct ifreq *)data;
-		if (ifr->ifr_mtu > ETHER_MAX_MTU || ifr->ifr_mtu < ETHERMIN)
+		if (ifr->ifr_mtu > 65535 || ifr->ifr_mtu < ETHERMIN)
 			error = EINVAL;
 		else
 			ifp->if_mtu = ifr->ifr_mtu;
@@ -440,7 +440,8 @@ static void
 octnic_qflush(struct ifnet *ifp)
 {
 
-	ifq_purge(&ifp->if_snd);
+	IFQ_PURGE(&ifp->if_snd);
+	ifq_clr_len(&ifp->if_snd, ifp->if_snd.ifq_len);
 }
 
 /* ----------------------------------------------------------------
@@ -469,7 +470,7 @@ octnic_watchdog(void *arg, int pending)
 	if (prd(PORT(sc, 0), C_MAGIC) != OCTNIC_MAGIC) {
 		sc->sc_card_lost = 1;
 		for (i = 0; i < oct_ports && i < OCTNIC_MAX_PORTS; i++)
-			if_setlinkstate(PORT(sc, i)->op_ifp, LINK_STATE_DOWN);
+			if_link_state_change(PORT(sc, i)->op_ifp, LINK_STATE_DOWN);
 		device_printf(sc->sc_dev, "CAVIUM CARD LOST: magic gone\n");
 		return;
 	}
@@ -480,7 +481,7 @@ octnic_watchdog(void *arg, int pending)
 		if ((time_uptime - sc->sc_hb_time) > oct_hb_timeout) {
 			sc->sc_card_lost = 1;
 			for (i = 0; i < oct_ports && i < OCTNIC_MAX_PORTS; i++)
-				if_setlinkstate(PORT(sc, i)->op_ifp,
+				if_link_state_change(PORT(sc, i)->op_ifp,
 				    LINK_STATE_DOWN);
 			device_printf(sc->sc_dev,
 			    "CAVIUM CARD LOST: heartbeat frozen\n");
@@ -521,9 +522,9 @@ octnic_watchdog(void *arg, int pending)
 		int carrier = (link & 0x80000000u) ? (link & 1) : 1;
 
 		if (carrier && port->op_ifp->if_link_state != LINK_STATE_UP)
-			if_setlinkstate(port->op_ifp, LINK_STATE_UP);
+			if_link_state_change(port->op_ifp, LINK_STATE_UP);
 		else if (!carrier && port->op_ifp->if_link_state != LINK_STATE_DOWN)
-			if_setlinkstate(port->op_ifp, LINK_STATE_DOWN);
+			if_link_state_change(port->op_ifp, LINK_STATE_DOWN);
 	}
 }
 
@@ -639,7 +640,11 @@ octnic_attach(device_t dev)
 		port->op_port_id = i;
 
 		/* MAC: 02:c4:xx:xx:xx:xx based on device name hash */
-		uint32_t h = crc32(pci_name(dev), strlen(pci_name(dev)));
+		/* Generate a stable MAC hash from domain:bus:slot:function */
+		uint32_t h = (uint32_t)(pci_get_domain(dev) << 24) |
+		    (uint32_t)(pci_get_bus(dev) << 16) |
+		    (uint32_t)(pci_get_slot(dev) << 8) |
+		    (uint32_t)(pci_get_function(dev));
 		port->op_macaddr[0] = 0x02;
 		port->op_macaddr[1] = 0xc4;
 		port->op_macaddr[2] = (h >> 24) & 0xff;
@@ -670,7 +675,7 @@ octnic_attach(device_t dev)
 		if_setmtu(port->op_ifp, 1500);
 
 		ether_ifattach(port->op_ifp, port->op_macaddr);
-		if_setlinkstate(port->op_ifp, LINK_STATE_DOWN);
+		if_link_state_change(port->op_ifp, LINK_STATE_DOWN);
 
 		device_printf(dev, "registered %s\n", if_name(port->op_ifp));
 	}
