@@ -14,78 +14,120 @@
 #include <sys/bus.h>
 #include <machine/bus.h>
 #include <sys/rman.h>
+#include <sys/ctype.h>
+#include <sys/sysctl.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/taskqueue.h>
+#include <sys/errno.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
-#include <sys/mbuf.h>
-#include <sys/sysctl.h>
-#include <sys/taskqueue.h>
+
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/ethernet.h>
 #include <net/if_types.h>
+#include <net/ifq_var.h>
+
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
 
 #include "octnic_regs.h"
 
-struct octnic_softc;
-
-/* Virtio-style Ring Descriptor (16 bytes) matching octnic.c */
-struct octnic_desc {
-	uint64_t	addr;	/* Host physical address or BAR2 offset */
-	uint32_t	len;	/* Buffer length / flags */
-	uint32_t	flags;	/* Phase bit, wrap, status */
-};
-
-struct octnic_tx_ring {
-	struct octnic_desc	*desc;
-	uint32_t		prod;
-	uint32_t		cons;
-	uint8_t			phase;
-	bus_dma_tag_t		dmat;
-	bus_dmamap_t		maps[OCTNIC_RING_SIZE];
-	struct mbuf		*bufs[OCTNIC_RING_SIZE];
-};
-
-struct octnic_rx_ring {
-	struct octnic_desc	*desc;
-	uint32_t		prod;
-	uint32_t		cons;
-	uint8_t			phase;
-	bus_dma_tag_t		dmat;
-	bus_dmamap_t		maps[OCTNIC_RING_SIZE];
-	struct mbuf		*bufs[OCTNIC_RING_SIZE];
-};
-
+/* ----------------------------------------------------------------
+ * Per-port software state — mirrors linuxmod/octnic.c host_port
+ * ---------------------------------------------------------------- */
 struct octnic_port {
 	struct octnic_softc	*op_sc;
-	int			op_port_id;
-	if_t			op_ifp;
-	struct octnic_tx_ring	op_tx;
-	struct octnic_rx_ring	op_rx;
-	uint8_t			op_macaddr[6];
-	int			op_running;
+	int			 op_port_id;
+	if_t			 op_ifp;
+
+	/* Shadow counters (host owns, kept in RAM) */
+	uint32_t		 op_tx_prod;	/* TX producer shadow */
+	uint32_t		 op_rx_cons;	/* RX consumer shadow */
+
+	/* Parallel TX CAS counter */
+	atomic_int		 op_tx_claim;
+
+	/* Last observed card TX consumer (cache) */
+	uint32_t		 op_tc_cache;
+
+	/* Multi-thread RX consumer per thread */
+	uint32_t		 op_rc_pub[8];
+
+	/* Poll threads */
+	struct thread		*op_poll_threads[8];
+
+	/* MAC address */
+	uint8_t			 op_macaddr[6];
+
+	/* Running flag */
+	int			 op_running;
+
+	/* DMA pools (hrx mode) */
+	void			*op_rx_dma_va;
+	bus_addr_t		 op_rx_dma_bus;
 };
 
+/* ----------------------------------------------------------------
+ * Softc — one per PCI device, two ports
+ * ---------------------------------------------------------------- */
 struct octnic_softc {
-	device_t		sc_dev;
+	device_t		 sc_dev;
 	struct resource		*sc_bar2_res;
-	int			sc_bar2_rid;
-	bus_space_tag_t		sc_bst;
-	bus_space_handle_t	sc_bsh;
-	bus_dma_tag_t		sc_parent_dmat;
+	int			 sc_bar2_rid;
+	bus_space_tag_t		 sc_bst;
+	bus_space_handle_t	 sc_bsh;
+	bus_dma_tag_t		 sc_parent_dmat;
 
-	struct octnic_port	sc_ports[OCTNIC_MAX_PORTS];
+	struct octnic_port	 sc_ports[OCTNIC_MAX_PORTS];
 
-	struct sysctl_ctx_list	sc_sysctl_ctx;
+	/* Sysctl */
+	struct sysctl_ctx_list	 sc_sysctl_ctx;
 	struct sysctl_oid	*sc_sysctl_tree;
 
-	int			sc_temp_warn;
-	int			sc_temp_crit;
-	int			sc_heartbeat_last;
-	struct callout		sc_timer;
-	struct task		sc_watchdog_task;
-	int			sc_test_mode;	/* 1 for ivshmem emulation mode */
+	/* Temperature thresholds (millidegC) — match Linux module params */
+	int			 sc_temp_warn_mc;
+	int			 sc_temp_crit_mc;
+
+	/* Heartbeat / watchdog */
+	int			 sc_heartbeat_last;
+	uint32_t		 sc_hb_jiffies;
+
+	/* Card lost flag */
+	int			 sc_card_lost;
+
+	/* Test mode (ivshmem) */
+	int			 sc_test_mode;
+
+	/* Lock for port state */
+	struct mtx		 sc_lock;
 };
+
+/* ----------------------------------------------------------------
+ * Function prototypes
+ * ---------------------------------------------------------------- */
+static int octnic_probe(device_t dev);
+static int octnic_attach(device_t dev);
+static int octnic_detach(device_t dev);
+
+static void octnic_init(void *arg);
+static void octnic_stop(struct octnic_port *port);
+static int  octnic_ioctl(if_t ifp, u_long cmd, caddr_t data);
+static void octnic_transmit(if_t ifp, struct mbuf *m);
+static void octnic_qflush(if_t ifp);
+
+/* Per-port RX drain thread */
+static int  octnic_poll_fn(void *arg);
+
+/* Watchdog */
+static void octnic_watchdog(void *arg, int pending);
+static void octnic_timer_tick(void *arg);
+
+/* DMA helpers */
+static int  octnic_dma_alloc(struct octnic_port *port);
+static void octnic_dma_free(struct octnic_port *port);
+
+/* MMIO helpers (inline in .c) */
 
 #endif /* _IF_OCTNIC_H_ */
