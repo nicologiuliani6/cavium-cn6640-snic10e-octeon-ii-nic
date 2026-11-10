@@ -62,7 +62,7 @@ struct octnic_port {
 	int			 op_running;
 
 	/* DMA pools (hrx mode) */
-	void			*op_rx_dma_va;
+	uint8_t			*op_rx_dma_va;
 	bus_addr_t		 op_rx_dma_bus;
 	bus_dmamap_t		 op_rx_dmamap;
 };
@@ -89,8 +89,8 @@ struct octnic_softc {
 	int			 sc_temp_crit_mc;
 
 	/* Heartbeat / watchdog */
-	int			 sc_heartbeat_last;
-	uint32_t		 sc_hb_jiffies;
+	uint32_t		 sc_heartbeat_last;
+	time_t			 sc_hb_time;
 
 	/* Card lost flag */
 	int			 sc_card_lost;
@@ -100,6 +100,8 @@ struct octnic_softc {
 
 	/* Lock for port state */
 	struct mtx		 sc_lock;
+	struct callout		sc_timer;
+	struct task		 sc_watchdog_task;
 };
 
 /* ----------------------------------------------------------------
