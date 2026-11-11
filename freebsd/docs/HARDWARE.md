@@ -1,5 +1,7 @@
 # Hardware
 
+> **Status: not verified.** Written from the Linux driver and the FreeBSD port design. Not tested on a FreeBSD host or on hardware. See [README](../README.md).
+
 ## The card
 
 | | |
@@ -98,7 +100,7 @@ traffic only with it un-gated.
 
 ## Compatibility
 
-No known FreeBSD-specific incompatibilities. The driver uses standard FreeBSD kernel APIs
+The driver is meant to use standard FreeBSD kernel APIs (not verified on hardware)
 (`bus_space`, `ifnet`, `sysctl`, `callout`, `taskqueue`) that have been stable since
 FreeBSD 13. The shared-memory protocol is byte-identical to the Linux driver and does not
 depend on any OS-specific card behavior beyond what `octboot` establishes.

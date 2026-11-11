@@ -1,5 +1,7 @@
 # Usage
 
+> **Status: not verified.** Written from the Linux driver and the FreeBSD port design. Not tested on a FreeBSD host or on hardware. See [README](../README.md).
+
 ## Loading the module
 
 ```sh
