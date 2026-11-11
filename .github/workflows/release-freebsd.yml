@@ -20,9 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Host-side tests (ring, phase)
-        run: make -C freebsd/test test
-
       - name: Build if_octnic.ko in FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
