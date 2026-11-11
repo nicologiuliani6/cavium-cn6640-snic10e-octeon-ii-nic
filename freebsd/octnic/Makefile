@@ -4,7 +4,7 @@
 # This Makefile needs bsd.kmod.mk, so it only works on FreeBSD (not GNU make).
 
 KMOD=	if_octnic
-SRCS=	if_octnic.c
+SRCS=	if_octnic.c device_if.h bus_if.h pci_if.h
 
 CFLAGS+=	-Wall -Werror
 
