@@ -1,33 +1,57 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2026 Cavium CN6640 SNIC10E FreeBSD Driver Project
- *
- * octnic: host side of the Cavium shared-memory NIC. Registers one ifnet
- * per card port (oct0, oct1) over the card's DRAM window at PCIe BAR2.
- * Protocol byte-identical to linuxmod/octnic.c.
+ * if_octnic.c — FreeBSD kernel module for Cavium CN6640-SNIC10E 10GbE NIC.
+ * Two ports (oct0, oct1) over PCIe BAR2 shared-memory datapath.
+ * Byte-identical register layout and ring protocol to linuxmod/octnic.c.
  */
 
-#include "if_octnic.h"
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/module.h>
+#include <sys/bus.h>
+#include <machine/bus.h>
+#include <sys/rman.h>
+#include <sys/sysctl.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+#include <sys/taskqueue.h>
+#include <sys/errno.h>
+#include <sys/callout.h>
+
+#include <sys/socket.h>
+#include <sys/sockio.h>
+
+#include <net/if.h>
+#include <sys/ck.h>
+#include <net/if_var.h>
+#include <net/altq/if_altq.h>
+#include <net/if_private.h>
+#include <net/ifq.h>
+#include <net/ethernet.h>
+#include <net/if_types.h>
+
+#include <dev/pci/pcireg.h>
+#include <dev/pci/pcivar.h>
+
+#include "octnic_regs.h"
 
 /* ----------------------------------------------------------------
- * Module parameters — match Linux defaults
+ * Module parameters — match Linux defaults (linuxmod lines 58-90)
  * ---------------------------------------------------------------- */
 static int oct_ports = 1;
-SYSCTL_INT(_kern, OID_AUTO, octnic_ports, CTLFLAG_RW, &oct_ports, 0,
-    "Number of card ports (1 or 2)");
+SYSCTL_INT(_kern, OID_AUTO, octnic_ports, CTLFLAG_RW, &oct_ports, 0, "Number of card ports");
 
 static int oct_poll_us = 200;
-SYSCTL_INT(_kern, OID_AUTO, octnic_poll_us, CTLFLAG_RW, &oct_poll_us, 0,
-    "Poll interval in microseconds");
+SYSCTL_INT(_kern, OID_AUTO, octnic_poll_us, CTLFLAG_RW, &oct_poll_us, 0, "Poll interval us");
 
 static int ntxq = 1;
-SYSCTL_INT(_kern, OID_AUTO, octnic_ntxq, CTLFLAG_RW, &ntxq, 0,
-    "Number of TX queues (parallel cores)");
+SYSCTL_INT(_kern, OID_AUTO, octnic_ntxq, CTLFLAG_RW, &ntxq, 0, "Number of TX queues");
 
 static int oct_rxthreads = 1;
 SYSCTL_INT(_kern, OID_AUTO, octnic_rxthreads, CTLFLAG_RW, &oct_rxthreads, 0,
-    "Number of parallel RX drain threads (power of 2: 1/2/4/8)");
+    "Number of parallel RX drain threads (power of 2)");
 
 static int oct_hrx = 1;
 SYSCTL_INT(_kern, OID_AUTO, octnic_hrx, CTLFLAG_RW, &oct_hrx, 0,
@@ -45,7 +69,7 @@ static int oct_dma = 0;
 SYSCTL_INT(_kern, OID_AUTO, octnic_dma, CTLFLAG_RW, &oct_dma, 0,
     "DMA mode: card DMA for RX/TX (requires IOMMU)");
 
-/* Temp thresholds — millidegC, match Linux module params */
+/* Temp thresholds — millidegC, match Linux module params (linuxmod lines 478-481) */
 static int oct_temp_warn_mc = 85000;
 SYSCTL_INT(_kern, OID_AUTO, octnic_temp_warn, CTLFLAG_RW, &oct_temp_warn_mc, 0,
     "Temperature warning threshold (millidegC)");
@@ -54,12 +78,12 @@ static int oct_temp_crit_mc = 100000;
 SYSCTL_INT(_kern, OID_AUTO, octnic_temp_crit, CTLFLAG_RW, &oct_temp_crit_mc, 0,
     "Temperature critical threshold (millidegC)");
 
-/* Heartbeat timeout in seconds */
+/* Heartbeat timeout in seconds (linuxmod line 482) */
 static int oct_hb_timeout = 10;
 SYSCTL_INT(_kern, OID_AUTO, octnic_hb_timeout, CTLFLAG_RW, &oct_hb_timeout, 0,
     "Heartbeat freeze timeout (seconds)");
 
-/* Power model params (milliwatts) */
+/* Power model params (milliwatts) — linuxmod lines 430-433 */
 static int p_base_mw = 18000;
 SYSCTL_INT(_kern, OID_AUTO, octnic_p_base_mw, CTLFLAG_RW, &p_base_mw, 0,
     "Card baseline power estimate (mW)");
@@ -69,112 +93,202 @@ SYSCTL_INT(_kern, OID_AUTO, octnic_p_gbps_mw, CTLFLAG_RW, &p_gbps_mw, 0,
     "Extra power per Gbps of aggregate TX+RX traffic (mW)");
 
 /* ----------------------------------------------------------------
- * Global state — mirrors linuxmod/octnic.c
+ * Constants — derived from linuxmod lines 28-36
  * ---------------------------------------------------------------- */
+#define POOL_SZ (OCTNIC_RING_SIZE * OCTNIC_BUF_SZ) /* 128*9216 = 1179648 */
+
+/* ----------------------------------------------------------------
+ * Per-port software state — mirrors linuxmod octnic.host_port (lines 97-109)
+ * ---------------------------------------------------------------- */
+struct octnic_port {
+	struct octnic_softc	*op_sc;
+	int			 op_port_id;
+	struct ifnet		*op_ifp;
+
+	/* Shadow counters (host owns, kept in RAM) */
+	uint32_t		 op_tx_prod;	/* linuxmod line 105: tp_shadow */
+	uint32_t		 op_rx_cons;	/* linuxmod line 107: rc_shadow */
+
+	/* Parallel TX CAS counter — FreeBSD atomic_fetchadd_int */
+	volatile u_int		 op_tx_claim;
+
+	/* Last observed card TX consumer (cache) */
+	uint32_t		 op_tc_cache;
+
+	/* Multi-thread RX consumer per thread */
+	uint32_t		 op_rc_pub[8];
+
+	/* MAC address */
+	uint8_t			 op_macaddr[6];
+
+	/* DMA pools (hrx mode) */
+	bus_dma_tag_t		 op_dmat;
+	bus_dmamap_t		 op_dmamap;
+	struct task		 op_rx_task;
+	uint8_t			*op_rx_dma_va;
+	bus_addr_t		 op_rx_dma_bus;
+};
+
+/* ----------------------------------------------------------------
+ * Softc — one per PCI device, two ports
+ * ---------------------------------------------------------------- */
+struct octnic_softc {
+	device_t		 sc_dev;
+	struct resource		*sc_bar2_res;
+	int			 sc_bar2_rid;
+	bus_space_tag_t		 sc_bst;
+	bus_space_handle_t	 sc_bsh;
+	bus_dma_tag_t		 sc_parent_dmat;
+
+	struct octnic_port	 sc_ports[OCTNIC_MAX_PORTS];
+
+	/* Sysctl */
+	struct sysctl_ctx_list	 sc_sysctl_ctx;
+	struct sysctl_oid	*sc_sysctl_tree;
+
+	/* Temperature thresholds (millidegC) — match Linux module params */
+	int			 sc_temp_warn_mc;
+	int			 sc_temp_crit_mc;
+
+	/* Heartbeat / watchdog */
+	uint32_t		 sc_heartbeat_last;
+	time_t			 sc_hb_time;
+
+	/* Card lost flag */
+	int			 sc_card_lost;
+
+	/* Lock for port state */
+	struct mtx		 sc_lock;
+	struct callout		sc_timer;
+	struct task		 sc_watchdog_task;
+};
+
 #define PORT(sc, idx)	(&((sc)->sc_ports[(idx)]))
 
-/* MMIO helpers — bus_space_read/write on the BAR2 handle */
+/* ----------------------------------------------------------------
+ * MMIO helpers — bus_space_read/write on the BAR2 handle
+ * linuxmod lines 117-120
+ * ---------------------------------------------------------------- */
 static inline uint32_t
 prd(struct octnic_port *p, uint32_t off)
 {
-	return (bus_space_read_4(p->op_sc->sc_bst,
-	    p->op_sc->sc_bsh, p->op_port_id * OCTNIC_PORT_STRIDE + off));
+	struct octnic_softc *sc = p->op_sc;
+	return (bus_space_read_4(sc->sc_bst, sc->sc_bsh,
+	    p->op_port_id * OCTNIC_PORT_STRIDE + off));
 }
 
 static inline void
 pwr(struct octnic_port *p, uint32_t off, uint32_t v)
 {
-	bus_space_write_4(p->op_sc->sc_bst,
-	    p->op_sc->sc_bsh, p->op_port_id * OCTNIC_PORT_STRIDE + off, v);
+	struct octnic_softc *sc = p->op_sc;
+	bus_space_write_4(sc->sc_bst, sc->sc_bsh,
+	    p->op_port_id * OCTNIC_PORT_STRIDE + off, v);
 }
 
 static inline uint64_t
 prd64(struct octnic_port *p, uint32_t off)
 {
-	return (bus_space_read_8(p->op_sc->sc_bst,
-	    p->op_sc->sc_bsh, p->op_port_id * OCTNIC_PORT_STRIDE + off));
+	struct octnic_softc *sc = p->op_sc;
+	return (bus_space_read_8(sc->sc_bst, sc->sc_bsh,
+	    p->op_port_id * OCTNIC_PORT_STRIDE + off));
 }
 
 static inline void
 pwr64(struct octnic_port *p, uint32_t off, uint64_t v)
 {
-	bus_space_write_8(p->op_sc->sc_bst,
-	    p->op_sc->sc_bsh, p->op_port_id * OCTNIC_PORT_STRIDE + off, v);
+	struct octnic_softc *sc = p->op_sc;
+	bus_space_write_8(sc->sc_bst, sc->sc_bsh,
+	    p->op_port_id * OCTNIC_PORT_STRIDE + off, v);
 }
 
 /* ----------------------------------------------------------------
  * DMA helpers — busdma for hrx pool
+ * linuxmod lines 122-161: octdma_alloc / octdma_free
  * ---------------------------------------------------------------- */
-struct octnic_dmamap_arg {
-	bus_addr_t	da_addr;
-	int		da_error;
-};
 
+/* Callback: save first segment bus address from loaded map */
 static void
-octnic_dmamap_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
+octnic_dma_callback(void *arg, struct bus_dma_segment *segs, int nsegs, int error)
 {
-	struct octnic_dmamap_arg *da = arg;
+	struct {
+		bus_addr_t *addr;
+		int *err;
+	} *cbarg = arg;
 
-	if (error) {
-		da->da_error = error;
-		return;
-	}
-	da->da_addr = segs[0].ds_addr;
+	if (error == 0 && nsegs > 0)
+		*cbarg->addr = segs[0].ds_addr;
+	if (cbarg->err)
+		*cbarg->err = error;
 }
 
 static int
 octnic_dma_alloc(struct octnic_port *port)
 {
-	struct octnic_dmamap_arg da;
-	int error;
+	struct octnic_softc *sc = port->op_sc;
 	uint8_t *va;
-	int i;
+	bus_addr_t bus_addr;
+	int error, i;
 
-	error = bus_dma_tag_create(bus_get_dma_tag(port->op_sc->sc_dev),
+	/* Create DMA tag for RX pool — linuxmod line 130 */
+	error = bus_dma_tag_create(bus_get_dma_tag(sc->sc_dev),
 	    1, 0, BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR,
-	    NULL, NULL, OCTNIC_BUF_SZ * OCTNIC_RING_SIZE, 1,
-	    OCTNIC_BUF_SZ * OCTNIC_RING_SIZE, 0, NULL, NULL, &port->op_sc->sc_parent_dmat);
+	    NULL, NULL, POOL_SZ, 1, POOL_SZ, 0, NULL, NULL,
+	    &port->op_dmat);
 	if (error) {
-		device_printf(port->op_sc->sc_dev,
-		    "Failed to create RX DMA tag: %d\n", error);
+		device_printf(sc->sc_dev, "Failed to create RX DMA tag: %d\n", error);
 		return (error);
 	}
 
-	error = bus_dmamem_alloc(port->op_sc->sc_parent_dmat, (void **)&va,
-	    BUS_DMA_ZERO | BUS_DMA_WAITOK, &port->op_rx_dmamap);
+	/* Allocate coherent memory — linuxmod line 130: dma_alloc_coherent */
+	error = bus_dmamem_alloc(port->op_dmat, (void **)&va,
+	    BUS_DMA_ZERO | BUS_DMA_WAITOK, NULL);
 	if (error) {
-		device_printf(port->op_sc->sc_dev,
-		    "Failed to alloc RX DMA memory: %d\n", error);
+		device_printf(sc->sc_dev, "Failed to alloc RX DMA memory: %d\n", error);
+		bus_dma_tag_destroy(port->op_dmat);
 		return (error);
 	}
 
-	da.da_error = 0;
-	error = bus_dmamap_load(port->op_sc->sc_parent_dmat, port->op_rx_dmamap,
-	    va, OCTNIC_BUF_SZ * OCTNIC_RING_SIZE, octnic_dmamap_cb, &da, 0);
-	if (error || da.da_error) {
-		device_printf(port->op_sc->sc_dev,
-		    "Failed to load RX DMA map: %d\n", error ? error : da.da_error);
-		bus_dmamem_free(port->op_sc->sc_parent_dmat, va,
-		    port->op_rx_dmamap);
-		port->op_rx_dmamap = NULL;
-		return (error ? error : da.da_error);
+	/* Create DMA map */
+	error = bus_dmamap_create(port->op_dmat, 0, &port->op_dmamap);
+	if (error) {
+		device_printf(sc->sc_dev, "Failed to create RX DMA map: %d\n", error);
+		bus_dmamem_free(port->op_dmat, va, NULL);
+		bus_dma_tag_destroy(port->op_dmat);
+		return (error);
+	}
+
+	/* Load DMA map to get bus address via callback */
+	bus_addr = 0;
+	error = bus_dmamap_load(port->op_dmat, port->op_dmamap, va, POOL_SZ,
+	    octnic_dma_callback, &(struct { bus_addr_t *addr; int *err; }){&bus_addr, &error},
+	    BUS_DMA_NOWAIT);
+	if (error) {
+		device_printf(sc->sc_dev, "Failed to load RX DMA map: %d\n", error);
+		bus_dmamem_free(port->op_dmat, va, port->op_dmamap);
+		bus_dma_tag_destroy(port->op_dmat);
+		return (error);
 	}
 
 	port->op_rx_dma_va = va;
-	port->op_rx_dma_bus = da.da_addr;
+	port->op_rx_dma_bus = bus_addr;
 
-	/* Seed phase bits to "not ready" (opposite of first expected) */
+	/* Seed phase bits to "not ready" (linuxmod lines 134-141) */
 	for (i = 0; i < OCTNIC_RING_SIZE; i++) {
 		uint32_t *hdr = (uint32_t *)(va + i * OCTNIC_BUF_SZ + 4);
-		*hdr = htole32(RX_PHASE(i) ^ 1u);
+		*hdr = htole32(OCTNIC_RX_PHASE(i) ^ 1u);
 	}
 
+	/* Publish DMA bases to card — linuxmod lines 142-146 */
 	pwr64(port, C_RX_DMA_BASE, port->op_rx_dma_bus);
-	bus_space_barrier(port->op_sc->sc_bst, port->op_sc->sc_bsh, 0, 0, BUS_SPACE_BARRIER_WRITE);
+	bus_space_barrier(sc->sc_bst, sc->sc_bsh,
+	    port->op_port_id * OCTNIC_PORT_STRIDE + C_RX_DMA_BASE, 8,
+	    BUS_SPACE_BARRIER_WRITE);
 	pwr(port, C_DMA_ENABLE, 1);
-	bus_space_barrier(port->op_sc->sc_bst, port->op_sc->sc_bsh, 0, 0, BUS_SPACE_BARRIER_WRITE);
+	bus_space_barrier(sc->sc_bst, sc->sc_bsh,
+	    port->op_port_id * OCTNIC_PORT_STRIDE + C_DMA_ENABLE, 4,
+	    BUS_SPACE_BARRIER_WRITE);
 
-	device_printf(port->op_sc->sc_dev, "port%d DMA on, rx_bus=0x%jx\n",
+	device_printf(sc->sc_dev, "port%d DMA on, rx_bus=0x%jx\n",
 	    port->op_port_id, (uintmax_t)port->op_rx_dma_bus);
 
 	return (0);
@@ -183,37 +297,49 @@ octnic_dma_alloc(struct octnic_port *port)
 static void
 octnic_dma_free(struct octnic_port *port)
 {
-	if (!port->op_sc || !port->op_rx_dma_va || !port->op_rx_dmamap)
+	struct octnic_softc *sc;
+
+	if (!port || !port->op_sc)
+		return;
+
+	sc = port->op_sc;
+
+	if (!port->op_rx_dma_va || !port->op_dmamap)
 		return;
 
 	pwr(port, C_DMA_ENABLE, 0);
-	bus_space_barrier(port->op_sc->sc_bst, port->op_sc->sc_bsh, 0, 0, BUS_SPACE_BARRIER_WRITE);
+	bus_space_barrier(sc->sc_bst, sc->sc_bsh,
+	    port->op_port_id * OCTNIC_PORT_STRIDE + C_DMA_ENABLE, 4,
+	    BUS_SPACE_BARRIER_WRITE);
 	DELAY(100000); /* 100ms — let card disarm + in-flight DMA drain */
 
-	bus_dmamap_unload(port->op_sc->sc_parent_dmat, port->op_rx_dmamap);
-	bus_dmamem_free(port->op_sc->sc_parent_dmat, port->op_rx_dma_va,
-	    port->op_rx_dmamap);
+	bus_dmamap_unload(port->op_dmat, port->op_dmamap);
+	bus_dmamem_free(port->op_dmat, port->op_rx_dma_va, port->op_dmamap);
 	port->op_rx_dma_va = NULL;
-	port->op_rx_dmamap = NULL;
+	port->op_dmamap = NULL;
+
+	if (port->op_dmat) {
+		bus_dma_tag_destroy(port->op_dmat);
+		port->op_dmat = NULL;
+	}
 }
 
 /* ----------------------------------------------------------------
- * TX — oct_xmit equivalent
+ * TX — oct_xmit equivalent (linuxmod lines 163-202)
  * ---------------------------------------------------------------- */
 static int
-octnic_start(struct ifnet *ifp, struct mbuf *m0)
+octnic_transmit(if_t ifp, struct mbuf *m0)
 {
-	struct octnic_port *port = ifp->if_softc;
+	struct octnic_port *port = if_getsoftc(ifp);
 	struct octnic_softc *sc = port->op_sc;
 	uint32_t tp, slot, len;
 
-	if ((ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) {
+	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0) {
 		m_freem(m0);
-		if_inc_counter(ifp, IFCOUNTER_OQDROPS, 1);
-		return (0);
+		return (ENETDOWN);
 	}
 
-	/* CAS-claim a slot — parallel across txqs */
+	/* CAS-claim a slot — parallel across txqs (linuxmod lines 170-184) */
 	for (;;) {
 		tp = (uint32_t)atomic_fetchadd_int(&port->op_tx_claim, 1);
 		if ((tp - port->op_tc_cache) >= OCTNIC_RING_SIZE) {
@@ -221,22 +347,21 @@ octnic_start(struct ifnet *ifp, struct mbuf *m0)
 			port->op_tc_cache = tc;
 			if ((tp - tc) >= OCTNIC_RING_SIZE) {
 				m_freem(m0);
-				if_inc_counter(ifp, IFCOUNTER_OQDROPS, 1);
-				return (0);
+				return (ENOBUFS);
 			}
 		}
 
 		slot = tp & (OCTNIC_RING_SIZE - 1);
 
-		/* Check phase bit — slot available if phase matches */
-		uint32_t desc_phase = prd(port, OCTNIC_TXDESC_OFF +
-		    slot * 8 + 4) & 1u;
-		if ((TX_PHASE(tp) == desc_phase))
+		/* Phase check: if descriptor phase matches our phase, slot is free */
+		uint32_t desc_phase = prd(port, OCTNIC_TXDESC_OFF + slot * 8 + 4) & 1u;
+		if ((OCTNIC_TX_PHASE(tp) == desc_phase))
 			break;
 
 		/* Slot not available, try again */
 		continue;
 	}
+
 
 	len = m0->m_pkthdr.len;
 	if (len > OCTNIC_BUF_SZ)
@@ -245,36 +370,44 @@ octnic_start(struct ifnet *ifp, struct mbuf *m0)
 	if (oct_ztx && oct_dma && port->op_rx_dma_va != NULL) {
 		/* Zero-copy: copy into coherent pool */
 		memcpy(port->op_rx_dma_va + slot * OCTNIC_BUF_SZ,
-		    mtod(m0, caddr_t), len);
+		    mtod(m0, uint8_t *), len);
 	} else {
-		/* PIO: host posted-write into BAR2 TX buffer */
+		/* PIO: host posted-write into BAR2 TX buffer (linuxmod line 192) */
 		bus_space_write_region_1(sc->sc_bst, sc->sc_bsh,
 		    port->op_port_id * OCTNIC_PORT_STRIDE +
 		    OCTNIC_TXBUF_OFF + slot * OCTNIC_BUF_SZ,
-		    mtod(m0, caddr_t), len);
+		    mtod(m0, uint8_t *), len);
 	}
 
-	bus_space_barrier(sc->sc_bst, sc->sc_bsh, 0, 0, BUS_SPACE_BARRIER_WRITE);
-	pwr(port, OCTNIC_TXDESC_OFF + slot * 8, len);
-	bus_space_barrier(sc->sc_bst, sc->sc_bsh, 0, 0, BUS_SPACE_BARRIER_WRITE);
-	pwr(port, OCTNIC_TXDESC_OFF + slot * 8 + 4, TX_PHASE(tp));
-	bus_space_barrier(sc->sc_bst, sc->sc_bsh, 0, 0, BUS_SPACE_BARRIER_WRITE);
+	bus_space_barrier(sc->sc_bst, sc->sc_bsh,
+	    port->op_port_id * OCTNIC_PORT_STRIDE + OCTNIC_TXBUF_OFF +
+	    slot * OCTNIC_BUF_SZ, len, BUS_SPACE_BARRIER_WRITE);
+	pwr(port, OCTNIC_TXDESC_OFF + slot * 8, len); /* desc len */
+	bus_space_barrier(sc->sc_bst, sc->sc_bsh,
+	    port->op_port_id * OCTNIC_PORT_STRIDE + OCTNIC_TXDESC_OFF + slot * 8,
+	    4, BUS_SPACE_BARRIER_WRITE);
+	pwr(port, OCTNIC_TXDESC_OFF + slot * 8 + 4,
+	    OCTNIC_TX_PHASE(tp)); /* phase LAST = slot ready to xmit */
+	bus_space_barrier(sc->sc_bst, sc->sc_bsh,
+	    port->op_port_id * OCTNIC_PORT_STRIDE + OCTNIC_TXDESC_OFF + slot * 8 + 4,
+	    4, BUS_SPACE_BARRIER_WRITE);
 
 	m_freem(m0);
+	if_inc_counter(ifp, IFCOUNTER_OPACKETS, 1);
 	if_inc_counter(ifp, IFCOUNTER_OBYTES, len);
 	return (0);
 }
 
 /* ----------------------------------------------------------------
- * RX drain — oct_drain equivalent
+ * RX drain — oct_drain equivalent (linuxmod lines 206-284)
  * ---------------------------------------------------------------- */
 static void
 octnic_drain(void *arg, int pending)
 {
-	struct octnic_port *port = (struct octnic_port *)arg;
+	struct octnic_port *port = arg;
 	struct octnic_softc *sc = port->op_sc;
 	struct ifnet *ifp = port->op_ifp;
-	uint32_t stride = oct_rxthreads;
+	uint32_t stride = (oct_rxthreads > 1) ? oct_rxthreads : 1;
 	uint32_t rp = oct_lockfree ? 0 : prd(port, C_RX_PROD);
 	uint32_t rc = port->op_rc_pub[0]; /* simplified for single thread */
 	int n = 0;
@@ -289,16 +422,15 @@ octnic_drain(void *arg, int pending)
 			uint8_t *h = port->op_rx_dma_va + slot * OCTNIC_BUF_SZ;
 			uint32_t phase = le32toh(*(uint32_t *)(h + 4));
 
-			if (phase != RX_PHASE(rc))
+			if (phase != OCTNIC_RX_PHASE(rc))
 				break; /* not filled yet */
 			atomic_thread_fence_acq();
 			len = le32toh(*(uint32_t *)h);
 		} else if (oct_lockfree) {
 			/* One 64-bit desc read = {len, flags} */
-			uint64_t desc = prd64(port, OCTNIC_RXDESC_OFF +
-			    slot * 8);
+			uint64_t desc = prd64(port, OCTNIC_RXDESC_OFF + slot * 8);
 
-			if (((uint32_t)(desc >> 32) & 1u) != RX_PHASE(rc))
+			if (((uint32_t)(desc >> 32) & 1u) != OCTNIC_RX_PHASE(rc))
 				break;
 			len = (uint32_t)desc;
 		} else {
@@ -310,33 +442,31 @@ octnic_drain(void *arg, int pending)
 		if (len && len <= OCTNIC_BUF_SZ) {
 			m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
 			if (m == NULL) {
-				if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
 				rc += stride;
 				n++;
 				continue;
 			}
 
-			m->m_len = m->m_pkthdr.len = len;
 			if (oct_dma && port->op_rx_dma_va != NULL) {
 				/* Card DMA-wrote into local coherent RAM */
 				memcpy(mtod(m, caddr_t),
 				    (uint8_t *)port->op_rx_dma_va +
 				    slot * OCTNIC_BUF_SZ +
-				    (oct_hrx ? 8 : 0), len);
+				    (oct_hrx ? OCTNIC_HRX_HDR : 0), len);
 			} else {
 				/* PIO path: read from BAR2 RX buffer */
 				bus_space_read_region_1(sc->sc_bst, sc->sc_bsh,
 				    port->op_port_id * OCTNIC_PORT_STRIDE +
 				    OCTNIC_RXBUF_OFF + slot * OCTNIC_BUF_SZ,
-				    mtod(m, caddr_t), len);
+				    mtod(m, uint8_t *), len);
 			}
 
+			m->m_len = m->m_pkthdr.len = len;
 			m->m_pkthdr.rcvif = ifp;
 			if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
 			if_inc_counter(ifp, IFCOUNTER_IBYTES, len);
 
-			/* Deliver to stack */
-			(*ifp->if_input)(ifp, m);
+			if_input(ifp, m);
 		}
 
 		rc += stride;
@@ -359,24 +489,25 @@ octnic_init(void *arg)
 {
 	struct octnic_port *port = arg;
 	struct ifnet *ifp = port->op_ifp;
+	struct octnic_softc *sc = port->op_sc;
 	int i;
 
-	if ((ifp->if_drv_flags & IFF_DRV_RUNNING))
+	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING))
 		return;
 
-	port->op_tx_prod = prd(port, C_TX_PROD);
+	port->op_tx_prod = prd(port, C_TX_PROD); /* linuxmod line 320 */
 	port->op_tc_cache = prd(port, C_TX_CONS);
 	atomic_store_rel_int(&port->op_tx_claim, 0);
 	port->op_tc_cache = 0;
 
-	/* Snap RX consumer to card's current producer */
+	/* Snap RX consumer to card's current producer (linuxmod lines 326-329) */
 	port->op_rx_cons = oct_hrx ? 0 : prd(port, C_RX_PROD);
 	pwr(port, C_RX_CONS, port->op_rx_cons);
-	pwr(port, C_HOST_READY, 1);
+	pwr(port, C_HOST_READY, 1); /* linuxmod line 330 */
 
-	ifp->if_drv_flags |= IFF_DRV_RUNNING;
+	if_setdrvflagbits(ifp, IFF_DRV_RUNNING, 0);
 
-	/* Validate rxthreads */
+	/* Validate rxthreads (linuxmod lines 334-341) */
 	if (oct_rxthreads < 1) oct_rxthreads = 1;
 	if (oct_rxthreads > 8) oct_rxthreads = 8;
 	while (oct_rxthreads & (oct_rxthreads - 1))
@@ -390,34 +521,34 @@ octnic_init(void *arg)
 		port->op_rc_pub[i] = port->op_rx_cons + i;
 	}
 
-	device_printf(port->op_sc->sc_dev, "port%d: initialized\n", port->op_port_id);
+	device_printf(sc->sc_dev, "port%d: initialized\n", port->op_port_id);
 }
 
 static void
 octnic_stop(struct octnic_port *port)
 {
 	struct ifnet *ifp = port->op_ifp;
+	struct octnic_softc *sc = port->op_sc;
 
-	ifp->if_drv_flags &= ~IFF_DRV_RUNNING;
-	port->op_running = 0;
-	pwr(port, C_HOST_READY, 0);
+	if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
+	pwr(port, C_HOST_READY, 0); /* linuxmod line 373 */
 
-	device_printf(port->op_sc->sc_dev, "port%d: stopped\n", port->op_port_id);
+	device_printf(sc->sc_dev, "port%d: stopped\n", port->op_port_id);
 }
 
 static int
 octnic_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
-	struct octnic_port *port = ifp->if_softc;
+	struct octnic_port *port = if_getsoftc(ifp);
 	int error = 0;
 
 	switch (cmd) {
 	case SIOCSIFFLAGS:
-		if (ifp->if_flags & IFF_UP) {
-			if ((ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
+		if (if_getflags(ifp) & IFF_UP) {
+			if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0)
 				octnic_init(port);
 		} else {
-			if (ifp->if_drv_flags & IFF_DRV_RUNNING)
+			if (if_getdrvflags(ifp) & IFF_DRV_RUNNING)
 				octnic_stop(port);
 		}
 		break;
@@ -426,7 +557,7 @@ octnic_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 		if (ifr->ifr_mtu > 65535 || ifr->ifr_mtu < ETHERMIN)
 			error = EINVAL;
 		else
-			ifp->if_mtu = ifr->ifr_mtu;
+			if_setmtu(ifp, ifr->ifr_mtu);
 		break;
 	}
 	default:
@@ -437,15 +568,9 @@ octnic_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 	return (error);
 }
 
-static void
-octnic_qflush(struct ifnet *ifp)
-{
-
-	IFQ_PURGE(&ifp->if_snd);
-}
-
 /* ----------------------------------------------------------------
  * Watchdog / heartbeat — card health monitoring
+ * linuxmod lines 469-583: wd_fn
  * ---------------------------------------------------------------- */
 static void
 octnic_watchdog(void *arg, int pending)
@@ -466,7 +591,7 @@ octnic_watchdog(void *arg, int pending)
 		}
 	}
 
-	/* Check magic */
+	/* Check magic (linuxmod line 541) */
 	if (prd(PORT(sc, 0), C_MAGIC) != OCTNIC_MAGIC) {
 		sc->sc_card_lost = 1;
 		for (i = 0; i < oct_ports && i < OCTNIC_MAX_PORTS; i++)
@@ -475,7 +600,7 @@ octnic_watchdog(void *arg, int pending)
 		return;
 	}
 
-	/* Check heartbeat */
+	/* Check heartbeat (linuxmod lines 543-551) */
 	beat = prd(PORT(sc, 0), C_HEARTBEAT);
 	if (beat == sc->sc_heartbeat_last) {
 		if ((time_uptime - sc->sc_hb_time) > oct_hb_timeout) {
@@ -492,13 +617,7 @@ octnic_watchdog(void *arg, int pending)
 		sc->sc_hb_time = time_uptime;
 	}
 
-	/* Drain RX in poll mode */
-	for (i = 0; i < oct_ports && i < OCTNIC_MAX_PORTS; i++) {
-		if (PORT(sc, i)->op_ifp->if_drv_flags & IFF_DRV_RUNNING)
-			octnic_drain(PORT(sc, i), 0);
-	}
-
-	/* Check temperatures */
+	/* Check temperatures (linuxmod lines 564-579) */
 	for (ch = 0; ch < 2; ch++) {
 		if (ch >= oct_ports || !PORT(sc, ch)->op_ifp)
 			continue;
@@ -515,16 +634,14 @@ octnic_watchdog(void *arg, int pending)
 		device_printf(sc->sc_dev, "card hot: %ld.%01ld C\n",
 		    tmax / 1000, (tmax % 1000) / 100);
 
-	/* Carrier follows SFP+ link */
+	/* Carrier follows SFP+ link (linuxmod lines 496-527) */
 	for (i = 0; i < oct_ports && i < OCTNIC_MAX_PORTS; i++) {
 		struct octnic_port *port = PORT(sc, i);
 		uint32_t link = prd(port, C_LINK);
 		int carrier = (link & 0x80000000u) ? (link & 1) : 1;
 
-		if (carrier && port->op_ifp->if_link_state != LINK_STATE_UP)
-			if_link_state_change(port->op_ifp, LINK_STATE_UP);
-		else if (!carrier && port->op_ifp->if_link_state != LINK_STATE_DOWN)
-			if_link_state_change(port->op_ifp, LINK_STATE_DOWN);
+		/* ponytail: set state every poll, if_link_state_change on same state is a no-op; cache it if spam matters */
+		if_link_state_change(port->op_ifp, carrier ? LINK_STATE_UP : LINK_STATE_DOWN);
 	}
 }
 
@@ -534,7 +651,9 @@ octnic_timer_tick(void *arg)
 	struct octnic_softc *sc = arg;
 
 	taskqueue_enqueue(taskqueue_thread, &sc->sc_watchdog_task);
-	callout_reset(&sc->sc_timer, (hz * oct_poll_us) / 1000000, octnic_timer_tick, sc);
+	for (int i = 0; i < oct_ports && i < OCTNIC_MAX_PORTS; i++)
+		taskqueue_enqueue(taskqueue_thread, &PORT(sc, i)->op_rx_task);
+	callout_reset(&sc->sc_timer, hz, octnic_timer_tick, sc);
 }
 
 /* ----------------------------------------------------------------
@@ -548,12 +667,6 @@ octnic_probe(device_t dev)
 
 	if (v == OCTNIC_VENDOR_ID && d == OCTNIC_DEVICE_ID) {
 		device_set_desc(dev, "Cavium CN6640 SNIC10E 10GbE NIC");
-		return (BUS_PROBE_DEFAULT);
-	}
-
-	if (v == IVSHMEM_VENDOR_ID && d == IVSHMEM_DEVICE_ID) {
-		device_set_desc(dev,
-		    "Cavium CN6640 SNIC10E Emulation (ivshmem)");
 		return (BUS_PROBE_DEFAULT);
 	}
 
@@ -572,14 +685,10 @@ octnic_attach(device_t dev)
 	sc->sc_temp_warn_mc = oct_temp_warn_mc;
 	sc->sc_temp_crit_mc = oct_temp_crit_mc;
 
-	if (pci_get_vendor(dev) == IVSHMEM_VENDOR_ID &&
-	    pci_get_device(dev) == IVSHMEM_DEVICE_ID)
-		sc->sc_test_mode = 1;
-
-	/* Enable bus mastering */
+	/* Enable bus mastering (linuxmod lines 662-664) */
 	pci_enable_busmaster(dev);
 
-	/* Allocate BAR2 resource */
+	/* Allocate BAR2 resource (linuxmod line 661) */
 	sc->sc_bar2_rid = PCIR_BAR(OCTNIC_BAR);
 	sc->sc_bar2_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
 	    &sc->sc_bar2_rid, RF_ACTIVE);
@@ -591,7 +700,7 @@ octnic_attach(device_t dev)
 	sc->sc_bst = rman_get_bustag(sc->sc_bar2_res);
 	sc->sc_bsh = rman_get_bushandle(sc->sc_bar2_res);
 
-	/* Verify magic on port 0 */
+	/* Verify magic on port 0 (linuxmod lines 679-686) */
 	if (prd(PORT(sc, 0), C_MAGIC) != OCTNIC_MAGIC) {
 		device_printf(dev, "bad magic 0x%08x at BAR2\n",
 		    prd(PORT(sc, 0), C_MAGIC));
@@ -610,7 +719,7 @@ octnic_attach(device_t dev)
 	if (ntxq < 1) ntxq = 1;
 	if (ntxq > 8) ntxq = 8;
 
-	/* Create DMA tag */
+	/* Create parent DMA tag */
 	error = bus_dma_tag_create(bus_get_dma_tag(dev),
 	    1, 0, BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR,
 	    NULL, NULL, BUS_SPACE_MAXSIZE_32BIT, 0,
@@ -627,20 +736,20 @@ octnic_attach(device_t dev)
 	sysctl_ctx_init(&sc->sc_sysctl_ctx);
 	sc->sc_sysctl_tree = SYSCTL_ADD_NODE(&sc->sc_sysctl_ctx,
 	    SYSCTL_STATIC_CHILDREN(_kern), OID_AUTO, "octnic",
-	    CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "octnic driver");
+	    CTLFLAG_RW, 0, "octnic driver");
 
 	mtx_init(&sc->sc_lock, "octnic", NULL, MTX_DEF);
 	callout_init_mtx(&sc->sc_timer, &sc->sc_lock, 0);
 	TASK_INIT(&sc->sc_watchdog_task, 0, octnic_watchdog, sc);
 
-	/* Initialize ports */
+	/* Initialize ports (linuxmod lines 693-735) */
 	for (i = 0; i < oct_ports; i++) {
 		port = PORT(sc, i);
 		port->op_sc = sc;
 		port->op_port_id = i;
+		TASK_INIT(&port->op_rx_task, 0, octnic_drain, port);
 
-		/* MAC: 02:c4:xx:xx:xx:xx based on device name hash */
-		/* Generate a stable MAC hash from domain:bus:slot:function */
+		/* MAC: 02:c4:xx:xx:xx:xx based on device BDF hash (linuxmod lines 715-721) */
 		uint32_t h = (uint32_t)(pci_get_domain(dev) << 24) |
 		    (uint32_t)(pci_get_bus(dev) << 16) |
 		    (uint32_t)(pci_get_slot(dev) << 8) |
@@ -667,11 +776,9 @@ octnic_attach(device_t dev)
 
 		if_initname(port->op_ifp, "oct", i);
 		if_setsoftc(port->op_ifp, port);
-		if_setdrvflags(port->op_ifp, 0);
 		if_setinitfn(port->op_ifp, octnic_init);
 		if_setioctlfn(port->op_ifp, octnic_ioctl);
-		if_settransmitfn(port->op_ifp, octnic_start);
-		if_setqflushfn(port->op_ifp, octnic_qflush);
+		if_settransmitfn(port->op_ifp, octnic_transmit);
 		if_setmtu(port->op_ifp, 1500);
 
 		ether_ifattach(port->op_ifp, port->op_macaddr);
@@ -680,7 +787,7 @@ octnic_attach(device_t dev)
 		device_printf(dev, "registered %s\n", if_name(port->op_ifp));
 	}
 
-	/* Start watchdog */
+	/* Start watchdog (linuxmod lines 747-750) */
 	sc->sc_heartbeat_last = prd(PORT(sc, 0), C_HEARTBEAT);
 	sc->sc_hb_time = time_uptime;
 	mtx_lock(&sc->sc_lock);
@@ -688,7 +795,7 @@ octnic_attach(device_t dev)
 	mtx_unlock(&sc->sc_lock);
 
 	device_printf(dev, "octnic driver attached (%s)\n",
-	    sc->sc_test_mode ? "emulation" : "hardware");
+	    "hardware");
 
 	return (0);
 

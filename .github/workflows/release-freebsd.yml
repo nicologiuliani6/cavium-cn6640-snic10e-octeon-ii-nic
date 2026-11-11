@@ -1,0 +1,65 @@
+name: Release FreeBSD kernel module
+
+on:
+  push:
+    tags: ['freebsd-v*']
+    paths: ['freebsd/**', '.github/workflows/release-freebsd.yml']
+  pull_request:
+    paths: ['freebsd/**', '.github/workflows/release-freebsd.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        freebsd-version: ['14.5']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build if_octnic.ko in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.freebsd-version }}
+          usesh: true
+          sync: rsync
+          prepare: |
+            pkg install -y git
+            fetch -q "https://download.freebsd.org/releases/amd64/amd64/${{ matrix.freebsd-version }}-RELEASE/src.txz" -o /tmp/src.txz
+            tar -xf /tmp/src.txz -C /
+            rm -f /tmp/src.txz
+          run: |
+            set -e
+            make -C freebsd/octnic clean || true
+            make -C freebsd/octnic
+            ls -l freebsd/octnic/if_octnic.ko
+
+      - name: Package
+        run: |
+          set -e
+          test -f freebsd/octnic/if_octnic.ko
+          NAME=if_octnic-freebsd${{ matrix.freebsd-version }}
+          rm -rf dist && mkdir -p dist/$NAME
+          cp freebsd/octnic/if_octnic.ko freebsd/rc.d/cavium_nic freebsd/install.sh dist/$NAME/
+          cp freebsd/README.md dist/$NAME/
+          tar -C dist -czf dist/$NAME.tar.gz $NAME
+          sha256sum dist/$NAME.tar.gz > dist/$NAME.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: if_octnic-freebsd${{ matrix.freebsd-version }}
+          path: dist/*
+
+      - name: Create pre-release (tag only)
+        if: startsWith(github.ref, 'refs/tags/freebsd-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          files: dist/*
+          body: |
+            FreeBSD kernel module if_octnic (pre-release).
+            - Builds against FreeBSD ${{ matrix.freebsd-version }} sources (bsd.kmod.mk).
+            - NOT tested on hardware yet. Card boot on FreeBSD is NOT implemented yet.

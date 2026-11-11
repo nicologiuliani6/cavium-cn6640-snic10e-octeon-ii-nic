@@ -10,7 +10,7 @@ or [a discussion](https://github.com/nicologiuliani6/cavium-cn6640-snic10e-octeo
 
 **Sponsor:** [github.com/sponsors/nicologiuliani6](https://github.com/sponsors/nicologiuliani6)
 
-Multi-OS driver stack and boot tooling for the **Cavium CN6640-SNIC10E** (**Linux** and **Windows** today, BSD planned)
+Multi-OS driver stack and boot tooling for the **Cavium CN6640-SNIC10E** (**Linux**, **Windows**, and **FreeBSD** in development)
 (Octeon II CN6640, PCI `177d:0092`), exposing the card as **two independent 10 GbE
 host interfaces** (`oct0`, `oct1`) over a reverse-engineered PCIe BAR2 shared-memory
 datapath. No vendor NDA firmware.
@@ -41,7 +41,7 @@ back.
 |---|---|---|
 | **Linux** | `linuxmod/` (kernel module, DKMS) | working, hardware-validated |
 | **Windows** 10/11 x64 | `winmod/` (NDIS 6.20 miniport, test-signed) | working: `oct0` + `oct1` in Device Manager and Network Connections, DHCP/ping/internet verified through the card, card boots from Windows at every start |
-| **BSD** | `bsdmod/` | **not implemented** — the installer cancels there |
+| **FreeBSD** 14 | `freebsd/` (kernel module, in development) | compiles against real FreeBSD headers (`-Wall -Werror`); not yet tested on hardware; not in releases yet |
 ## Components
 
 ### Host Drivers (per OS)
@@ -50,7 +50,7 @@ back.
 |---|---|---|
 | `octnic` (`linuxmod/octnic.c`) | Linux (kmod) | Registers `oct0`/`oct1` over the card's BAR2 window. Auto-discovers the card (`modprobe octnic ports=2`). |
 | `octnic` (`winmod/octnic.sys`) | Windows (NDIS) | NDIS 6.20 miniport, same BAR2 shared-memory protocol. Two adapters (port 0 = PCI function, port 1 = companion root device). Prebuilt in releases, see `winmod/README.md`. |
-| `octnic` (`bsdmod/`) | BSD (planned) | Placeholder for FreeBSD/OpenBSD/DragonFly ifnet driver. |
+| `octnic` (`freebsd/octnic/`) | FreeBSD (in development) | ifnet kernel driver; OpenBSD/DragonFly not planned |
 
 ### Card Modules (shared across all hosts)
 
@@ -77,7 +77,8 @@ One command per OS — the same guided flow, asking for confirmation before ever
 |---|---|
 | Linux | `sudo ./install.sh` |
 | Windows | `install.bat` (double-click; asks for Administrator) |
-| BSD | not implemented yet — the installer **cancels** with a message |
+| FreeBSD | `freebsd/install.sh` (in development, untested on hardware) |
+| OpenBSD, DragonFly | not supported — the installer **cancels** with a message |
 
 What the installer does:
 

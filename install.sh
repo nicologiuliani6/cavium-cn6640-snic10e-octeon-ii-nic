@@ -1,19 +1,17 @@
 #!/bin/bash
-# install.sh — GLOBAL installer for the Cavium CN6640 SNIC10E NIC stack (Linux today;
-# Windows = install.bat, BSD not implemented yet -> this script cancels there).
+# install.sh — GLOBAL installer for the Cavium CN6640 SNIC10E NIC stack.
 #
 # What it does, asking for confirmation before every step that changes something:
 #   1. is the card on the PCI bus?
-#   2. install the host driver (octnic via dkms) + configs + autostart service
-#   3. is the card already flashed (u-boot env provisioned for host boot, see docs/FLASHING.md)?
-#        yes -> done: `systemctl start cavium-nic` boots it with no serial cable
+#   2. install the host driver + configs + autostart service/rc-script
+#   3. is the card already flashed (u-boot env provisioned for host boot)?
+#        yes -> done
 #        no  -> 4
-#   4. find the USB-serial adapter, test it, and (after confirmation) flash the u-boot env
-#      with scripts/card-prep-hostboot.sh, then boot the card
+#   4. find the USB-serial adapter, test it, and flash the u-boot env
 #
 #   sudo ./install.sh            # interactive
 #   sudo ./install.sh --start    # also boot the card + bring the NICs up now
-#   sudo ./install.sh --yes      # answer yes to every question (incl. the flash step) — unattended
+#   sudo ./install.sh --yes      # answer yes to every question — unattended
 # Without a terminal (no tty) the driver steps run as before; the reset/flash steps are
 # skipped unless --yes is given.
 set -u
@@ -29,7 +27,6 @@ done
 say(){ printf '[ \033[32m*\033[0m ] %s\n' "$1"; }
 warn(){ printf '[ \033[33m!\033[0m ] %s\n' "$1"; }
 die(){ printf '[ \033[31mFAIL\033[0m ] %s\n' "$1" >&2; exit 1; }
-# ask "question" [soft]  — soft questions default to yes when there is no terminal (legacy unattended use)
 ask(){
   if [ "$YES" = 1 ]; then printf '[ ? ] %s -> yes (--yes)\n' "$1"; return 0; fi
   if [ ! -t 0 ]; then
@@ -39,15 +36,16 @@ ask(){
   printf '[ ? ] %s [y/N] ' "$1"; read -r _a; case "$_a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-# --- OS gate: this installer is global, the drivers are not (yet) ---
+# --- OS gate ---
 OS=$(uname -s 2>/dev/null || echo unknown)
 case "$OS" in
   Linux) ;;
-  FreeBSD|OpenBSD|NetBSD|DragonFly)
-    die "$OS: the BSD driver is not implemented yet (see bsdmod/README.md) — installation cancelled." ;;
+  FreeBSD) exec sh "$REPO/freebsd/install.sh" "$@" ;;
+  OpenBSD|NetBSD|DragonFly)
+    die "$OS: not supported (Linux and FreeBSD only) — installation cancelled." ;;
   MINGW*|MSYS*|CYGWIN*)
     die "Windows detected: run install.bat from a normal Windows prompt (or double-click it)." ;;
-  *) die "unsupported OS '$OS' (Linux only for now; Windows: install.bat) — installation cancelled." ;;
+  *) die "unsupported OS '$OS' (Linux and FreeBSD supported; Windows: install.bat) — installation cancelled." ;;
 esac
 [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
 
@@ -107,73 +105,69 @@ else
 fi
 
 # ---------- 2) driver ----------
-ask "Install the host driver (octnic via dkms), configs and the cavium-nic autostart service?" soft || die "cancelled by user"
-install_driver(){
-# 1) deps
-say "checking host deps"
-miss=
-for c in setpci lspci make gcc ip awk python3 depmod modprobe; do
-  command -v "$c" >/dev/null 2>&1 || miss="$miss $c"
-done
-[ -d "/lib/modules/$(uname -r)/build" ] || miss="$miss kernel-headers(/lib/modules/$(uname -r)/build)"
-[ -z "$miss" ] || die "missing:$miss  (Debian/Ubuntu: apt install pciutils build-essential linux-headers-\$(uname -r))"
-# Secure Boot puts the kernel in lockdown: setpci + the BAR mmaps return EPERM and unsigned
-# out-of-tree modules are refused. Warn early — it is a BIOS setting, nothing to rebuild.
-grep -q '\[integrity\]\|\[confidentiality\]' /sys/kernel/security/lockdown 2>/dev/null \
-  && printf '[ \033[33m!\033[0m ] kernel lockdown is ON (Secure Boot) — setpci/BAR access will fail; disable Secure Boot in the BIOS\n'
+ask "Install the host driver (octnic), configs and the autostart service/rc-script?" soft || die "cancelled by user"
 
-# 2) build + install the host module (native, against the running kernel).
-# With dkms present the module is registered so it rebuilds itself on every kernel
-# upgrade; without it we fall back to a plain build into /lib/modules/<ver>/extra,
-# which has to be re-run by hand after a kernel update. NODKMS=1 forces the fallback.
-VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$REPO/linuxmod/dkms.conf")
-if command -v dkms >/dev/null 2>&1 && [ "${NODKMS:-0}" != 1 ]; then
-  say "building host module (octnic $VER, dkms)"
-  # drop EVERY registered octnic version (also stale/broken ones), else dkms skips the install
-  for v in $(dkms status 2>/dev/null | awk -F'[/,: ]+' '$1=="octnic"{print $2}' | sort -u); do
-    dkms remove -m octnic -v "$v" --all >/dev/null 2>&1 || true
+install_driver_linux(){
+  # 1) deps
+  say "checking host deps"
+  miss=
+  for c in setpci lspci make gcc ip awk python3 depmod modprobe; do
+    command -v "$c" >/dev/null 2>&1 || miss="$miss $c"
   done
-  rm -rf /usr/src/octnic-*
-  rm -rf "/usr/src/octnic-$VER"
-  # drop any octnic.ko left by an earlier non-dkms install, else dkms flags the mismatch
-  rm -f "/lib/modules/$(uname -r)/extra/octnic.ko"
-  install -d "/usr/src/octnic-$VER"
-  install -m644 "$REPO/linuxmod/octnic.c" "$REPO/linuxmod/Makefile" "$REPO/linuxmod/dkms.conf" \
-    "/usr/src/octnic-$VER/" || die "stage dkms source"
-  dkms install -m octnic -v "$VER" >/tmp/octnic-build.log 2>&1 \
-    || { tail -20 /tmp/octnic-build.log; die "dkms build failed"; }
-  say "installed octnic.ko via dkms (rebuilds on kernel upgrade)"
-else
-  say "building host module (octnic, no dkms)"
-  # Makefile uses M=$(PWD), so build from inside linuxmod (not `make -C`).
-  ( cd "$REPO/linuxmod" && make clean ) >/dev/null 2>&1 || true
-  ( cd "$REPO/linuxmod" && make ) >/tmp/octnic-build.log 2>&1 || { cat /tmp/octnic-build.log; die "linuxmod build failed"; }
-  DEST="/lib/modules/$(uname -r)/extra"
-  install -d "$DEST"
-  install -m644 "$REPO/linuxmod/octnic.ko" "$DEST/" || die "install octnic.ko"
-  depmod -a
-  say "installed octnic.ko -> $DEST  (modprobe octnic; re-run after a kernel upgrade)"
-fi
+  [ -d "/lib/modules/$(uname -r)/build" ] || miss="$miss kernel-headers(/lib/modules/$(uname -r)/build)"
+  [ -z "$miss" ] || die "missing:$miss  (Debian/Ubuntu: apt install pciutils build-essential linux-headers-\$(uname -r))"
+  # Secure Boot puts the kernel in lockdown: setpci + the BAR mmaps return EPERM and unsigned
+  # out-of-tree modules are refused. Warn early — it is a BIOS setting, nothing to rebuild.
+  grep -q '\[integrity\]\|\[confidentiality\]' /sys/kernel/security/lockdown 2>/dev/null \
+    && printf '[ \033[33m!\033[0m ] kernel lockdown is ON (Secure Boot) — setpci/BAR access will fail; disable Secure Boot in the BIOS\n'
 
-# 3) system configs: keep stock liquidio off, sensors config
-say "installing system configs"
-install -m644 "$REPO/system/blacklist-liquidio.conf" /etc/modprobe.d/ 2>/dev/null \
-  && rmmod liquidio 2>/dev/null; true
-# oct0/oct1 are DHCP clients now (nic-up.sh): drop the old "unmanaged" pin from earlier installs
-rm -f /etc/NetworkManager/conf.d/99-octnic-unmanaged.conf
-# lm-sensors config so `sensors` shows the card's temps (cavium_card hwmon driver)
-if [ -d /etc/sensors.d ]; then
-  install -m644 "$REPO/system/cavium-card" /etc/sensors.d/ 2>/dev/null; true
-fi
+  # 2) build + install the host module (native, against the running kernel).
+  VER=$(awk -F'"' '/^PACKAGE_VERSION=/{print $2}' "$REPO/linuxmod/dkms.conf")
+  if command -v dkms >/dev/null 2>&1 && [ "${NODKMS:-0}" != 1 ]; then
+    say "building host module (octnic $VER, dkms)"
+    for v in $(dkms status 2>/dev/null | awk -F'[/,: ]+' '$1=="octnic"{print $2}' | sort -u); do
+      dkms remove -m octnic -v "$v" --all >/dev/null 2>&1 || true
+    done
+    rm -rf /usr/src/octnic-*
+    rm -rf "/usr/src/octnic-$VER"
+    rm -f "/lib/modules/$(uname -r)/extra/octnic.ko"
+    install -d "/usr/src/octnic-$VER"
+    install -m644 "$REPO/linuxmod/octnic.c" "$REPO/linuxmod/Makefile" "$REPO/linuxmod/dkms.conf" \
+      "/usr/src/octnic-$VER/" || die "stage dkms source"
+    dkms install -m octnic -v "$VER" >/tmp/octnic-build.log 2>&1 \
+      || { tail -20 /tmp/octnic-build.log; die "dkms build failed"; }
+    say "installed octnic.ko via dkms (rebuilds on kernel upgrade)"
+  else
+    say "building host module (octnic, no dkms)"
+    ( cd "$REPO/linuxmod" && make clean ) >/dev/null 2>&1 || true
+    ( cd "$REPO/linuxmod" && make ) >/tmp/octnic-build.log 2>&1 || { cat /tmp/octnic-build.log; die "linuxmod build failed"; }
+    DEST="/lib/modules/$(uname -r)/extra"
+    install -d "$DEST"
+    install -m644 "$REPO/linuxmod/octnic.ko" "$DEST/" || die "install octnic.ko"
+    depmod -a
+    say "installed octnic.ko -> $DEST  (modprobe octnic; re-run after a kernel upgrade)"
+  fi
 
-# 4) autostart service, with ExecStart pinned to THIS repo location
-say "installing cavium-nic.service (ExecStart -> $REPO/scripts/cavium-up.sh)"
-sed "s|@REPO@|$REPO|g" "$REPO/system/cavium-nic.service" \
-  > /etc/systemd/system/cavium-nic.service || die "write service"
-systemctl daemon-reload
-systemctl enable cavium-nic.service >/dev/null 2>&1 && say "service enabled (starts at boot)"
+  # 3) system configs
+  say "installing system configs"
+  install -m644 "$REPO/system/blacklist-liquidio.conf" /etc/modprobe.d/ 2>/dev/null \
+    && rmmod liquidio 2>/dev/null; true
+  rm -f /etc/NetworkManager/conf.d/99-octnic-unmanaged.conf
+  if [ -d /etc/sensors.d ]; then
+    install -m644 "$REPO/system/cavium-card" /etc/sensors.d/ 2>/dev/null; true
+  fi
+
+  # 4) autostart service
+  say "installing cavium-nic.service (ExecStart -> $REPO/scripts/cavium-up.sh)"
+  sed "s|@REPO@|$REPO|g" "$REPO/system/cavium-nic.service" \
+    > /etc/systemd/system/cavium-nic.service || die "write service"
+  systemctl daemon-reload
+  systemctl enable cavium-nic.service >/dev/null 2>&1 && say "service enabled (starts at boot)"
 }
-install_driver
+
+case "$OS" in
+  Linux) install_driver_linux ;;
+esac
 
 # ---------- 3) already flashed? ----------
 FLASHED=0
@@ -215,22 +209,31 @@ if [ -n "$CARD" ]; then
   fi
 fi
 
-# ---------- 5) card image + first boot ----------# 5) card image check (built OpenWrt initramfs; octboot needs it)
+# ---------- 5) card image + first boot ----------
 IMG=$(ls "$REPO"/*snic10e-initramfs-kernel.bin \
         "$REPO"/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin \
         /home/*/openwrt/bin/targets/octeon/generic/*snic10e-initramfs-kernel.bin 2>/dev/null | head -1)
 if [ -n "$IMG" ]; then say "card image found: $IMG"
 else printf '[ \033[33m!\033[0m ] no card image -> download it from the GitHub release into %s/, or build it with ./openwrt/build-openwrt.sh\n' "$REPO"; fi
-if [ "$FLASHED" = 1 ] && { [ "$START" = 1 ] || ask "Boot the card and bring up oct0/oct1 now (systemctl start cavium-nic)?"; }; then
-  say "booting card + bringing up NICs (systemctl start cavium-nic)"
-  systemctl start cavium-nic.service && say "done -> check: ip -br addr show oct0" \
-    || die "start failed (see /var/log/cavium-up.log)"
-fi
+
+case "$OS" in
+  Linux)
+    if [ "$FLASHED" = 1 ] && { [ "$START" = 1 ] || ask "Boot the card and bring up oct0/oct1 now (systemctl start cavium-nic)?"; }; then
+      say "booting card + bringing up NICs (systemctl start cavium-nic)"
+      systemctl start cavium-nic.service && say "done -> check: ip -br addr show oct0" \
+        || die "start failed (see /var/log/cavium-up.log)"
+    fi
+    ;;
+esac
 
 echo
 say "installed. Next:"
-echo "    sudo systemctl start cavium-nic     # boot card + oct0/oct1 (no serial)"
-echo "    ip -br addr show oct0"
+case "$OS" in
+  Linux)
+    echo "    sudo systemctl start cavium-nic     # boot card + oct0/oct1 (no serial)"
+    echo "    ip -br addr show oct0"
+    ;;
+esac
 echo
 [ "$FLASHED" = 1 ] || { printf '[ \033[33mnote\033[0m ] The card is not flashed yet: it needs its one-time u-boot env provisioned\n'
                          printf '           (USB-serial, once) — run ./install.sh again with the adapter, or see docs/FLASHING.md.\n'; }

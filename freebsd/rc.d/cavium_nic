@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# $FreeBSD$
+# PROVIDE: cavium_nic
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# Card boot on FreeBSD is NOT implemented yet: octboot is Linux-only
+# (setpci, sysfs, resource2 mmap). This script only loads/unloads the module.
+
+. /etc/rc.subr
+
+name="cavium_nic"
+rcvar="cavium_nic_enable"
+
+cavium_nic_start() {
+    kldstat -q -m if_octnic || kldload if_octnic || return 1
+    echo "cavium_nic: module loaded. Card boot on FreeBSD not implemented yet (see freebsd/README.md)."
+    return 1
+}
+
+cavium_nic_stop() {
+    kldunload if_octnic 2>/dev/null || true
+    return 0
+}
+
+load_rc_config "$name"
+: ${cavium_nic_enable:="NO"}
+
+run_rc_command "$1"
