@@ -32,6 +32,68 @@ OFF=${OFF:-0x10000}
 
 ok(){ printf '[ \033[32mOK\033[0m ] %s\n' "$1"; }
 
+# host_window [wait_s]: program the card's PEM BAR1 window (P2N_BAR0/1 + BAR1_INDEX0..7) from the
+# HOST, through the SLI indirect window in BAR0 -- the same registers u-boot's wa..wd write. Needed
+# when the card's SLI is alive but BAR2 is not (u-boot never ran/finished wa..wd, or a PCIe reset
+# wiped the window): without it BAR2 stays 0xffffffff and the push can never start. SAFETY: the
+# SLI window's timeout (SLI_WINDOW_CTL, BAR0+0x2E0) defaults to 0 = wait forever, and a window op
+# to a dead target hard-freezes the host, so the timeout is written FIRST and read back; if it
+# does not stick (SLI not really up) nothing else is touched. Only CSRs are accessed through the
+# window (never card DRAM: window->DRAM reads are what froze the host before). Returns 0 once BAR2
+# accepts a write, 1 otherwise.
+host_window() {
+  CARD=$CARD WAIT=${1:-0} python3 - <<'PY'
+import mmap,os,struct,sys,time
+c=os.environ["CARD"]; d="/sys/bus/pci/devices/0000:%s/"%c
+res=open(d+"resource").read().split("\n")
+b0=int(res[0].split()[0],16); b2=int(res[2].split()[0],16)
+if not b0 or not b2: sys.exit(1)
+f=os.open(d+"resource0",os.O_RDWR); m=mmap.mmap(f,16384,mmap.MAP_SHARED)
+r=lambda o: struct.unpack("<I",m[o:o+4])[0]
+def w(o,v): m[o:o+4]=struct.pack("<I",v)
+t=time.time()
+while r(0x3d80)==0xffffffff:                     # SLI_S2M_PORT0_CTL: all-ones = SLI not up
+    if time.time()-t>=float(os.environ["WAIT"]): sys.exit(1)
+    time.sleep(0.2)
+w(0x2e0,0x200000)                                # SLI_WINDOW_CTL timeout, before ANY window op
+if r(0x2e0)!=0x200000: sys.exit(1)
+def rd(a):
+    w(0x14,((a>>32)&0xffffffff)|0x00060000); r(0x14); w(0x10,a&0xffffffff); r(0x10)
+    return struct.unpack("<Q",m[0x40:0x48])[0]
+def wr(a,v):
+    w(0x4,a>>32); w(0x0,a&0xffffffff); w(0x30,0xff)
+    w(0x24,v>>32); r(0x24); w(0x20,v&0xffffffff)  # low word last: it triggers the write
+PEM=0x00011800C0000000
+rbase=0x20000000>>22                             # 4 MB granule of the card-DRAM load base
+wr(PEM+0x80,b0); wr(PEM+0x88,b2)
+for i in range(8): wr(PEM+0xA8+8*i,((rbase+i)<<4)|0xB)
+if rd(PEM+0x80)!=b0 or rd(PEM+0x88)!=b2: sys.exit(1)   # readback: window regs took the values
+fd=os.open(d+"resource2",os.O_RDWR); n=mmap.mmap(fd,64*1024*1024,mmap.MAP_SHARED)
+n[0x10000:0x10008]=b"NSRLIVE0"; n.flush()
+sys.exit(0 if bytes(n[0x10000:0x10008])==b"NSRLIVE0" else 1)
+PY
+}
+
+# soft_reset_chip: restart the Octeon (CIU_SOFT_RST) through the SLI window. This is what revives a
+# card whose cores already ran bootoctlinux on an empty load address (u-boot's pre-boot wait expired
+# while the host was still in BIOS POST and the window had been wiped by a PCIe reset): neither SBR
+# nor a cold power-up recovers it, but a chip soft reset restarts u-boot and with it the wait, giving
+# the host a fresh window to push the image. Same SLI_WINDOW_CTL safety rule as host_window.
+soft_reset_chip() {
+  CARD=$CARD python3 - <<'PY'
+import mmap,os,struct,sys
+d="/sys/bus/pci/devices/0000:%s/"%os.environ["CARD"]
+f=os.open(d+"resource0",os.O_RDWR); m=mmap.mmap(f,16384,mmap.MAP_SHARED)
+r=lambda o: struct.unpack("<I",m[o:o+4])[0]
+def w(o,v): m[o:o+4]=struct.pack("<I",v)
+if r(0x3d80)==0xffffffff: sys.exit(1)           # SLI not up: nothing to reset through
+w(0x2e0,0x200000)
+if r(0x2e0)!=0x200000: sys.exit(1)
+w(0x4,0x00010700); w(0x0,0x00000740); w(0x30,0xff)  # CIU_SOFT_RST = 0x0001070000000740
+w(0x24,0); r(0x24); w(0x20,1)
+PY
+}
+
 CARD=$(lspci -d 177d:0092 | awk '{print $1}' | head -1)
 [ -n "$CARD" ] || { echo "[FAIL] CN6640 (177d:0092) not found"; exit 1; }
 BRIDGE=$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/0000:$CARD)")" | sed 's/^0000://')
@@ -90,11 +152,26 @@ PY
     [ "$up" = 1 ] && { ok "Card came up on its own (prior push) -- no SBR, no reload"; exit 0; }
     sleep 1
   done
-  ok "Still not up after 10s -- assume wedged, SBR"
+  # A host-programmed window here would NOT prove u-boot is still waiting (its wait may have
+  # expired into a jump to garbage), so restart the chip instead (soft reset, else SBR below).
+  ok "Still not up after 10s -- assume wedged, restarting the card"
 fi   # STATE=os falls through with DOSBR=1 (OpenWrt running -> SBR to reload a fresh image)
 if [ "$DOSBR" = 1 ]; then
-  setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
-  ok "Secondary Bus Reset"
+  if [ "$STATE" = dead ]; then
+    # BARs may be zeroed (an earlier SBR/PCIe reset): restore from sysfs so SLI (BAR0) is reachable
+    RES0=/sys/bus/pci/devices/0000:$CARD/resource
+    setpci -s "$CARD" BASE_ADDRESS_0=$(printf '0x%08x' $(( ($(awk 'NR==1{print $1}' "$RES0")) & 0xffffffff | 0xc ))) \
+                      BASE_ADDRESS_1=0x00000000 \
+                      BASE_ADDRESS_2=$(printf '0x%08x' $(( ($(awk 'NR==3{print $1}' "$RES0")) & 0xffffffff | 0xc ))) \
+                      BASE_ADDRESS_3=0x00000000 COMMAND=0x06
+  fi
+  if [ "$STATE" = dead ] && soft_reset_chip; then
+    ok "Chip soft reset (CIU_SOFT_RST via SLI window) -- u-boot restarts, fresh pre-boot wait"
+    sleep 1
+  else
+    setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
+    ok "Secondary Bus Reset"
+  fi
   sleep 2					# window wait below polls; no fixed u-boot delay needed
 fi
 
@@ -124,6 +201,9 @@ if [ -n "$DEVCTL" ]; then
   setpci -s "$CARD" CAP_EXP+8.w=$NEW 2>/dev/null && ok "MPS 256B (DevCtl $DEVCTL->$NEW)"
 fi
 
+# After an SBR u-boot normally re-programs the window itself; if it has not done so by the time
+# SLI is back, do it from the host (no-op when it already did: same values).
+[ "$DOSBR" = 1 ] && host_window 8 && ok "BAR2 window programmed from the host (SLI window)"
 OFF=$OFF CARD=$CARD python3 - "$IMG" <<'PY'
 import mmap,os,sys,time
 off=int(os.environ["OFF"],0); card=os.environ["CARD"]
