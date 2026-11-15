@@ -151,18 +151,21 @@ Left as-is, the card sits idle until `octboot` pushes an image again.
   `echo 1 > /sys/bus/pci/rescan`). Don't leave `octnic` loaded on an idle/wedged card.
 - **Card won't boot after a wedge** — soft resets don't clear card RAM; only a full host
   reboot power-cycles the card.
-- **`octboot` says `state=dead` but PCIe is up** (BAR2 `0xffffffff`, BAR0 SLI regs answer):
-  `octboot` now restarts the Octeon itself — chip soft reset (`CIU_SOFT_RST`) through the SLI
-  indirect window, then programs the PEM BAR2 window from the host (`P2N_BAR0/1`,
-  `BAR1_INDEX0..7`) before pushing the image. Verified on hardware: soft reset restarts u-boot
-  (PCI console re-initialised), the host-programmed window makes BAR2 live, the image push and
-  `GO!!` flag complete. Every window access sets `SLI_WINDOW_CTL` (BAR0 `0x2E0`) first and reads
-  it back; only CSRs go through the window, never DRAM. **Not verified:** that the card then
-  boots — on a CN6640 whose u-boot stopped after a power loss, the push completed but no
-  heartbeat followed (u-boot did not run `bootoctlinux` visibly). In that state the card's UART
-  also showed RX activity (its own boot banner read back from `RBR`) and `LSR` overrun right after
-  reset, which would make u-boot abort its 1 s autoboot countdown; that cause is a hypothesis,
-  not confirmed without a serial console.
+- **Card dead after a power loss / `octboot` says `state=dead`, BAR2 `0xffffffff`** — `octboot`
+  now recovers it with no serial and no host reboot: chip soft reset (`CIU_SOFT_RST`) through the
+  SLI indirect window, then it drives u-boot through its PCI console. Why a console is needed:
+  on the failing card u-boot stopped at its prompt (empty/lost env, so `bootcmd` ran nothing) and
+  the UART RX was looped back to its own TX, so u-boot read its own prompt as typed input and a
+  serial console is useless. The PCI console (ring in card DRAM at the bootmem block
+  `__pci_console`) is read by u-boot at the prompt, so `octboot` programs the PEM BAR2 window from
+  the host (`P2N_BAR0/1`, `BAR1_INDEX0..15`), slows the card UART to ~95 baud (the looped-back
+  echo then trickles at ~10 chars/s and the host drains it), pushes the image and types
+  `flush_l2c; flush_dcache; bootoctlinux ...`. Hardware-verified end to end: heartbeat in ~100 s,
+  `oct0/oct1` register, DHCP on oct1. It also runs as a fallback when the u-boot-env handshake
+  push gets no heartbeat. Safety: every SLI-window access writes `SLI_WINDOW_CTL` (BAR0 `0x2E0`)
+  first and reads it back; only CSRs go through the window, never card DRAM reads.
+  This boots the card but does not repair the u-boot env in NAND (`card-prep-hostboot.sh`, serial,
+  still does that).
 - **Fresh boot before each benchmark** — a card that has been hammered gives degraded/zero
   throughput until re-booted with `octboot`.
 - **`[FAIL] BAR2 never writable`** — the card's u-boot env still has BAR addresses from the

@@ -94,6 +94,76 @@ w(0x24,0); r(0x24); w(0x20,1)
 PY
 }
 
+# pci_console_boot: boot the card with NO serial and NO working u-boot env. After a chip soft reset,
+# u-boot may sit at its prompt (lost/empty env, or its autoboot aborted) and its UART RX can be
+# wired back to its own TX, so u-boot reads its own prompt as typed input and a serial console is
+# useless. u-boot's PCI console (a ring in card DRAM, found at the bootmem block "__pci_console")
+# IS read at the prompt, so we type through it: program the PEM window from the host, slow the card
+# UART to ~95 baud (the looped-back echo then trickles at ~10 chars/s while the host drains it, so a
+# typed line is not interleaved with junk), push the image, then type
+#   flush_l2c; flush_dcache; bootoctlinux 0x20010000 numcores=8 endbootargs ...
+# Returns 0 when the command was consumed (caller then waits for the heartbeat).
+pci_console_boot() {
+  CARD=$CARD IMG=$IMG RGO=${RGO:-3} python3 - <<'PY'
+import mmap,os,struct,sys,time
+c=os.environ["CARD"]; d="/sys/bus/pci/devices/0000:%s/"%c
+res=open(d+"resource").read().split("\n")
+b0=int(res[0].split()[0],16); b2=int(res[2].split()[0],16)
+f=os.open(d+"resource0",os.O_RDWR); m=mmap.mmap(f,16384,mmap.MAP_SHARED)
+r=lambda o: struct.unpack("<I",m[o:o+4])[0]
+def w(o,v): m[o:o+4]=struct.pack("<I",v)
+t0=time.time()
+while r(0x3d80)==0xffffffff:
+    if time.time()-t0>15: sys.exit(1)
+    time.sleep(0.02)
+w(0x2e0,0x200000)                                    # SLI_WINDOW_CTL timeout first (host-freeze guard)
+if r(0x2e0)!=0x200000: sys.exit(1)
+def rd(a):
+    w(0x14,((a>>32)&0xffffffff)|0x00060000); r(0x14); w(0x10,a&0xffffffff); r(0x10)
+    return struct.unpack("<Q",m[0x40:0x48])[0]
+def wr(a,v):
+    w(0x4,a>>32); w(0x0,a&0xffffffff); w(0x30,0xff)
+    w(0x24,v>>32); r(0x24); w(0x20,v&0xffffffff)
+PEM=0x00011800C0000000; U=0x0001180000000800
+wr(PEM+0x80,b0); wr(PEM+0x88,b2)
+wr(PEM+0xA8,(0x3f<<4)|0xB)                           # BAR2+0   -> card 0x0fc00000 (PCI console block)
+for i in range(1,16): wr(PEM+0xA8+8*i,((0x80+i-1)<<4)|0xB)   # BAR2+4M.. -> card 0x20000000..
+fd=os.open(d+"resource2",os.O_RDWR); n=mmap.mmap(fd,64*1024*1024,mmap.MAP_SHARED)
+be=lambda o: struct.unpack(">I",bytes(n[o:o+4]))[0]
+CON=0x0fffcea0-0x0fc00000; INB=0x0fffcec8-0x0fc00000
+def drain(ms):
+    t=time.time()
+    while time.time()-t<ms/1000:
+        if rd(U+0x28)&1: rd(U)
+# wait for u-boot to be up at its prompt: PCI console descriptor valid, then a settle time
+ok=False
+while time.time()-t0<40:
+    drain(200)
+    if be(0x0fffce80-0x0fc00000)==1 and time.time()-t0>=16: ok=True; break
+if not ok: sys.exit(2)
+wr(U+0x18,0x93); wr(U+0x00,0xff); wr(U+0x08,0xff); wr(U+0x18,0x13)   # UART divisor 0xffff (~95 baud)
+drain(400)
+def send(s):
+    for ch in s.encode():
+        wp=be(CON+0xc); n[INB+wp]=ch; n[CON+0xc:CON+0x10]=struct.pack(">I",(wp+1)%0x400)
+    t=time.time()
+    while be(CON+8)!=be(CON+0xc) and time.time()-t<4: drain(2)
+    return be(CON+8)==be(CON+0xc)
+img=open(os.environ["IMG"],"rb").read(); off=0x400000+0x10000    # card DRAM 0x20010000
+n[off:off+len(img)]=img; n.flush()
+for it in range(10):
+    rb=bytes(n[off:off+len(img)])
+    bad=[] if rb==img else [i for i in range(0,len(img),4) if img[i:i+4]!=rb[i:i+4]]
+    if not bad: print("[ \033[32mOK\033[0m ] Uploading OpenWrt... (%d bytes, %d fix passes)"%(len(img),it)); break
+    for i in bad: n[off+i:off+i+4]=img[i:i+4]
+    n.flush()
+else: sys.exit(3)
+drain(300)
+line="\x03flush_l2c\rflush_dcache\rbootoctlinux 0x20010000 numcores=8 endbootargs console=ttyS0,115200 octeon-ethernet.receive_group_order=%s\r"%os.environ["RGO"]
+sys.exit(0 if send(line) else 4)
+PY
+}
+
 CARD=$(lspci -d 177d:0092 | awk '{print $1}' | head -1)
 [ -n "$CARD" ] || { echo "[FAIL] CN6640 (177d:0092) not found"; exit 1; }
 BRIDGE=$(basename "$(dirname "$(readlink -f /sys/bus/pci/devices/0000:$CARD)")" | sed 's/^0000://')
@@ -121,7 +191,7 @@ except Exception:
     print("dead")
 PY
 )
-DOSBR=1
+DOSBR=1; SOFTRST=0; PCIBOOT=0; PUSHRC=0
 # Boot-time reuse (cavium-up sets OCT_REUSE=1 right after host boot): a card whose OS is already
 # up and ready (host warm reboot / card kept power) is usable as is -> skip SBR + reload, ~30 s.
 if [ "$STATE" = osready ] && [ "${OCT_REUSE:-0}" = 1 ]; then
@@ -167,7 +237,7 @@ if [ "$DOSBR" = 1 ]; then
   fi
   if [ "$STATE" = dead ] && soft_reset_chip; then
     ok "Chip soft reset (CIU_SOFT_RST via SLI window) -- u-boot restarts, fresh pre-boot wait"
-    sleep 1
+    SOFTRST=1; sleep 1
   else
     setpci -s "$BRIDGE" BRIDGE_CONTROL=40:40; sleep 0.2; setpci -s "$BRIDGE" BRIDGE_CONTROL=00:40
     ok "Secondary Bus Reset"
@@ -201,6 +271,14 @@ if [ -n "$DEVCTL" ]; then
   setpci -s "$CARD" CAP_EXP+8.w=$NEW 2>/dev/null && ok "MPS 256B (DevCtl $DEVCTL->$NEW)"
 fi
 
+# After a soft reset, drive u-boot through its PCI console (no serial, works with an empty env and
+# with the UART RX looped back); if that fails, fall back to the u-boot-env handshake below.
+if [ "$SOFTRST" = 1 ]; then
+  ok "Driving u-boot through its PCI console (takes ~25 s before the image push)"
+  if pci_console_boot; then PCIBOOT=1; ok "Boot command typed into u-boot (PCI console)"
+  else echo "[WARN] PCI-console boot failed (rc=$?), falling back to the env handshake"; fi
+fi
+if [ "$PCIBOOT" != 1 ]; then
 # After an SBR u-boot normally re-programs the window itself; if it has not done so by the time
 # SLI is back, do it from the host (no-op when it already did: same values).
 [ "$DOSBR" = 1 ] && host_window 8 && ok "BAR2 window programmed from the host (SLI window)"
@@ -236,20 +314,46 @@ for _ in range(20):
     if bytes(m[0x100:0x104])==b"GO!!": break
 m.close(); os.close(fd)
 PY
-[ $? -eq 0 ] || { echo "[FAIL] image push aborted"; exit 1; }
-ok "Booting... (u-boot flush -> bootoctlinux)"
+PUSHRC=$?
+if [ "$PUSHRC" -ne 0 ]; then
+  echo "[FAIL] image push aborted -- will try the PCI-console recovery"
+else
+  ok "Booting... (u-boot flush -> bootoctlinux)"
+fi
+fi   # PCIBOOT != 1
 
 # wait for the card NIC to raise its BAR2 heartbeat (magic 0x4f435348 + card_ready=1).
 # Must exceed the u-boot pre-boot sleep (120s) + Linux boot: the image is pushed into the live
 # window early, but u-boot only bootoctlinux's after its sleep expires, so the card is ready
 # ~140s after SBR. Block here until then so nic-up finds the card up on its first try.
-for _ in $(seq 1 165); do
-  v=$(python3 -c "import mmap,os
+wait_heartbeat() {   # $1 = seconds
+  local _ v
+  for _ in $(seq 1 "$1"); do
+    v=$(python3 -c "import mmap,os
 fd=os.open('/sys/bus/pci/devices/0000:$CARD/resource2',os.O_RDWR)   # O_RDONLY mmap -> Errno 13
 m=mmap.mmap(fd,4096,mmap.MAP_SHARED)
 print(1 if int.from_bytes(bytes(m[0:4]),'little')==0x4f435348 and int.from_bytes(bytes(m[8:12]),'little') else 0)
 m.close();os.close(fd)" 2>/dev/null)
-  [ "$v" = 1 ] && { ok "Heartbeat detected -- card ready. Load NIC: sudo modprobe octnic ports=2"; exit 0; }
-  sleep 1
-done
-echo "[WARN] no heartbeat after ~165s; card may still be booting. Check: sudo modprobe octnic"
+    [ "$v" = 1 ] && return 0
+    sleep 1
+  done
+  return 1
+}
+if [ "$PUSHRC" -eq 0 ] && wait_heartbeat 165; then
+  ok "Heartbeat detected -- card ready. Load NIC: sudo modprobe octnic ports=2"; exit 0
+fi
+# No heartbeat. A live BAR2 window does not prove u-boot is waiting for GO (it may sit at its
+# prompt with an empty env or an aborted autoboot): restart the chip and type the boot command
+# through u-boot's PCI console instead. Tried once.
+if [ "$SOFTRST" != 1 ] && [ "$PCIBOOT" != 1 ]; then
+  echo "[WARN] card did not boot -- restarting the chip and booting through the PCI console"
+  setpci -s "$CARD" BASE_ADDRESS_0=$(printf '0x%08x' $(( ($(awk 'NR==1{print $1}' /sys/bus/pci/devices/0000:$CARD/resource)) & 0xffffffff | 0xc ))) \
+                    BASE_ADDRESS_1=0x00000000 \
+                    BASE_ADDRESS_2=$(printf '0x%08x' $(( ($(awk 'NR==3{print $1}' /sys/bus/pci/devices/0000:$CARD/resource)) & 0xffffffff | 0xc ))) \
+                    BASE_ADDRESS_3=0x00000000 COMMAND=0x06
+  if soft_reset_chip && sleep 3 && pci_console_boot && wait_heartbeat 160; then
+    ok "Heartbeat detected (PCI-console boot) -- card ready. Load NIC: sudo modprobe octnic ports=2"; exit 0
+  fi
+fi
+echo "[WARN] no heartbeat; card may still be booting. Check: sudo modprobe octnic"
+exit 1
